@@ -1,0 +1,6 @@
+# OPTIONAL engine: IBM Docling (MIT) - trained layout model + TableFormer table structure.
+# Install:   python -m pip install -r requirements-docling.txt
+# Large install (PyTorch). Its layout/table models download from Hugging Face on first use;
+# for offline networks see "Optional Docling engine" in README.md.
+-r requirements.txt
+docling[rapidocr]>=2.128,<3   # tested 2.128.0 with docling-core 2.97.0

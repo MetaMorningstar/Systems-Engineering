@@ -1,0 +1,4 @@
+# Only needed to run the automated accuracy tests in the tests/ folder.
+-r requirements.txt
+reportlab>=4.0      # builds the synthetic test documents (BSD). Tested 5.0.1
+rapidfuzz>=3.0      # text similarity for scoring (MIT). Tested 3.14.6
