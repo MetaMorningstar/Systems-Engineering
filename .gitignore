@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# The private environment that setup_windows.bat creates
+.venv/
+wheels/
+
+# Everything the tools produce: OCR caches, extraction output, test corpus and results.
+# These are rebuilt on demand (tests/make_test_corpus.py) and can be large, so they are
+# deliberately not part of the repository - and never commit real scanned documents here.
+_cache/
+extraction_output/
+spec_extractor_log.txt
+spec_extractor/tests/corpus/
+spec_extractor/tests/_results/

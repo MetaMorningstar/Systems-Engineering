@@ -241,6 +241,72 @@ class Builder:
                 if kw:
                     self.gt.requirements.append(GTReq(r[req_col], kw, "table", r[id_col] if id_col is not None else ""))
 
+    def matrix(self, caption: str, label_headers: list[str], method_headers: list[str],
+               rows: list[list[str]], col_widths: list[float], *, sideways: bool = True,
+               row_lines: bool = False, font_size: float = 9, header_height: float = 84):
+        """A verification cross reference matrix: label columns, then one column per method.
+
+        The defaults reproduce the layout of a real MIL-STD matrix, and the one that used to defeat
+        the extractor: the method headers are printed SIDEWAYS, and the columns are ruled while the
+        rows are not. `rows` are the data rows, [paragraph, title..., marks...]."""
+        cell = ParagraphStyle(f"m{len(self.story)}", parent=self.body, fontSize=font_size,
+                              leading=font_size * 1.3, spaceAfter=0, spaceBefore=0)
+        head = [Paragraph(escape(h), cell) for h in label_headers]
+        head += [SidewaysText(h, self.body.fontName, font_size, header_height - 8) if sideways
+                 else Paragraph(escape(h), cell) for h in method_headers]
+        data = [head] + [[Paragraph(escape(c), cell) for c in r] for r in rows]
+        tbl = Table(data, colWidths=col_widths, repeatRows=1,
+                    rowHeights=[header_height] + [font_size * 2.6] * len(rows))
+        style = [("VALIGN", (0, 0), (-1, 0), "BOTTOM"), ("VALIGN", (0, 1), (-1, -1), "TOP"),
+                 ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                 ("BOX", (0, 0), (-1, -1), 0.9, colors.black),
+                 ("LINEAFTER", (0, 0), (-2, -1), 0.9, colors.black),      # column rules
+                 ("LINEBELOW", (0, 0), (-1, 0), 0.9, colors.black)]       # under the headers only
+        if row_lines:
+            style.append(("GRID", (0, 0), (-1, -1), 0.9, colors.black))
+        tbl.setStyle(TableStyle(style))
+        self.story.append(self._p(caption, self.body, alignment=TA_CENTER, spaceBefore=6, spaceAfter=6))
+        self.story.append(tbl)
+        self.spacer(10)
+        self.gt.captions.append({"kind": "table", "text": caption})
+        self.gt.all_text.append(caption)
+        grid = [label_headers + method_headers] + rows
+        self.gt.tables.append({"caption": caption, "rows": grid, "optional": False})
+        self.gt.all_text.extend(c for r in grid for c in r if c)
+
+    def banner_table(self, caption: str, left_headers: list[str], banner: str, under_banner: list[str],
+                     rows: list[list[str]], col_widths: list[float], *, req_col: int | None = None,
+                     id_col: int | None = None, keyword_of=None, font_size: float = 9):
+        """A table whose right-hand columns sit under one merged banner, so it has TWO header rows
+        ("VERIFICATION" spanning "Method" and "Phase"). The name of a column is then the lower of
+        the two lines, not the banner."""
+        cell = ParagraphStyle(f"b{len(self.story)}", parent=self.body, fontSize=font_size,
+                              leading=font_size * 1.3, spaceAfter=0, spaceBefore=0)
+        n_left = len(left_headers)
+        head0 = left_headers + [banner] + [""] * (len(under_banner) - 1)
+        head1 = [""] * n_left + under_banner
+        grid = [head0, head1] + rows
+        data = [[Paragraph(escape(c), cell) for c in r] for r in grid]
+        tbl = Table(data, colWidths=col_widths, repeatRows=2)
+        tbl.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                 ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                                 ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                                 ("GRID", (0, 0), (-1, -1), 0.9, colors.black),
+                                 ("SPAN", (n_left, 0), (-1, 0)),               # the banner
+                                 ("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1))]))
+        self.story.append(self._p(caption, self.body, alignment=TA_CENTER, spaceBefore=6, spaceAfter=6))
+        self.story.append(tbl)
+        self.spacer(10)
+        self.gt.captions.append({"kind": "table", "text": caption})
+        self.gt.all_text.append(caption)
+        self.gt.tables.append({"caption": caption, "rows": grid, "optional": False})
+        self.gt.all_text.extend(c for r in grid for c in r if c)
+        if req_col is not None:
+            for r in rows:
+                kw = keyword_of(r[req_col])
+                if kw:
+                    self.gt.requirements.append(GTReq(r[req_col], kw, "table", r[id_col] if id_col is not None else ""))
+
     def figure(self, flowable, caption: str, figure_words: list[str]):
         cap = self._p(caption, self.body, alignment=TA_CENTER, spaceBefore=6, spaceAfter=10)
         self.story.append(KeepTogether([Spacer(1, 6), flowable, cap]))
@@ -506,6 +572,99 @@ def build_spec_c() -> tuple[list[bytes], GroundTruth]:
 # --------------------------------------------------------------------------------------
 # Document D: hard layout cases found in review (all must come out complete and in order)
 # --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Document E: table structure - the layouts that used to defeat the extractor completely
+#
+# Real Systems Engineering documents, and verification matrices above all, rule a table's COLUMNS
+# but draw no line between the ROWS, and print the method headers SIDEWAYS because the words are
+# far wider than the columns they head. Both are reproduced here, with exact ground truth.
+# --------------------------------------------------------------------------------------
+class SidewaysText(Flowable):
+    """A table cell whose text is printed sideways, reading upwards from the bottom of the cell."""
+
+    def __init__(self, text: str, font: str, size: float, height: float):
+        super().__init__()
+        self.text, self.font, self.size = text, font, size
+        self.width, self.height = size * 1.45, height
+
+    def wrap(self, avail_w, avail_h):
+        return self.width, self.height
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+        c.setFont(self.font, self.size)
+        c.rotate(90)                       # after the turn, +x runs up the page
+        c.drawString(2, -(self.width - 2), self.text)
+        c.restoreState()
+
+
+def build_spec_e() -> tuple[bytes, GroundTruth]:
+    body = ParagraphStyle("body", fontName=FONTS["type"], fontSize=10.5, leading=15)
+    heading = ParagraphStyle("head", fontName=FONTS["type_bold"], fontSize=11, leading=16)
+    small = ParagraphStyle("small", fontName=FONTS["type"], fontSize=9, leading=12)
+    b = Builder("specE", body, heading, small)
+
+    b.title_block(["SPECIFICATION", "", "SURVEILLANCE RADAR SET", "", "SPEC-E-0055"])
+    b.page_break()
+
+    b.heading("3. REQUIREMENTS")
+    b.para("3.2.1.1", "Detection range.",
+           [("The radar shall detect a one square meter target at 100 nautical miles.", "shall")])
+    b.para("3.2.1.2", "Range accuracy.",
+           [("The radar shall measure target range to within 50 meters.", "shall")])
+    b.para("3.2.2.1", "Weight.", [("The equipment shall not exceed 45 kilograms.", "shall")])
+    b.para("3.2.2.2", "Input power.",
+           [("The equipment shall operate from 115 VAC, 400 Hz, three phase power.", "shall")])
+
+    b.heading("4. VERIFICATION")
+    # the legend: this sentence is what names the matrix columns when their sideways headers
+    # cannot be read, so the wording matters to the test
+    b.para("4.1", "Verification methods.",
+           [("Verification of each requirement in section 3 shall be accomplished by inspection (I), "
+             "analysis (A), demonstration (D), or test (T), as specified in TABLE I.", "shall")])
+    b.matrix("TABLE I. Verification cross reference matrix.",
+             ["Paragraph", "Title"], ["INSPECTION", "ANALYSIS", "DEMONSTRATION", "TEST"],
+             [["3.2.1.1", "Detection range", "", "", "", "X"],
+              ["3.2.1.2", "Range accuracy", "", "X", "", "X"],
+              ["3.2.2.1", "Weight", "X", "", "", ""],
+              ["3.2.2.2", "Input power", "", "", "", "X"]],
+             [1.15 * inch, 2.25 * inch] + [0.52 * inch] * 4)
+    b.page_break()
+
+    # a WIDE, very sparse matrix: short upright headers, column rules, still no line between rows
+    b.para("4.2", "Extended verification.",
+           [("Qualification testing shall be performed as specified in TABLE II.", "shall")])
+    b.matrix("TABLE II. Qualification verification matrix.",
+             ["Paragraph"], ["I", "A", "D", "T", "S", "E"],
+             [["3.4.1.1", "", "", "", "X", "", ""], ["3.4.1.2", "", "X", "", "", "", ""],
+              ["3.4.2.1", "X", "", "", "", "", ""], ["3.4.2.2", "", "", "", "", "X", ""],
+              ["3.4.3.1", "", "", "X", "", "", ""], ["3.4.3.2", "", "", "", "", "", "X"]],
+             [1.3 * inch] + [0.48 * inch] * 6, sideways=False, header_height=22)
+
+    # a requirement table with a banner merged over the two right-hand columns
+    b.banner_table("TABLE III. Interface requirements.",
+                   ["Requirement ID", "Requirement Text"], "VERIFICATION", ["Method", "Phase"],
+                   [["IRS-010", "The unit shall accept MIL-STD-1553B bus commands.", "Test", "Qualification"],
+                    ["IRS-011", "The unit shall report its status every 50 milliseconds.", "Test", "Acceptance"]],
+                   [1.05 * inch, 2.75 * inch, 0.85 * inch, 1.05 * inch],
+                   req_col=1, id_col=0, keyword_of=keyword_of)
+
+    def on_page(canvas, doc):
+        if doc.page == 1:
+            return
+        canvas.setFont(FONTS["type"], 10)
+        canvas.drawRightString(letter[0] - 0.9 * inch, letter[1] - 0.6 * inch, "SPEC-E-0055")
+        canvas.drawCentredString(letter[0] / 2, 0.55 * inch, str(doc.page))
+
+    buf = io.BytesIO()
+    SimpleDocTemplate(buf, pagesize=letter, leftMargin=1.0 * inch, rightMargin=1.0 * inch,
+                      topMargin=0.95 * inch, bottomMargin=0.9 * inch).build(b.story, onFirstPage=on_page,
+                                                                            onLaterPages=on_page)
+    b.gt.all_text += ["SPEC-E-0055"]
+    return buf.getvalue(), b.gt
+
+
 def build_spec_d() -> tuple[list[bytes], GroundTruth]:
     body = ParagraphStyle("D", fontName=FONTS["type"], fontSize=11, leading=14.5)
     head = ParagraphStyle("DH", parent=body, fontName=FONTS["type"])
@@ -769,9 +928,18 @@ def main():
     save_pdf([degrade(p, PROFILES["scan"], rng) for p in pages_d], out / "specD_scan.pdf", 300)
     (out / "specD_groundtruth.json").write_text(json.dumps(gt_d.to_json(), indent=2))
 
+    # ---- Document E: table structure (sideways headers, rows without ruling lines) --------
+    pdf_e, gt_e = build_spec_e()
+    (out / "specE_source_digital.pdf").write_bytes(pdf_e)
+    pages_e = rasterize(pdf_e, 300)
+    save_pdf([degrade(p, PROFILES["scan"], rng) for p in pages_e], out / "specE_scan.pdf", 300)
+    pages_e200 = rasterize(pdf_e, 200)
+    save_tiff([degrade(p, PROFILES["photocopy"], rng) for p in pages_e200], out / "specE_photocopy.tif", (200, 200))
+    (out / "specE_groundtruth.json").write_text(json.dumps(gt_e.to_json(), indent=2))
+
     for f in sorted(out.iterdir()):
         print(f"{f.stat().st_size / 1e6:7.2f} MB  {f.name}")
-    for gt in (gt_a, gt_b, gt_c, gt_d):
+    for gt in (gt_a, gt_b, gt_c, gt_d, gt_e):
         print(f"{gt.doc}: {len(gt.requirements)} requirements, {len(gt.captions)} captions, {len(gt.tables)} tables")
 
 
