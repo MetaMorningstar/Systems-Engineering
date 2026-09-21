@@ -130,7 +130,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # The Python versions this release passed both test levels on (64-bit, standard build).
 # Change this only after running tests/test_rules.py and tests/run_regression.py on the new version
@@ -863,7 +863,9 @@ def estimate_dpi_from_text(gray: "np.ndarray") -> Optional[float]:
     if len(heights) < 50:
         return None
     median_h = statistics.median(heights) / scale
-    return float(np.clip(median_h / 0.085, 100, 800))  # ~0.085 in = typical glyph height at 10-12 pt
+    # The floor is low on purpose: a page exported as a screen-sized image really can be near
+    # 60 dpi, and saying so is what lets it be enlarged enough to read (see prepare_page).
+    return float(np.clip(median_h / 0.085, 40, 800))   # ~0.085 in = glyph height at 10-12 pt
 
 
 def rotate_bound(gray: "np.ndarray", angle: float, border: int) -> "np.ndarray":
@@ -1050,8 +1052,13 @@ def prepare_page(raw: RawPage, settings: Settings, orientation: OrientationDetec
             dpi = guess
             notes.append(f"resolution unknown - estimated {dpi:.0f} dpi from text size")
 
-    # 1) resolution normalization (the OCR model is most accurate/fast around target_dpi)
-    scale = float(np.clip(settings.target_dpi / max(dpi, 1.0), 0.35, 2.0))
+    # 1) resolution normalization (the OCR model is most accurate/fast around target_dpi).
+    # Enlarging is allowed to go further than shrinking: a page saved as a screen-sized image can
+    # be a third of the resolution the recogniser wants, and doubling alone does not get it there.
+    scale = float(np.clip(settings.target_dpi / max(dpi, 1.0), 0.35, 4.0))
+    megapixels = gray.shape[0] * gray.shape[1] * scale * scale / 1e6
+    if megapixels > settings.max_page_megapixels:      # never enlarge past the memory limit
+        scale *= math.sqrt(settings.max_page_megapixels / megapixels)
     if abs(scale - 1.0) > 0.12:
         interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=interp)
@@ -1352,6 +1359,9 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
             cell_boxes = _resplit_rows(cell_boxes, lines)
             if cell_boxes is None:
                 return None
+        if found_by in ("inferred", "resplit"):
+            # rows worked out from the text put every LINE on its own row; put the wrapped ones back
+            cell_boxes = _merge_continuation_rows(cell_boxes, lines)
         tbox = (int(et.bbox.x1), int(et.bbox.y1), int(et.bbox.x2), int(et.bbox.y2))
         pad = 0.02 * dpi
         inside = {i for i, ln in enumerate(lines) if box_center_inside(ln.box, tbox, pad) and i not in claimed}
@@ -1396,6 +1406,9 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
             return None                                 # a page border drawn around ordinary paragraphs
         if found_by == "borderless" and not _plausible_borderless_table(grid, n_unique, n_filled):
             return None
+        if found_by == "borderless" and _cut_out_of_a_record(tbox, lines):
+            return None                                 # half a table: leave it to a reading that
+            # sees the header and the first record as well (detect_aligned_tables, below)
         if found_by in ("inferred", "resplit") and _reads_like_prose(grid):
             return None                                 # paragraphs inside a page border, not a table
         # Headers printed sideways read as nothing, or as fragments; turn that band upright and
@@ -1488,6 +1501,97 @@ def _better_row_split(printed: list, inferred: list) -> list:
         if len(alts) == 1 and alts[0][1] == "ruled" and _rows_are_under_split(alts[0][0]):
             kept[i] = [(alts[0][0], "resplit"), alts[0]]
     return kept
+
+
+def _cut_out_of_a_record(tbox: Box, lines: list) -> bool:
+    """True when a candidate's top edge sits INSIDE a record instead of above the table.
+
+    A borderless table is found from where the text lines up, and that can lock on to the lower
+    half of one - taking the wrapped lines for rows and missing the header and the first record
+    above them. The giveaway is that the text immediately above almost touches it: a table starts
+    after a gap, never a fraction of a line below the line before it."""
+    inside = [ln for ln in lines if box_center_inside(ln.box, tbox)]
+    above = [ln for ln in lines
+             if ln.box[3] <= tbox[1] + 2 and min(ln.box[2], tbox[2]) > max(ln.box[0], tbox[0])]
+    if not inside or not above:
+        return False
+    median_h = statistics.median(ln.box[3] - ln.box[1] for ln in inside)
+    return tbox[1] - max(ln.box[3] for ln in above) < 0.5 * median_h
+
+
+def _gap_threshold(gaps: list, median_h: float) -> Optional[float]:
+    """A table's own dividing line between "the next wrapped line" and "the next record".
+
+    Both spacings come from the table's leading, so both are constant through it while differing
+    from table to table - which is why this is measured per table instead of being a fixed number.
+    The dividing line is the biggest step in the sorted gaps, and None when there is no real step,
+    meaning every line is spaced alike and so is a record of its own."""
+    if len(gaps) < 3:
+        return None
+    ordered = sorted(gaps)
+    step, at = max((ordered[i + 1] - ordered[i], i) for i in range(len(ordered) - 1))
+    if step < 0.3 * max(median_h, 1.0):
+        return None
+    return (ordered[at] + ordered[at + 1]) / 2
+
+
+def _record_breaks(row_ink: list, row_columns: list, median_h: float) -> list:
+    """Which rows of text BEGIN a record of a table, given each row's ink (y0, y1) and the set of
+    columns it fills. A record is one row of the table plus the lines its cells wrap onto.
+
+    Three things are tried, strongest first:
+      1. The key column. Where the left-hand column carries a value on some rows but not others -
+         an ID, a paragraph number, a signal name - those rows are the records and the rest are
+         wrapped lines. This is what the table itself says, so it is believed first.
+      2. The leading. Lines wrapped inside a record sit closer together than records do, so one
+         threshold per table separates them (_gap_threshold).
+      3. Neither: every line is a record, which is what a matrix of one-line entries looks like."""
+    n = len(row_ink)
+    if n < 2:
+        return list(range(n))
+    keyed = [i for i, cols in enumerate(row_columns) if 0 in cols]
+    if 2 <= len(keyed) < n:
+        return keyed if keyed and keyed[0] == 0 else [0] + keyed
+    gaps = [row_ink[i][0] - row_ink[i - 1][1] for i in range(1, n)]
+    cut = _gap_threshold(gaps, median_h)
+    if cut is None:
+        return list(range(n))
+    return [0] + [i for i, gap in enumerate(gaps, start=1) if gap > cut]
+
+
+def _merge_continuation_rows(cell_boxes: list, lines: list) -> list:
+    """Join the grid rows that are really the wrapped lines of one record.
+
+    Row separators that were never printed have to be worked out from the text, and both img2table
+    and _resplit_rows put every LINE of text on a row of its own. That is right for a matrix whose
+    entries are one line each, and wrong for a requirement table, where a cell wraps over two or
+    three lines and all of them belong to the record that started it."""
+    if len(cell_boxes) < 2:
+        return cell_boxes
+    row_ink, row_columns = [], []
+    for row in cell_boxes:
+        inside, columns = [], set()
+        for c, cb in enumerate(row):
+            here = [ln for ln in lines if cb is not None and box_center_inside(ln.box, cb)]
+            if here:
+                columns.add(c)
+                inside += here
+        present = [cb for cb in row if cb is not None]
+        fallback = box_union(present) if present else (0, 0, 0, 0)
+        row_ink.append((min((ln.box[1] for ln in inside), default=fallback[1]),
+                        max((ln.box[3] for ln in inside), default=fallback[3])))
+        row_columns.append(columns)
+    heights = [ln.box[3] - ln.box[1] for ln in lines]
+    starts = _record_breaks(row_ink, row_columns, statistics.median(heights) if heights else 0.0)
+    if len(starts) == len(cell_boxes):
+        return cell_boxes
+    merged = []
+    for first, stop in zip(starts, starts[1:] + [len(cell_boxes)]):
+        block = cell_boxes[first:stop]
+        merged.append([box_union([row[c] for row in block if c < len(row) and row[c] is not None])
+                       if any(c < len(row) and row[c] is not None for row in block) else None
+                       for c in range(max(len(row) for row in block))])
+    return merged
 
 
 def _resplit_rows(cell_boxes: list, lines: list) -> Optional[list]:
@@ -1835,40 +1939,50 @@ def detect_aligned_tables(lines: list, dpi: float, claimed: set) -> list:
             if gap > 2.2 * char_h:
                 break
             if len(rows[m]["segs"]) >= 2:
-                run.append(m)
-            elif m + 1 < len(rows) and len(rows[m + 1]["segs"]) >= 2 and rows[m + 1]["box"][1] - rows[m]["box"][3] <= 2.2 * char_h:
-                run.append(m)             # a wrapped cell line between two table rows
-            else:
+                run.append(m)                 # another row of the table
+                m += 1
+                continue
+            # A line with no cells of its own is a cell still wrapping, but only while it sits
+            # tight against the line above the way wrapped lines do; set off by more than that it
+            # is the caption of the next table, or the text below this one. However MANY wrapped
+            # lines follow is not the question - demanding that the next row have cells again, as
+            # this once did, ended the table at the first cell that wrapped over two lines.
+            if gap > 0.8 * char_h:
                 break
-            m += 1
-        # a wrapped cell line directly below the last row ("... Considerations and" / "Laboratory Tests")
-        if (m < len(rows) and len(rows[m]["segs"]) == 1 and len(rows[run[-1]]["segs"]) >= 2
-                and rows[m]["box"][1] - rows[run[-1]]["box"][3] <= 0.8 * char_h
-                and rows[m]["box"][0] > min(w.box[0] for _, ws in rows[run[-1]]["segs"] for w in ws) + 2 * char_h):
             run.append(m)
             m += 1
-        k = m
+        k = max(m, k + 1)          # always move on, whatever the code below does with its own names
         multi = [r for r in run if len(rows[r]["segs"]) >= 2]
         if len(multi) < 3:
             continue
-        # column bands = merged horizontal extents of the cells of all multi-cell rows
+        # Which rows start a record, and which are the lines its cells wrap onto. A wrapped line
+        # can itself break into two segments ("completed without a fault." | "reset." - two columns
+        # wrapping at once), so the count of segments cannot decide this; _record_breaks uses the
+        # key column and the table's own leading instead.
+        provisional = _merge_intervals([(min(w.box[0] for w in ws), max(w.box[2] for w in ws))
+                                        for r in multi for _, ws in rows[r]["segs"]], 0.6 * char_h)
+        if len(provisional) < 2:
+            continue
+        row_ink = [(rows[r]["box"][1], rows[r]["box"][3]) for r in run]
+        row_cols = [{_nearest_band(w, provisional) for _i, ws in rows[r]["segs"] for w in ws} for r in run]
+        starts = set(_record_breaks(row_ink, row_cols, char_h))
+        # The bands are measured from the record rows only: a wrapped line breaks where its text
+        # happens to end, and letting that count would invent columns of its own.
         bands = _merge_intervals([(min(w.box[0] for w in ws), max(w.box[2] for w in ws))
-                                  for r in multi for _, ws in rows[r]["segs"]], 0.6 * char_h)
-        if len(bands) < 2:
+                                  for pos, r in enumerate(run) if pos in starts
+                                  for _, ws in rows[r]["segs"]], 0.6 * char_h)
+        if len(bands) < 2 or sum(1 for pos in starts if len(rows[run[pos]]["segs"]) >= 2) < 3:
             continue
         grid, conf, words_grid, used = [], [], [], set()
-        for r in run:
+        for pos, r in enumerate(run):
             cells = [[] for _ in bands]
             for i, ws in rows[r]["segs"]:
                 for w in ws:
-                    cx = (w.box[0] + w.box[2]) / 2
-                    col = min(range(len(bands)), key=lambda b: 0 if bands[b][0] <= cx <= bands[b][1]
-                              else min(abs(cx - bands[b][0]), abs(cx - bands[b][1])))
-                    cells[col].append(w)
+                    cells[_nearest_band(w, bands)].append(w)
                 used.add(i)
             texts = [_join_words_in_reading_order(c) for c in cells]
             confs = [min((w.conf for w in c), default=1.0) for c in cells]
-            if len(rows[r]["segs"]) < 2 and grid:          # wrapped line: add to the row above
+            if pos not in starts and grid:                 # a wrapped line: add it to its own record
                 for c, t in enumerate(texts):
                     if t:
                         grid[-1][c] = (grid[-1][c] + " " + t).strip()
@@ -2119,6 +2233,13 @@ def _figure_is_really_text(fig_box: Box, lines_inside: list) -> bool:
 
 
 # ---- 6e. Reading order: recursive XY-cut ----------------------------------------------
+def _nearest_band(word, bands: list) -> int:
+    """The column band a word sits in, or the nearest one when it sits between two."""
+    cx = (word.box[0] + word.box[2]) / 2
+    return min(range(len(bands)), key=lambda b: 0 if bands[b][0] <= cx <= bands[b][1]
+               else min(abs(cx - bands[b][0]), abs(cx - bands[b][1])))
+
+
 def _merge_intervals(intervals: list, tolerance: float) -> list:
     out = []
     for a, b in sorted(intervals):

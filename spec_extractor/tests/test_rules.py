@@ -1216,6 +1216,191 @@ def test_sideways_headers_are_only_read_where_the_headers_are_missing():
 
 
 # =====================================================================================================================
+# Records: telling a row of a table from the lines its cells wrap onto
+#
+# Where a table's row separators were never printed, the rows have to be worked out from the text,
+# and the first thing that goes wrong is putting every LINE on a row of its own. These cases come
+# from pages supplied after a run against real Systems Engineering material.
+# =====================================================================================================================
+def test_gap_threshold_splits_a_tables_two_spacings():
+    """Wrapped lines sit tight together, records are set apart; the dividing line is measured from
+    the table itself because the leading differs from one document to the next."""
+    gaps = [18, 1, 3, 23, -2, -2, 24, 22, -1, 0]          # measured off a supplied page
+    cut = se._gap_threshold(gaps, 36)
+    assert cut is not None and 3 < cut < 18, cut
+    assert [g > cut for g in gaps] == [True, False, False, True, False, False, True, True, False, False]
+
+
+def test_evenly_spaced_lines_have_no_threshold():
+    """A matrix of one-line entries has one spacing only: there is nothing to split, and saying so
+    is what keeps every one of its rows a record of its own."""
+    assert se._gap_threshold([20, 21, 19, 20, 22], 36) is None
+    assert se._gap_threshold([18, 1], 36) is None                      # too few gaps to judge
+
+
+def test_record_breaks_follow_the_key_column():
+    """The strongest signal: a value in the left-hand column starts a record, and a line without
+    one continues the record above, however many such lines there are."""
+    ink = [(0, 30), (40, 70), (72, 100), (102, 130), (160, 190), (192, 220)]
+    cols = [{0, 1, 2}, {0, 1, 2}, {1}, {1}, {0, 1, 2}, {1}]
+    assert se._record_breaks(ink, cols, 30) == [0, 1, 4]
+
+
+def test_record_breaks_fall_back_to_the_leading():
+    """With no key column to go by - every row fills every column - the spacing decides."""
+    ink = [(0, 30), (34, 64), (66, 96), (130, 160), (162, 192)]
+    cols = [{0, 1}] * 5
+    assert se._record_breaks(ink, cols, 30) == [0, 3]
+
+
+def test_record_breaks_keep_every_row_when_nothing_distinguishes_them():
+    ink = [(0, 30), (50, 80), (100, 130), (150, 180)]
+    assert se._record_breaks(ink, [{0, 1}] * 4, 30) == [0, 1, 2, 3]
+
+
+def test_continuation_rows_are_merged_back_into_their_record():
+    """One row per line of text goes in, one row per record comes out, and the merged cell boxes
+    cover the whole record so its text is gathered from all of its lines."""
+    xs = [100, 400, 900]
+    ys = [(0, 30), (34, 64), (66, 96), (130, 160)]          # record, wrap, wrap, record
+    cell_boxes = [[(xs[0], y0, xs[1], y1), (xs[1], y0, xs[2], y1)] for y0, y1 in ys]
+    lines = [make_line("SYS-101", xs[0] + 5, 0, height=30), make_line("The radar shall detect", xs[1] + 5, 0, height=30),
+             make_line("a target at a range of", xs[1] + 5, 34, height=30),
+             make_line("not less than 150 km.", xs[1] + 5, 66, height=30),
+             make_line("SYS-102", xs[0] + 5, 130, height=30), make_line("The radar shall track", xs[1] + 5, 130, height=30)]
+    merged = se._merge_continuation_rows(cell_boxes, lines)
+    assert len(merged) == 2, merged
+    assert merged[0][1] == (xs[1], 0, xs[2], 96), merged[0][1]         # the record's whole height
+    assert merged[1][0] == (xs[0], 130, xs[1], 160), merged[1][0]
+
+
+def test_a_grid_of_real_rows_is_left_alone_by_the_merge():
+    """A matrix whose entries are one line each must come through untouched."""
+    xs, ys = [100, 400, 900], [(0, 30), (50, 80), (100, 130)]
+    cell_boxes = [[(xs[0], y0, xs[1], y1), (xs[1], y0, xs[2], y1)] for y0, y1 in ys]
+    lines = []
+    for r, (para, title) in enumerate([("3.2.1.1", "Detection range"), ("3.2.1.2", "Range accuracy"),
+                                       ("3.2.2.1", "Weight")]):
+        y = ys[r][0]
+        lines += [make_line(para, xs[0] + 5, y, height=30), make_line(title, xs[1] + 5, y, height=30)]
+    assert se._merge_continuation_rows(cell_boxes, lines) == cell_boxes
+
+
+def test_a_candidate_that_starts_inside_a_record_is_rejected():
+    """Aligned-text detection can lock on to the lower half of a table, taking its wrapped lines
+    for rows and missing the header and first record above them."""
+    lines = [make_line("READY Set when the power-on self test has", 200, 100, height=30),
+             make_line("completed without a fault.", 400, 132, height=30),
+             make_line("FAULT Set when any line replaceable unit", 200, 190, height=30)]
+    assert se._cut_out_of_a_record((200, 130, 1200, 230), lines)       # begins a third of a line below
+    assert not se._cut_out_of_a_record((200, 90, 1200, 230), lines)    # begins at the top of the table
+
+
+def test_a_cell_wrapping_over_two_lines_does_not_end_a_borderless_table():
+    """The bug behind a whole table being lost: the run stopped at the first cell that wrapped
+    over two lines, because it demanded that the very next row have cells again."""
+    lines = [make_line("Req ID", 200, 400, height=21), make_line("Requirement", 520, 400, height=21),
+             make_line("Method", 1500, 400, height=21)]
+    rows = [("SYS-101", ["The radar shall detect a target having a radar", "cross section of 1 square meter at a range",
+                         "of not less than 150 km."], "T"),
+            ("SYS-102", ["The radar shall maintain not less than 200", "simultaneous tracks while continuing to",
+                         "search the full surveillance volume."], "A, T"),
+            ("SYS-103", ["The radar shall operate from 115 VAC."], "T"),
+            ("SYS-104", ["The operator console shall display all tracks,", "alerts and status within one second."], "D")]
+    y = 455
+    for req_id, wrapped, method in rows:
+        lines.append(make_line(req_id, 200, y, height=21))
+        lines.append(make_line(method, 1500, y, height=21))
+        for n, part in enumerate(wrapped):
+            lines.append(make_line(part, 520, y + 26 * n, height=21))
+        y += 26 * len(wrapped) + 38
+    found = se.detect_aligned_tables(lines, DPI, set())
+    assert found, "a borderless table whose cells wrap over three lines was lost"
+    grid = found[0][0].grid
+    assert len(grid) == 5 and len(grid[0]) == 3, grid
+    assert [r[0] for r in grid[1:]] == ["SYS-101", "SYS-102", "SYS-103", "SYS-104"], grid
+    assert "150 km." in grid[1][1] and "surveillance volume." in grid[2][1], grid
+    assert [r[2] for r in grid[1:]] == ["T", "A, T", "T", "D"], grid
+
+
+def test_two_borderless_tables_on_one_page_are_both_found():
+    """Also a guard on the scan itself: the loop that walks the page must move on after each
+    table. A version of this code reused its counter inside the table it had just built, so the
+    scan restarted for ever and no page with two borderless tables ever finished."""
+    lines = []
+    for table, top in ((("Signal", "Description", "Remarks"), 300), (("ID", "Requirement", "Method"), 900)):
+        lines += [make_line(table[0], 200, top, height=21), make_line(table[1], 520, top, height=21),
+                  make_line(table[2], 1400, top, height=21)]
+        for n in range(3):
+            y = top + 60 + 64 * n
+            lines += [make_line(f"ITEM-{n}", 200, y, height=21),
+                      make_line("Set when the power-on self test has", 520, y, height=21),
+                      make_line("completed without a fault.", 520, y + 26, height=21),
+                      make_line("None.", 1400, y, height=21)]
+    found = se.detect_aligned_tables(lines, DPI, set())
+    assert len(found) == 2, [(t.n_rows, t.n_cols) for t, _, _, _ in found]
+    for table, _tbox, _used, _c in found:
+        assert (table.n_rows, table.n_cols) == (4, 3), table.grid
+
+
+def test_boxed_table_with_only_a_header_rule_gives_one_row_per_record():
+    """The layout the supplied pages showed most often: a box and a line under the headers, with
+    nothing between the rows, and requirement cells that wrap over three lines."""
+    xs = [300, 700, 1500, 1750]
+    img = np.full((PAGE_H, PAGE_W), 255, np.uint8)
+    cv2.rectangle(img, (xs[0], 380), (xs[-1], 1180), 0, 2)
+    for x in xs[1:-1]:
+        cv2.line(img, (x, 380), (x, 1180), 0, 2)
+    cv2.line(img, (xs[0], 440), (xs[-1], 440), 0, 2)                   # under the headers only
+    lines = []
+
+    def put(text, x, y):
+        words = _draw_words(img, text, x, y, scale=0.7)
+        lines.append(se.Line(text, 0.97, se.box_union(w.box for w in words), words))
+
+    for text, x in (("ID", xs[0]), ("Requirement", xs[1]), ("Verification", xs[2])):
+        put(text, x + 12, 396)
+    y = 460
+    for n, (req_id, wrapped, method) in enumerate([
+            ("IFC-101", ["The radar shall detect a target having", "a radar cross section of 1 square meter",
+                         "at a range of not less than 150 km."], "T"),
+            ("IFC-102", ["The radar shall maintain not less than", "200 simultaneous tracks while it",
+                         "searches the full surveillance volume."], "A, T"),
+            ("IFC-103", ["The radar shall operate from 115 VAC."], "T")]):
+        put(req_id, xs[0] + 12, y)
+        put(method, xs[2] + 12, y)
+        for i, part in enumerate(wrapped):
+            put(part, xs[1] + 12, y + 34 * i)
+        y += 34 * len(wrapped) + 40
+    found = se.detect_tables(img, lines, DPI, settings(detect_tables=True))
+    assert found, "a table boxed with only a header rule was not detected"
+    grid = found[0][0].grid
+    assert len(grid) == 4, grid                                        # header + three records, not per line
+    assert [r[0] for r in grid[1:]] == ["IFC-101", "IFC-102", "IFC-103"], grid
+    assert "150 km." in grid[1][1], grid[1][1]
+    assert [r[2] for r in grid[1:]] == ["T", "A, T", "T"], grid
+
+
+def test_a_page_saved_at_screen_size_is_enlarged_enough_to_read():
+    """A page exported at screen size is about a third of the resolution the recogniser wants.
+    Assuming the usual 300 dpi and then shrinking toward 220 made such a page worse, not better;
+    the resolution estimated from the text has to be believed, and the enlargement allowed to go
+    past doubling. Run on one of the supplied pages, which is exactly that kind of image."""
+    page = HERE / "pages" / "specG_page1.png"
+    if not page.exists():                       # the supplied pages are optional
+        return
+    gray = cv2.imread(str(page), cv2.IMREAD_GRAYSCALE)
+    estimated = se.estimate_dpi_from_text(gray)
+    assert estimated is not None and estimated < 100, estimated        # a screen-sized page, not a scan
+    s = settings(auto_rotate=False, deskew=False, clean_background=False, denoise=False)
+    raw = se.RawPage(1, gray, float(s.fallback_dpi), False)             # no resolution recorded
+    prep = se.prepare_page(raw, s, None, None)
+    assert prep.ocr_image.shape[1] > 2.5 * gray.shape[1], (gray.shape, prep.ocr_image.shape)
+    assert 150 <= prep.dpi <= 300, prep.dpi                             # brought near the target
+    assert prep.ocr_image.size / 1e6 <= s.max_page_megapixels
+
+
+# =====================================================================================================================
 # Command line and file handling
 # =====================================================================================================================
 def test_page_selection():

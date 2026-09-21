@@ -23,7 +23,7 @@ ROOT = HERE.parent
 CORPUS = HERE / "corpus"
 RESULTS = HERE / "_results"
 FILES = ["specA_clean.pdf", "specA_scan.pdf", "specA_photocopy.tif", "specB_scan.pdf", "specB_photocopy.tif", "specC_fax.tif",
-         "specD_scan.pdf", "specE_scan.pdf", "specE_photocopy.tif"]
+         "specD_scan.pdf", "specE_scan.pdf", "specE_photocopy.tif", "specG_pages.tif"]
 
 # Minimum acceptable scores. "ref_errors" = requirement rows with a wrong paragraph number / ID;
 # "caption_link_errors" = tables that carry another table's caption (or none).

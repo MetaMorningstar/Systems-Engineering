@@ -665,6 +665,97 @@ def build_spec_e() -> tuple[bytes, GroundTruth]:
     return buf.getvalue(), b.gt
 
 
+# --------------------------------------------------------------------------------------
+# Document G: two page images supplied from outside, not rendered here
+#
+# These two pages came from a run against real Systems Engineering material and are kept
+# exactly as they were supplied, at their own (low) resolution: a page exported at screen size
+# rather than scanned. They carry, in one place, every table shape that has given trouble:
+#
+#   TABLE XI    a verification matrix - column rules and a line under the headers, no line
+#               between the rows
+#   TABLE XII   a requirement table with no ruling lines at all, whose cells wrap over three lines
+#   TABLE XIII  a requirement table boxed with a line under the headers only, cells wrapping over
+#               three lines - the shape that used to give one table row per LINE of text
+#   TABLE XIV   a borderless table whose second and third columns wrap at the same time
+#   TABLE XV    a fully ruled requirement table (the control: it was always read correctly)
+#
+# The ground truth below is the text as printed on those pages, so the scoring measures what the
+# tool makes of them, not what the tool happens to produce.
+# --------------------------------------------------------------------------------------
+SPECG_REQUIREMENT_TEXTS = [
+    "The radar shall detect a target having a radar cross section of 1 square meter at a range of "
+    "not less than 150 km.",
+    "The radar shall maintain not less than 200 simultaneous tracks while continuing to search the "
+    "full surveillance volume.",
+    "The radar shall operate from 115 VAC.",
+    "The operator console shall display all tracks, alerts and system status messages within one "
+    "second of detection.",
+]
+SPECG_METHODS = ["T", "A, T", "T", "D"]
+
+
+def _specg_requirement_table(headers: list[str], prefix: str) -> list[list[str]]:
+    return [headers] + [[f"{prefix}-10{i + 1}", text, SPECG_METHODS[i]]
+                        for i, text in enumerate(SPECG_REQUIREMENT_TEXTS)]
+
+
+def build_spec_g() -> GroundTruth:
+    """The ground truth for the two supplied page images (no rendering: the pages already exist)."""
+    gt = GroundTruth(doc="specG")
+
+    # ---- page 1 -------------------------------------------------------------------
+    gt.requirements.append(GTReq("Each requirement shall be verified by the method shown in TABLE XI.",
+                                 "shall", "paragraph", "4.1"))
+    gt.captions.append({"kind": "table", "text": "TABLE XI. Verification cross reference matrix."})
+    gt.tables.append({"caption": "TABLE XI. Verification cross reference matrix.", "optional": False, "rows": [
+        ["Paragraph", "Title", "I", "A", "D", "T"],
+        ["3.2.1.1", "Detection range", "", "", "", "X"],
+        ["3.2.1.2", "Range accuracy", "", "X", "", "X"],
+        ["3.2.1.3", "Operating modes", "", "", "X", ""],
+        ["3.2.1.4", "Track capacity", "", "", "", "X"],
+        ["3.2.2.1", "Weight", "X", "", "", ""],
+        ["3.2.2.2", "Input power", "", "", "", "X"],
+        ["3.2.3", "Environmental conditions", "", "X", "", "X"],
+        ["3.3.1", "Materials", "X", "", "", ""]]})
+
+    for caption, headers, prefix in (
+            ("TABLE XII. System requirements.", ["Req ID", "Requirement", "Method"], "SYS"),
+            ("TABLE XIII. Interface requirements.", ["ID", "Requirement", "Verification"], "IFC")):
+        rows = _specg_requirement_table(headers, prefix)
+        gt.captions.append({"kind": "table", "text": caption})
+        gt.tables.append({"caption": caption, "rows": rows, "optional": False})
+        for row in rows[1:]:
+            gt.requirements.append(GTReq(row[1], keyword_of(row[1]), "table", row[0]))
+
+    # ---- page 2 -------------------------------------------------------------------
+    gt.captions.append({"kind": "table", "text": "TABLE XIV. Discrete signals."})
+    gt.tables.append({"caption": "TABLE XIV. Discrete signals.", "optional": False, "rows": [
+        ["Signal", "Description", "Remarks"],
+        ["READY", "Set when the power-on self test has completed without a fault.",
+         "Latched until the next reset."],
+        ["FAULT", "Set when any line replaceable unit reports a failure.", "Cleared by the operator."],
+        ["STANDBY", "Set in standby mode.", "None."]]})
+
+    rows = _specg_requirement_table(["ID", "Requirement", "Verification"], "PWR")
+    gt.captions.append({"kind": "table", "text": "TABLE XV. Power requirements."})
+    gt.tables.append({"caption": "TABLE XV. Power requirements.", "rows": rows, "optional": False})
+    for row in rows[1:]:
+        gt.requirements.append(GTReq(row[1], keyword_of(row[1]), "table", row[0]))
+
+    stem = "The radar shall provide the following modes:"
+    for marker, item in (("a.", "Long range search mode, which shall cover the full instrumented "
+                                "range of the radar in all weather."),
+                         ("b.", "Track-while-scan mode, which shall update every track at least "
+                                "once per antenna revolution."),
+                         ("c.", "Built-in test mode.")):
+        gt.requirements.append(GTReq(f"{stem} {marker} {item}", "shall", "list", "4.2"))
+
+    gt.all_text += [t for table in gt.tables for row in table["rows"] for t in row if t]
+    gt.all_text += [c["text"] for c in gt.captions]
+    return gt
+
+
 def build_spec_d() -> tuple[list[bytes], GroundTruth]:
     body = ParagraphStyle("D", fontName=FONTS["type"], fontSize=11, leading=14.5)
     head = ParagraphStyle("DH", parent=body, fontName=FONTS["type"])
@@ -937,9 +1028,22 @@ def main():
     save_tiff([degrade(p, PROFILES["photocopy"], rng) for p in pages_e200], out / "specE_photocopy.tif", (200, 200))
     (out / "specE_groundtruth.json").write_text(json.dumps(gt_e.to_json(), indent=2))
 
+    # ---- Document G: the two supplied page images, kept at their own resolution ----------
+    pages_dir = Path(__file__).parent / "pages"
+    supplied = sorted(pages_dir.glob("specG_page*.png"))
+    if supplied:
+        gt_g = build_spec_g()
+        save_tiff([np.array(Image.open(p).convert("L")) for p in supplied], out / "specG_pages.tif", (96, 96))
+        (out / "specG_groundtruth.json").write_text(json.dumps(gt_g.to_json(), indent=2))
+    else:
+        gt_g = None
+        print(f"NOTE: {pages_dir} holds no specG_page*.png - Document G skipped")
+
     for f in sorted(out.iterdir()):
         print(f"{f.stat().st_size / 1e6:7.2f} MB  {f.name}")
-    for gt in (gt_a, gt_b, gt_c, gt_d, gt_e):
+    for gt in (gt_a, gt_b, gt_c, gt_d, gt_e, gt_g):
+        if gt is None:
+            continue
         print(f"{gt.doc}: {len(gt.requirements)} requirements, {len(gt.captions)} captions, {len(gt.tables)} tables")
 
 

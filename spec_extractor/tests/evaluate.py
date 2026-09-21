@@ -84,16 +84,25 @@ def read_items(xlsx: Path) -> list:
     return items, tables
 
 
-def greedy_match(truths: list, founds: list, key_t, key_f, threshold: float) -> list:
+def greedy_match(truths: list, founds: list, key_t, key_f, threshold: float,
+                 id_t=None, id_f=None) -> list:
+    """Pair each expected row with the extracted row it matches best.
+
+    Where several rows carry the SAME text - a specification can repeat one requirement in three
+    tables and change only the identifier, as the supplied pages do - the identifiers break the
+    tie, so each expected row is paired with its own copy rather than an arbitrary one. Without
+    that, identical text produces matches that are correct but credited to the wrong row, and the
+    paragraph-number score counts errors that are not there."""
     pairs = []
     for ti, t in enumerate(truths):
         for fi, f in enumerate(founds):
             s = similarity(key_t(t), key_f(f))
             if s >= threshold:
-                pairs.append((s, ti, fi))
+                same_id = bool(id_t and id_f and id_t(t) and ref_ok(id_t(t), id_f(f)))
+                pairs.append((s + (0.001 if same_id else 0.0), s, ti, fi))
     pairs.sort(reverse=True)
     used_t, used_f, matches = set(), set(), []
-    for s, ti, fi in pairs:
+    for _rank, s, ti, fi in pairs:
         if ti not in used_t and fi not in used_f:
             used_t.add(ti)
             used_f.add(fi)
@@ -107,7 +116,8 @@ def evaluate(xlsx: Path, gt: dict, details: bool) -> dict:
     caps = [i for i in items if i.get("Type") in ("Table Caption", "Figure Caption")]
     tabs = [i for i in items if i.get("Type") == "Table"]
     gt_reqs = gt["requirements"]
-    m = greedy_match(gt_reqs, reqs, lambda t: t["text"], lambda f: f.get("Content") or "", 0.90)
+    m = greedy_match(gt_reqs, reqs, lambda t: t["text"], lambda f: f.get("Content") or "", 0.90,
+                     id_t=lambda t: t.get("doc_id", ""), id_f=lambda f: f.get("Doc Ref") or "")
     matched_t = {ti for ti, _, _ in m}
     matched_f = {fi for _, fi, _ in m}
     exact = sum(1 for ti, fi, _ in m if norm(gt_reqs[ti]["text"]) == norm(reqs[fi]["Content"]))
