@@ -125,12 +125,12 @@ import sysconfig
 import time
 import traceback
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 # The Python versions this release passed both test levels on (64-bit, standard build).
 # Change this only after running tests/test_rules.py and tests/run_regression.py on the new version
@@ -379,6 +379,17 @@ class Settings:
     detect_tables: bool = True
     borderless_tables: bool = True      # also look for tables without ruling lines
     merge_continued_tables: bool = True # join a table that continues on the next page
+    # Many specifications rule a table's columns but print no line between the rows; verification
+    # cross-reference matrices nearly always do. A row only exists between two horizontal lines, so
+    # such a table is otherwise missed completely. With this on, the separators that were never
+    # printed are worked out from where the text sits - but only where the printed lines clearly do
+    # not describe the table, so a table that draws all of its lines keeps exactly the grid it had.
+    infer_missing_rules: bool = True
+    # Column headers printed sideways (turned a quarter turn, because the words are far wider than
+    # the columns they head) are normal in verification matrices, and the recogniser reads upright
+    # text only: it returns nothing for such a band, or short fragments ("INS OON" for INSPECTION).
+    # Either way the band is cut out, turned upright and read again.
+    sideways_headers: bool = True
 
     # ---- Requirements -------------------------------------------------------------
     # keyword -> requirement class. Matching ignores case. Multi-word phrases are fine.
@@ -416,7 +427,8 @@ class Settings:
         """Settings that change OCR/layout results (used for the cache key)."""
         keys = ["target_dpi", "fallback_dpi", "max_page_megapixels", "auto_rotate", "deskew",
                 "max_skew_degrees", "clean_background", "denoise", "remove_color_marks", "engine",
-                "ocr_model_size", "min_text_confidence", "detect_tables", "borderless_tables"]
+                "ocr_model_size", "min_text_confidence", "detect_tables", "borderless_tables",
+                "infer_missing_rules", "sideways_headers"]
         values = {k: getattr(self, k) for k in keys}
         values["keywords"] = sorted(self.keywords)      # the layout rules protect keyword sentences
         blob = json.dumps(values, sort_keys=True, default=str)
@@ -1271,7 +1283,7 @@ def _estimate_word_boxes(text: str, box: Box, conf: float) -> list:
 
 
 # ---- 6c. Tables (img2table finds the grid; our OCR words fill the cells) --------------
-def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Settings) -> list:
+def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Settings, ocr=None) -> list:
     """Return [(TableData, table_box, set_of_line_indexes_inside, caption_lines)] for one page.
     img2table finds the table grid (ruling lines, or aligned text for borderless tables);
     the words we already OCR'd are then placed into the cells."""
@@ -1297,35 +1309,49 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
 
     ok, png = cv2.imencode(".png", gray)
 
-    def run_img2table(borderless: bool) -> list:
+    def run_img2table(borderless: bool, infer: bool = False) -> list:
         try:
             return I2TImage(src=png.tobytes(), detect_rotation=False).extract_tables(
-                ocr=_PrecomputedOCR() if records else None, implicit_rows=False, implicit_columns=False,
+                ocr=_PrecomputedOCR() if records else None, implicit_rows=infer, implicit_columns=infer,
                 borderless_tables=borderless, min_confidence=1)
         except Exception as exc:
             LOG.warning("Table detection failed on a page (%s) - continuing without tables", exc)
             return []
 
-    # Pass 1: ruled tables (reliable). Pass 2: borderless candidates, which must pass
-    # stricter checks because aligned lists and indented text can look like tables.
-    candidates = [(et, False) for et in run_img2table(False)]
+    # Pass 1: ruled tables, using only the ruling lines that are really printed (most reliable).
+    ruled = [(et, "ruled") for et in run_img2table(False)]
+    # Pass 2: the same page with the separators that were never printed filled in from the text.
+    # This is what finds a table whose columns are ruled but whose rows are not - the usual layout
+    # of a verification matrix, which pass 1 does not see at all, because a row needs two
+    # horizontal lines before it exists. _better_row_split then decides, area by area, which
+    # reading to believe, and returns each area as the readings to try in order, best first.
+    candidates = (_better_row_split(ruled, run_img2table(False, infer=True))
+                  if settings.infer_missing_rules else [[alt] for alt in ruled])
+    # Pass 3: borderless candidates, which must pass stricter checks because aligned lists and
+    # indented text can look like tables.
     if settings.borderless_tables:
-        ruled_boxes = [(et.bbox.x1, et.bbox.y1, et.bbox.x2, et.bbox.y2) for et, _ in candidates]
+        ruled_boxes = [_et_box(alts[0][0]) for alts in candidates]
         for et in run_img2table(True):
-            eb = (et.bbox.x1, et.bbox.y1, et.bbox.x2, et.bbox.y2)
+            eb = _et_box(et)
             if not any(box_intersection(eb, rb) > 0.3 * min(box_area(eb), box_area(rb)) for rb in ruled_boxes):
-                candidates.append((et, True))
+                candidates.append([(et, "borderless")])
 
     page_area = gray.shape[0] * gray.shape[1]
     results = []
     claimed = set()
-    for et, borderless in candidates:
+
+    def build(et, found_by: str):
+        """Turn one reading of one area into a table, or return None if it is not a table at all."""
         rows = list(et.content.values())
         if len(rows) < 2 or max((len(r) for r in rows), default=0) < 2:
-            continue
+            return None
         n_cols = max(len(r) for r in rows)
         cell_boxes = [[(int(c.bbox.x1), int(c.bbox.y1), int(c.bbox.x2), int(c.bbox.y2)) for c in r]
                       + [None] * (n_cols - len(r)) for r in rows]
+        if found_by == "resplit":
+            cell_boxes = _resplit_rows(cell_boxes, lines)
+            if cell_boxes is None:
+                return None
         tbox = (int(et.bbox.x1), int(et.bbox.y1), int(et.bbox.x2), int(et.bbox.y2))
         pad = 0.02 * dpi
         inside = {i for i, ln in enumerate(lines) if box_center_inside(ln.box, tbox, pad) and i not in claimed}
@@ -1362,19 +1388,411 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
             if remaining:
                 tbox = (tbox[0], min(cb[1] for cb in remaining), tbox[2], max(cb[3] for cb in remaining))
 
-        if n_filled < max(2, 0.25 * n_unique):
-            continue                                    # mostly empty grid: a drawing or form, not a table
+        # A verification matrix is mostly empty on purpose (one tick per row), so it is judged on
+        # its shape rather than on how many of its cells carry text.
+        if n_filled < max(2, 0.25 * n_unique) and not _is_mark_matrix(grid):
+            return None                                 # mostly empty grid: a drawing or form, not a table
         if box_area(tbox) > 0.6 * page_area and words_in_cells / max(n_filled, 1) > 25:
-            continue                                    # a page border drawn around ordinary paragraphs
-        if borderless and not _plausible_borderless_table(grid, n_unique, n_filled):
-            continue
-        claimed |= inside
+            return None                                 # a page border drawn around ordinary paragraphs
+        if found_by == "borderless" and not _plausible_borderless_table(grid, n_unique, n_filled):
+            return None
+        if found_by in ("inferred", "resplit") and _reads_like_prose(grid):
+            return None                                 # paragraphs inside a page border, not a table
+        # Headers printed sideways read as nothing, or as fragments; turn that band upright and
+        # read it again. The band is put back together first, in case the row inference split it.
+        if settings.sideways_headers and ocr is not None:
+            merges = _collapse_header_band(grid, conf, cell_boxes, words_grid, merges)
+            _add_sideways_headers(gray, grid, cell_boxes, ocr)
         table = TableData(grid=grid, conf=conf, merges=merges, cell_boxes=cell_boxes, cell_words=words_grid,
-                          header_rows=1 if _looks_like_header(grid[0]) else 0)
-        results.append((table, tbox, inside, caption_lines))
+                          header_rows=_header_row_count(grid, merges))
+        return table, tbox, inside, caption_lines
+
+    for alternatives in candidates:
+        # try the best reading of this area first and fall back to the other one, so that a reading
+        # rejected by the checks above never costs us the table itself
+        for et, found_by in alternatives:
+            made = build(et, found_by)
+            if made is not None:
+                claimed |= made[2]
+                results.append(made)
+                break
     if settings.borderless_tables:
         results += detect_aligned_tables(lines, dpi, claimed)
     return results
+
+
+def _et_box(et) -> Box:
+    """The page box of one table found by img2table."""
+    return (et.bbox.x1, et.bbox.y1, et.bbox.x2, et.bbox.y2)
+
+
+def _rows_are_under_split(et) -> bool:
+    """True when the rows of a detected table have each swallowed several rows of text - the sign
+    of row separators that were never printed, or that were too faint to be seen.
+
+    A cell whose text merely WRAPS onto a second line also holds more than one line, so counting
+    lines proves nothing on its own. img2table joins the lines that share a cell with newlines, and
+    two patterns in those give a missing separator away:
+
+    * MOST columns of one grid row hold several lines at once, and at least one holds three or
+      more. When a cell is only wrapping, just the wide column does.
+    * A verification matrix is mostly ticks, so only its LEFT-HAND column shows the crowding: one
+      column holds more lines than the whole table has rows, while two or more of the others hold
+      nothing but marks. The row count is what keeps an ordinary table with one deeply wrapped
+      cell out of this: there, the table has more rows than any one cell has lines."""
+    n_rows = len(et.content)
+    for cells in et.content.values():
+        filled = [c for c in cells if (c.value or "").strip()]
+        if len(filled) < 2:
+            continue
+        depths = [1 + (c.value or "").count("\n") for c in filled]
+        crowded = sum(1 for d in depths if d >= 2)
+        if crowded >= max(2, 0.6 * len(filled)) and max(depths) >= 3:
+            return True
+        def only_marks(cell):
+            return all(RE_MARK_CELL.match(v.strip()) for v in (cell.value or "").split("\n") if v.strip())
+
+        marks_only = sum(1 for c in filled if only_marks(c))
+        deepest = filled[depths.index(max(depths))]
+        if max(depths) > n_rows and marks_only >= 2 and not only_marks(deepest):
+            return True
+    return False
+
+
+def _better_row_split(printed: list, inferred: list) -> list:
+    """Choose, area by area, between a table as its printed ruling lines describe it and the same
+    table with the missing separators worked out from the text.
+
+    Each area comes back as a list of readings to TRY IN ORDER, best first, so that a reading later
+    judged not to be a table at all falls back to the other one instead of losing the table
+    altogether. The inferred reading goes first only where the printed one cannot be right:
+      * nothing at all was found in that area - the columns are ruled but the rows are not, so
+        there are no two horizontal lines to make a row from; or
+      * the printed rows have each swallowed several rows of text (see _rows_are_under_split).
+    A table that prints all of its ruling lines therefore keeps exactly the grid it already had."""
+    kept = [[alt] for alt in printed]
+    for cand in inferred:
+        cb = _et_box(cand)
+        overlaps = [i for i, (et, _) in enumerate(printed)
+                    if box_intersection(cb, _et_box(et)) > 0.5 * min(box_area(cb), box_area(_et_box(et)))]
+        if not overlaps:
+            kept.append([(cand, "inferred")])        # nothing was found here without the inferred rows
+            continue
+        for i in overlaps:
+            et = printed[i][0]
+            if len(cand.content) > len(et.content) and _rows_are_under_split(et):
+                kept[i] = [(cand, "inferred"), printed[i]]    # prefer it, but keep the fallback
+    # Where the printed rules still do not describe the rows and the inference offered nothing
+    # better, cut the rows ourselves from where the text sits (_resplit_rows).
+    for i, alts in enumerate(kept):
+        if len(alts) == 1 and alts[0][1] == "ruled" and _rows_are_under_split(alts[0][0]):
+            kept[i] = [(alts[0][0], "resplit"), alts[0]]
+    return kept
+
+
+def _resplit_rows(cell_boxes: list, lines: list) -> Optional[list]:
+    """New cell boxes for a table whose printed ruling lines do not describe its rows.
+
+    This is the last resort, for when img2table's own row inference gives up as well - it does that
+    on badly degraded scans, where the ink is too broken for it to measure a row pitch. Only the
+    horizontal cuts are new: a grid row that has swallowed several rows of text is cut half-way
+    down the white gap between them, and the columns are left exactly as the printed rules give
+    them. Returns None when there was nothing to cut."""
+    out, changed = [], False
+    for row in cell_boxes:
+        present = [cb for cb in row if cb is not None]
+        if not present:
+            out.append(row)
+            continue
+        band = box_union(present)
+        text_rows = _rows_of([ln for ln in lines if box_center_inside(ln.box, band)])
+        if len(text_rows) < 2:
+            out.append(row)
+            continue
+        cuts = [band[1]]
+        for above, below in zip(text_rows, text_rows[1:]):
+            cuts.append(int((max(ln.box[3] for ln in above) + min(ln.box[1] for ln in below)) / 2))
+        cuts.append(band[3])
+        out += [[None if cb is None else (cb[0], y0, cb[2], y1) for cb in row]
+                for y0, y1 in zip(cuts, cuts[1:])]
+        changed = True
+    return out if changed else None
+
+
+def _header_row_count(grid: list, merges: list) -> int:
+    """How many rows at the top of a table are header rows (nearly always one).
+
+    A second row counts when the first is a banner merged across several columns - the
+    "VERIFICATION METHOD" band printed above the I / A / D / T letters of a verification matrix -
+    and the row underneath reads like headers as well."""
+    if not grid or not _looks_like_header(grid[0]):
+        return 0
+    banner = any(r0 == 0 and r1 == 0 and c1 > c0 for r0, c0, r1, c1 in merges or [])
+    if banner and len(grid) > 2 and _looks_like_header(grid[1]):
+        return 2
+    return 1
+
+
+# ---- 6c-2. Sideways (rotated) column headers -------------------------------------------
+# Verification cross-reference matrices almost always print their method headers sideways
+# ("INSPECTION", "ANALYSIS", ...), because the words are far wider than the columns they head.
+# The recogniser reads upright text only, so such a band comes back either empty or as short
+# fragments ("INS OON" for INSPECTION), and a matrix whose columns have no usable names cannot fill
+# in the Verification column. The pass below cuts out the header band, turns it upright, reads it
+# again and puts each header back on the column whose ink it was printed over.
+def _unrotate_box(box: Box, rotation: int, shape: tuple) -> Box:
+    """Map a box found in a turned-upright crop back onto the crop as it sits on the page.
+
+    `rotation` is the quarter turn that was applied (90 = clockwise, 270 = anticlockwise) and
+    `shape` is the (height, width) of the crop BEFORE it was turned."""
+    h, w = int(shape[0]), int(shape[1])
+    x0, y0, x1, y1 = box
+    if rotation % 360 == 90:        # cv2.ROTATE_90_CLOCKWISE sends (x, y) to (h - y, x)
+        return (y0, h - x1, y1, h - x0)
+    if rotation % 360 == 270:       # cv2.ROTATE_90_COUNTERCLOCKWISE sends (x, y) to (y, w - x)
+        return (w - y1, x0, w - y0, x1)
+    return box
+
+
+def _word_like_score(lines: list) -> float:
+    """How much a reading looks like real words: confident, and mostly letters. Used to decide
+    which way round a sideways header band was printed."""
+    return sum(sum(1 for ch in ln.text if ch.isalpha()) * ln.conf
+               for ln in lines if sum(1 for ch in ln.text if ch.isalpha()) >= 2)
+
+
+def read_sideways_headers(gray: "np.ndarray", header_box: Box, column_bands: list, ocr,
+                          rotation: Optional[int] = None) -> dict:
+    """Read column headers that are printed sideways. Returns {column index: header text}.
+
+    The header band is cut out and turned a quarter turn each way; the turn that produces the more
+    word-like text wins. Every line read is mapped back onto the page, so a header lands on the
+    column whose ink it was printed over."""
+    x0, y0 = max(int(header_box[0]), 0), max(int(header_box[1]), 0)
+    x1, y1 = min(int(header_box[2]), gray.shape[1]), min(int(header_box[3]), gray.shape[0])
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return {}
+    strip = gray[y0:y1, x0:x1]
+    best, best_score = {}, 0.0
+    for rot in ((90, 270) if rotation is None else (rotation,)):
+        try:
+            found = ocr.read(rotate_right_angle(strip, rot))
+        except Exception as exc:            # a failed extra read must never lose the table
+            LOG.debug("Sideways header reading failed (%s)", exc)
+            continue
+        score = _word_like_score(found)
+        if not found or score <= best_score:
+            continue
+        headers = {}
+        for ln in found:
+            bx0, _y0, bx1, _y1 = _unrotate_box(ln.box, rot, strip.shape)
+            center = x0 + (bx0 + bx1) / 2
+            col = next((c for c, (cx0, cx1) in enumerate(column_bands) if cx0 <= center <= cx1), None)
+            if col is not None and ln.text.strip():
+                headers[col] = (headers[col] + " " + ln.text.strip()).strip() if col in headers else ln.text.strip()
+        if headers:
+            best, best_score = headers, score
+    return best
+
+
+def _has_ink(gray: "np.ndarray", box: Box, min_fraction: float = 0.004) -> bool:
+    """True when a region of the page holds a real amount of print, not just paper."""
+    x0, y0 = max(int(box[0]), 0), max(int(box[1]), 0)
+    patch = gray[y0:int(box[3]), x0:int(box[2])]
+    return patch.size > 0 and float((patch < 160).mean()) >= min_fraction
+
+
+def _looks_like_words(text: str) -> bool:
+    """A cell holding an unbroken run of four or more letters reads like a real word. Sideways
+    print read the normal way up comes back as short fragments ("INS OON" for INSPECTION)."""
+    return bool(re.search(r"[A-Za-z]{4,}", text or ""))
+
+
+def _longest_letter_run(text: str) -> int:
+    return max((len(m) for m in re.findall(r"[A-Za-z]+", text or "")), default=0)
+
+
+def _sideways_header_band(grid: list, cell_boxes: list) -> Optional[Box]:
+    """The box of a header row that was probably printed sideways, or None if it was not.
+
+    Either sign is enough. The header cells came back EMPTY - the recogniser found no text at all
+    in that band. Or the header row is far TALLER than the data rows, which is what a quarter-turned
+    word needs, and what was read there does not look like words: upright reading of sideways print
+    returns short fragments rather than nothing."""
+    boxes = cell_boxes[0]
+    present = [cb for cb in boxes if cb is not None]
+    if not present:
+        return None
+    band = box_union(present)
+    if band[3] - band[1] < 8:
+        return None
+    header = grid[0]
+    empty = sum(1 for c, cb in enumerate(boxes)
+                if cb is not None and not (header[c] if c < len(header) else "").strip())
+    if empty >= 2:
+        return band
+    body_heights = [cb[3] - cb[1] for row in cell_boxes[1:] for cb in row if cb is not None]
+    if not body_heights or (band[3] - band[1]) < 2.0 * statistics.median(body_heights):
+        return None
+    garbled = sum(1 for c in range(len(boxes))
+                  if not _looks_like_words(header[c] if c < len(header) else ""))
+    return band if garbled >= 2 else None
+
+
+def _row_height(cell_boxes_row: list) -> float:
+    """The height of one grid row, taken from the tallest cell box it has."""
+    present = [cb for cb in cell_boxes_row if cb is not None]
+    return max((cb[3] - cb[1] for cb in present), default=0.0)
+
+
+def _collapse_header_band(grid: list, conf: list, cell_boxes: list, words_grid: list, merges: list) -> list:
+    """Put a sideways header band back together when the row inference cut it into slices.
+
+    A quarter-turned header needs a tall band, and the fragments that upright reading finds in it
+    ("DEM" above "ON") can look like two rows of text, so the band comes back split. A leading row
+    holding almost nothing is one of those slices and never a row of data, so it is merged into the
+    row below it. Only a band that is much taller than the body rows is treated this way.
+    Returns the (possibly shortened) list of merged-cell ranges."""
+    while len(grid) > 2 and sum(1 for c in grid[0] if (c or "").strip()) < 2:
+        body = [_row_height(cell_boxes[r]) for r in range(2, len(cell_boxes))]
+        # The row BELOW the sliver must itself be far taller than the body rows: that is the tall
+        # band a sideways word needs. Rows of equal height are an ordinary table and are left alone.
+        if not body or _row_height(cell_boxes[1]) < 1.8 * statistics.median(body):
+            break
+        for c in range(len(grid[1])):
+            upper = (grid[0][c] if c < len(grid[0]) else "") or ""
+            grid[1][c] = (upper + " " + (grid[1][c] or "")).strip()
+            if c < len(conf[0]):
+                conf[1][c] = min(conf[0][c], conf[1][c])
+            if c < len(words_grid[0]):
+                words_grid[1][c] = words_grid[0][c] + words_grid[1][c]
+            above = cell_boxes[0][c] if c < len(cell_boxes[0]) else None
+            here = cell_boxes[1][c] if c < len(cell_boxes[1]) else None
+            if above is not None and here is not None:
+                cell_boxes[1][c] = box_union([above, here])    # the crop must cover the whole band
+            elif above is not None:
+                cell_boxes[1][c] = above
+        del grid[0], conf[0], cell_boxes[0], words_grid[0]
+        merges = _merges_without_row(merges, 0)
+    return merges
+
+
+def _add_sideways_headers(gray: "np.ndarray", grid: list, cell_boxes: list, ocr) -> list:
+    """Put back a table's column headers that were printed sideways. Returns the columns changed.
+
+    A header is only written where it beats what upright reading produced, measured by the longest
+    unbroken run of letters: "INSPECTION" beats the "INS OON" that reading it the wrong way up
+    gives, while a header that was read properly in the first place is never overwritten."""
+    if not grid or not cell_boxes or not cell_boxes[0]:
+        return []
+    boxes = cell_boxes[0]
+    band = _sideways_header_band(grid, cell_boxes)
+    if band is None or not _has_ink(gray, band):
+        return []
+    bands = [(cb[0], cb[2]) if cb is not None else (0, 0) for cb in boxes]
+    filled = []
+    for col, text in read_sideways_headers(gray, band, bands, ocr).items():
+        if col < len(grid[0]) and _longest_letter_run(text) > _longest_letter_run(grid[0][col]):
+            grid[0][col] = text
+            filled.append(col)
+    if filled:
+        LOG.debug("Read %d sideways column header(s)", len(filled))
+    return filled
+
+
+# Cells of a verification matrix that mean "this method applies": X, a tick, a dot, a bullet.
+RE_MARK_CELL = re.compile(r"^[xX×✓✔✕✖•●■√*+]$")
+# A paragraph number as it appears in the left-hand column of a verification matrix ("3.2.1.4").
+RE_MATRIX_PARA = re.compile(r"^(?:\d{1,2}|[A-Z])(?:\.[\dlIi|]{1,3}){1,7}\.?$")
+
+
+def _mark_columns(data_rows: list) -> list:
+    """Columns of these DATA rows (headers excluded) holding nothing but a "this applies" mark."""
+    out = []
+    for c in range(max((len(r) for r in data_rows), default=0)):
+        values = [(r[c] or "").strip() for r in data_rows if c < len(r) and (r[c] or "").strip()]
+        if values and all(RE_MARK_CELL.match(v) for v in values):
+            out.append(c)
+    return out
+
+
+def _method_column_run(data_rows: list, n_cols: int) -> list:
+    """The block of columns at the right-hand end of a verification matrix that hold only "this
+    applies" marks, or nothing at all - that is, its method columns.
+
+    A method column is often empty on a given page simply because no requirement on that page uses
+    that method, so an empty column inside the block still counts; this is what lets the block be
+    lined up with the legend even then. Returns [] unless at least two columns really carry a mark,
+    or if a column of text sits among them (then it is not a block of method columns)."""
+    def values(c):
+        return [(r[c] or "").strip() for r in data_rows if c < len(r) and (r[c] or "").strip()]
+
+    def marks_only(c):
+        vals = values(c)
+        return bool(vals) and all(RE_MARK_CELL.match(v) for v in vals)
+
+    marked = [c for c in range(n_cols) if marks_only(c)]
+    if len(marked) < 2:
+        return []
+    run = list(range(min(marked), n_cols))
+    if any(values(c) and not marks_only(c) for c in run):
+        return []                       # a column of text sits among them: not a block of methods
+    return run
+
+
+def _is_mark_matrix(grid: list) -> bool:
+    """True for a verification cross-reference matrix: a column of paragraph numbers beside two or
+    more columns that hold nothing but tick marks. Such a table is mostly empty on purpose, so the
+    "is this really a table?" checks must not judge it on how many of its cells are filled."""
+    if len(grid) < 3 or len(_mark_columns(grid[1:])) < 2:
+        return False
+    for c in range(max((len(r) for r in grid), default=0)):
+        values = [(r[c] or "").strip() for r in grid[1:] if c < len(r) and (r[c] or "").strip()]
+        if len(values) >= max(2, 0.6 * (len(grid) - 1)) and all(RE_MATRIX_PARA.match(v) for v in values):
+            return True
+    return False
+
+
+def column_headers(grid: list, header_rows: int) -> list:
+    """One header per column, read from however many header rows the table has.
+
+    With a banner merged across the top ("VERIFICATION METHOD" above I / A / D / T) the name of a
+    column is the LOWEST header line that carries text, so the banner never hides the real name."""
+    n_cols = max((len(r) for r in grid), default=0)
+    out = []
+    for c in range(n_cols):
+        above = [(grid[r][c] or "").strip() for r in range(min(header_rows, len(grid))) if c < len(grid[r])]
+        out.append(next((x for x in reversed(above) if x), ""))
+    return out
+
+
+def _names_requirement_column(header_row: list) -> bool:
+    """True when a row of headers announces a column of requirement text ("Requirement",
+    "Requirement Text", "Shall Statement"), so cells holding whole sentences are expected."""
+    return any(re.search(r"\b(?:requirement|shall statement)\b", (c or "").lower()) for c in header_row or [])
+
+
+def _reads_like_prose(grid: list) -> bool:
+    """True when the "cells" are really running text - a paragraph or a numbered heading caught
+    inside a border - rather than a table. Monospaced typewriter text lines up very well, so text
+    that merely looks tidy must not be taken for a table."""
+    prose_rows = 0
+    for row in grid:
+        cells = [c for c in row if c]
+        for cell in cells:
+            m = RE_PARA_NUM.match(cell)
+            if m and "." in m.group("num") + m.group("dot") and m.group("rest")[:1].isalpha():
+                return True                            # "4.1 Verification ..." : a numbered paragraph
+            if _is_heading_text(cell) and word_count(cell) >= 2 and RE_PARA_NUM.match(cell):
+                return True                            # "4. VERIFICATION"
+        # one sentence running across the cells: "manufactured and" | "finished" | "in accordance with".
+        # A lone tick in a verification matrix column ("Detection range" | "x") is not a word, so it
+        # never counts as a sentence carrying on into the next cell.
+        if any(re.search(r"[a-z,]$", a) and re.match(r"[a-z]", b) and word_count(a) + word_count(b) >= 3
+               and not RE_MARK_CELL.match(a.strip()) and not RE_MARK_CELL.match(b.strip())
+               for a, b in zip(cells, cells[1:])):
+            prose_rows += 1
+    return prose_rows >= max(2, 0.35 * len(grid))
 
 
 def detect_aligned_tables(lines: list, dpi: float, claimed: set) -> list:
@@ -1463,10 +1881,14 @@ def detect_aligned_tables(lines: list, dpi: float, claimed: set) -> list:
         n_cells = len(grid) * len(bands)
         filled = sum(1 for row in grid for c in row if c)
         words_per_cell = sum(word_count(c) for row in grid for c in row) / max(filled, 1)
-        if filled < 0.6 * n_cells or words_per_cell > 10 or not _plausible_borderless_table(grid, n_cells, filled):
+        # Long cells normally mean running text rather than a table - except where the header row
+        # says outright that a column holds requirement sentences, which are expected to be long.
+        wordy_limit = 40 if _names_requirement_column(grid[0] if grid else []) else 10
+        if ((filled < 0.6 * n_cells and not _is_mark_matrix(grid)) or words_per_cell > wordy_limit
+                or not _plausible_borderless_table(grid, n_cells, filled)):
             continue
         tbox = box_union(lines[i].box for i in used)
-        table = TableData(grid=grid, conf=conf, cell_words=words_grid, header_rows=1 if _looks_like_header(grid[0]) else 0)
+        table = TableData(grid=grid, conf=conf, cell_words=words_grid, header_rows=_header_row_count(grid, []))
         results.append((table, tbox, used, []))
         claimed |= used
     return results
@@ -1552,30 +1974,26 @@ def _merges_without_row(merges: list, row: int) -> list:
 
 def _plausible_borderless_table(grid: list, n_unique: int, n_filled: int) -> bool:
     """Borderless candidates must look like real tables, not lists, headings or prose that happens
-    to line up (monospaced typewriter text lines up very well)."""
+    to line up (monospaced typewriter text lines up very well).
+
+    A verification cross-reference matrix is the one shape that breaks the usual "most cells are
+    filled" rule, because a tick in one method column per row is exactly what it is meant to look
+    like, so it is recognised first and judged on its shape instead."""
     n_rows, n_cols = len(grid), max(len(r) for r in grid)
-    if n_rows < 3 or n_cols < 2 or n_cols > 15 or n_filled < 0.5 * n_unique:
+    if n_rows < 3 or n_cols < 2:
+        return False
+    mark_matrix = _is_mark_matrix(grid)
+    if n_cols > (20 if mark_matrix else 15):
+        return False
+    if n_filled < 0.5 * n_unique and not mark_matrix:
         return False
     first_col = [r[0] for r in grid if r and r[0]]
     if first_col and sum(1 for c in first_col if RE_BARE_MARKER.match(c)) >= 0.5 * len(first_col):
         return False                                   # "a. | Search mode." -> that is a list
-    prose_rows = 0
-    for row in grid:
-        cells = [c for c in row if c]
-        for cell in cells:
-            m = RE_PARA_NUM.match(cell)
-            if m and "." in m.group("num") + m.group("dot") and m.group("rest")[:1].isalpha():
-                return False                           # "4.1 Verification ..." : a numbered paragraph or heading
-            if _is_heading_text(cell) and word_count(cell) >= 2 and RE_PARA_NUM.match(cell):
-                return False                           # "4. VERIFICATION"
-        # one sentence running across cells: "manufactured and" | "finished" | "in accordance with"
-        if any(re.search(r"[a-z,]$", a) and re.match(r"[a-z]", b) and word_count(a) + word_count(b) >= 3
-               for a, b in zip(cells, cells[1:])):
-            prose_rows += 1
-    if prose_rows >= max(1, 0.3 * n_rows):
+    if _reads_like_prose(grid):
         return False
     well_filled = sum(1 for c in range(n_cols) if sum(1 for r in grid if c < len(r) and r[c]) >= 0.6 * n_rows)
-    return well_filled >= 2
+    return well_filled >= 2 or mark_matrix
 
 
 def _join_words_in_reading_order(words: list) -> str:
@@ -1945,7 +2363,7 @@ def _page_stats(rows: list) -> _PageStats:
     return _PageStats(line_h, line_gap, para_gap)
 
 
-def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settings) -> list:
+def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settings, ocr=None) -> list:
     """Turn the OCR lines of one page into ordered Blocks."""
     dpi = prep.dpi
     blocks = []
@@ -1959,7 +2377,7 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
     table_captions = []       # (table box, caption lines taken out of that table's grid)
     if settings.detect_tables and lines:
         used = set()
-        for table, tbox, inside, caption_lines in detect_tables(prep.ocr_image, lines, dpi, settings):
+        for table, tbox, inside, caption_lines in detect_tables(prep.ocr_image, lines, dpi, settings, ocr=ocr):
             blocks.append(Block("table", page_no, tbox, lines=[lines[i] for i in sorted(inside)], table=table))
             used |= inside
             if caption_lines:
@@ -2873,6 +3291,37 @@ METHOD_NAMES = {"i": "Inspection", "a": "Analysis", "d": "Demonstration", "t": "
                 "demo": "Demonstration", "test": "Test", "examination": "Examination", "exam": "Examination",
                 "similarity": "Similarity", "insp": "Inspection"}
 VERIFICATION_HEADERS = ("method", "verification", "verif", "ver method", "vm", "v v", "qualification method", "test method")
+# The sentence that defines the letters of a verification matrix, in either of its usual forms:
+# "... by inspection (I), analysis (A), demonstration (D), or test (T) ..."  and  "I = Inspection".
+_METHOD_WORDS = r"inspection|analysis|demonstration|examination|similarity|test"
+RE_METHOD_LEGEND = re.compile(
+    r"\b(" + _METHOD_WORDS + r")\b\s*[\(\[]\s*([A-Za-z])\s*[\)\]]"
+    r"|[\(\[]?\b([A-Za-z])\b[\)\]]?\s*(?:=|:|-|\u2013|\u2014)\s*\b(" + _METHOD_WORDS + r")\b", re.I)
+# What a verification matrix says about one paragraph, and whether the method names had to be
+# deduced from the legend's column order because the matrix's own headers could not be read.
+MatrixMethods = namedtuple("MatrixMethods", "methods from_legend")
+
+
+def method_legend(doc: DocResult) -> list:
+    """The method letters a document defines for its verification matrix, in the order written:
+    "inspection (I), analysis (A), demonstration (D), or test (T)" -> [(I, Inspection), ...].
+
+    A matrix prints its method columns in exactly that order, so this is what names the columns of
+    a matrix whose own headers are printed sideways and could not be read."""
+    for b in doc.blocks:
+        if b.kind not in ("paragraph", "list_item", "heading", "caption"):
+            continue
+        order = []
+        for m in RE_METHOD_LEGEND.finditer(b.text or ""):
+            name, letter = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3))
+            method, letter = METHOD_NAMES.get((name or "").lower()), (letter or "").upper()
+            if method and letter and letter not in [l for l, _ in order]:
+                order.append((letter, method))
+        if len(order) >= 2:            # a real legend names at least two methods
+            return order
+    return []
+
+
 RE_REFERENCES = re.compile(
     r"\b(?:MIL|DOD|DoD|FED|NASA|JSSG)-(?:STD|DTL|PRF|HDBK|SPEC)-\d+[A-Z]?\b"
     r"|\bMIL-[A-Z]-\d+[A-Z]?\b"
@@ -3066,8 +3515,15 @@ class RequirementExtractor:
             it.references = find_references(it.text)
             if not it.verification and it.doc_ref:
                 key = clean_para_number(it.doc_ref.split()[0].rstrip("."))
-                if key in matrix:
-                    it.verification = matrix[key] + " (from verification matrix)"
+                entry = matrix.get(key)
+                if entry and entry.from_legend:
+                    # the columns were named from the legend's order, not from a header we read
+                    it.verification = entry.methods + " (from verification matrix, columns named from the legend)"
+                    it.review_reasons.append(
+                        "Verification method comes from the verification matrix, whose column headers could "
+                        "not be read; the methods follow the order given in the legend - check against the scan")
+                elif entry:
+                    it.verification = entry.methods + " (from verification matrix)"
         # item numbers
         counters = Counter()
         prefix = {"Requirement": "R", "Table": "T", "Table Caption": "TC", "Figure Caption": "FC"}
@@ -3148,18 +3604,40 @@ class RequirementExtractor:
 
     @staticmethod
     def _verification_matrix(doc: DocResult) -> dict:
-        """Read verification cross-reference matrices: a column of paragraph numbers and two or
-        more method columns (I / A / D / T ...) marked with X. Returns {paragraph: 'Analysis, Test'}."""
+        """Read verification cross-reference matrices: a column of paragraph numbers beside two or
+        more method columns (I / A / D / T ...) marked with an X.
+        Returns {paragraph: MatrixMethods(methods, from_legend)}.
+
+        The method columns are recognised by their CONTENT - a column holding nothing but marks -
+        so a matrix still works when its headers are printed sideways. Each column is named from
+        its own header where that could be read, and otherwise from the order of the legend
+        sentence printed above the matrix. A name that came from the legend is a deduction rather
+        than something read off the page, so it is reported as such and the row is flagged."""
         matrix = {}
+        legend = method_legend(doc)
         for b in doc.blocks:
             t = b.table
-            if b.kind != "table" or t is None or not t.header_rows or t.n_rows < 2:
+            if b.kind != "table" or t is None or t.n_rows < 2:
                 continue
-            header = [(h or "").strip().lower().rstrip(".") for h in t.grid[0]]
+            # Row 0 is treated as a header even when it did not look like one, which is what a row
+            # of unreadable sideways headers looks like. With a merged banner above them
+            # ("VERIFICATION METHOD"), the lowest readable line of each column is its name.
+            head_rows = max(t.header_rows, 1)
+            data = t.grid[head_rows:]
+            if not data:
+                continue
+            header = [h.lower().rstrip(".") for h in column_headers(t.grid, head_rows)]
             method_cols = {c: METHOD_NAMES[h] for c, h in enumerate(header) if h in METHOD_NAMES}
+            from_legend = False
+            if len(method_cols) < 2:
+                # Headers unreadable (the usual reason: they are printed sideways). Line the block
+                # of method columns up with the legend, which lists the methods in column order.
+                run = _method_column_run(data, t.n_cols)
+                if run and len(run) == len(legend):
+                    method_cols = {c: legend[i][1] for i, c in enumerate(run)}
+                    from_legend = True
             if len(method_cols) < 2:
                 continue
-            data = t.grid[t.header_rows:]
             para_col = None
             def para(v):                      # OCR tolerance: "3,2.1.1.." -> "3.2.1.1"
                 return clean_para_number(re.sub(r"(?<=\d),(?=\d)", ".", (v or "").strip()).rstrip("."))
@@ -3173,10 +3651,10 @@ class RequirementExtractor:
                 continue
             for r in data:
                 num = para(r[para_col]) if para_col < len(r) else ""
-                marks = [name for c, name in method_cols.items()
-                         if c < len(r) and re.fullmatch(r"\s*(?:[xX\u2713\u2714\u2022*+]|yes|Yes|YES)\s*", r[c] or "")]
+                marks = [name for c, name in sorted(method_cols.items())
+                         if c < len(r) and re.fullmatch(r"\s*(?:[xX\u00d7\u2713\u2714\u2022\u221a*+]|yes|Yes|YES)\s*", r[c] or "")]
                 if num and marks:
-                    matrix[num] = ", ".join(dict.fromkeys(marks))
+                    matrix[num] = MatrixMethods(", ".join(dict.fromkeys(marks)), from_legend)
         return matrix
 
     # ---- captions and tables --------------------------------------------------------------
@@ -3216,7 +3694,7 @@ class RequirementExtractor:
         s = self.settings
         if t.n_rows < 2 or t.n_cols < 1:
             return []
-        header = [(c or "").strip() for c in t.grid[0]] if t.header_rows else []
+        header = column_headers(t.grid, t.header_rows) if t.header_rows else []
         data_start = t.header_rows
         data = t.grid[data_start:]
         if not data:
@@ -4156,7 +4634,7 @@ class SpecExtractor:
                     doc.pages.append(info)
                     continue
                 lines = self.ocr.read(prep.ocr_image)
-                blocks = analyze_page(raw.number, prep, lines, s)
+                blocks = analyze_page(raw.number, prep, lines, s, ocr=self.ocr)
                 self._save_figure_images(blocks, prep.view_image, prep.dpi, cache_dir)
             except Exception as exc:
                 LOG.debug(traceback.format_exc())
@@ -4190,7 +4668,7 @@ class SpecExtractor:
                         img = _imread_gray(image_file)
                         prep = PreparedPage(img, img, dpi)
                         lines = self.ocr.read(img)
-                        blocks = analyze_page(number, prep, lines, s)
+                        blocks = analyze_page(number, prep, lines, s, ocr=self.ocr)
                         self._save_figure_images(blocks, img, dpi, cache_dir)
                         doc.blocks.extend(blocks)
                         LOG.info("  page %d: %d text lines (standard engine)", number, len(lines))
@@ -4335,6 +4813,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-clean", action="store_true", help="no background flattening / denoising")
     g.add_argument("--remove-color-marks", action="store_true", help="fade colored stamps, pen marks and highlighter")
     g.add_argument("--no-borderless-tables", action="store_true", help="only detect tables that have ruling lines")
+    g.add_argument("--no-inferred-rows", action="store_true",
+                   help="do not work out a table's missing row separators from the text (tables whose "
+                        "columns are ruled but whose rows are not will then be missed)")
+    g.add_argument("--no-sideways-headers", action="store_true",
+                   help="do not turn a table's empty header band upright to read column headers "
+                        "that were printed sideways")
     g.add_argument("--threads", type=int, default=0, help="CPU threads for OCR (default: automatic)")
     g.add_argument("--docling-models", help="folder with pre-downloaded Docling models (offline use)")
     g.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto", help="device for the Docling engine")
@@ -4383,6 +4867,8 @@ def settings_from_args(args) -> Settings:
     s.clean_background = s.denoise = not args.no_clean
     s.remove_color_marks = args.remove_color_marks
     s.borderless_tables = not args.no_borderless_tables
+    s.infer_missing_rules = not args.no_inferred_rows
+    s.sideways_headers = not args.no_sideways_headers
     s.ocr_threads = max(0, args.threads or 0)
     if args.docling_models:
         s.docling_models_dir = Path(args.docling_models)

@@ -23,6 +23,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
+import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 import spec_extractor as se  # noqa: E402
@@ -470,13 +471,19 @@ def test_heading_rules_still_find_real_headings():
 # Tables and captions
 # =====================================================================================================================
 def _fake_img2table(rows: dict, bbox: tuple):
-    """Replace img2table's Image class so detect_tables() receives exactly this cell grid."""
+    """Replace img2table's Image class so detect_tables() receives exactly this cell grid.
+
+    The cells carry geometry only (`value` is None): this mock stands in for the grid img2table
+    finds, while the text is filled in from our own OCR lines afterwards. The check for rows that
+    have swallowed several rows of text reads img2table's own cell text, so with this mock it sees
+    nothing and stays switched off - which is what these tests want, as they are about the grid."""
     import img2table.document as i2t_document
 
     def box(x1, y1, x2, y2):
         return types.SimpleNamespace(x1=x1, y1=y1, x2=x2, y2=y2)
 
-    table = types.SimpleNamespace(content={r: [types.SimpleNamespace(bbox=box(*c)) for c in cells] for r, cells in rows.items()},
+    table = types.SimpleNamespace(content={r: [types.SimpleNamespace(bbox=box(*c), value=None) for c in cells]
+                                           for r, cells in rows.items()},
                                   bbox=box(*bbox))
 
     class FakeImage:
@@ -790,6 +797,422 @@ def test_verification_column_and_references():
     assert [(r.doc_ref, r.verification) for r in rows] == [("SW-001", "Test"), ("SW-002", "Analysis, Test")], \
         [(r.doc_ref, r.verification, r.text) for r in rows]
     assert rows[1].references == "MIL-STD-461G; Section 10.2", rows[1].references
+
+
+# =====================================================================================================================
+# Table structure: rows without ruling lines, sideways headers, verification matrices
+#
+# These cases come from a review on real Systems Engineering scans, where the tool scored well on
+# running text but lost whole tables. Unlike the tests above, they draw a REAL page image and let
+# the real detector look at it, because the failures were in how the ruling lines (or the absence
+# of them) are read - not in the grid handling that happens afterwards.
+# =====================================================================================================================
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+def _draw_words(img, text: str, x: int, y_top: int, scale: float = 1.0, thickness: int = 2) -> list:
+    """Print `text` on the page one word at a time and return OCR Words whose boxes match the ink."""
+    words, cx = [], x
+    for token in text.split():
+        (w, h), base = cv2.getTextSize(token, FONT, scale, thickness)
+        cv2.putText(img, token, (cx, y_top + h), FONT, scale, 0, thickness, cv2.LINE_AA)
+        words.append(se.Word(token, 0.97, (cx, y_top, cx + w, y_top + h + base)))
+        cx += w + int(10 * scale) + 4
+    return words
+
+
+def _draw_table(cells: dict, xs: list, ys: list, *, h_lines: bool = True, v_lines: bool = True,
+                frame: bool = True, scale: float = 1.0) -> tuple:
+    """Draw a table on a blank page and return (page image, OCR lines).
+
+    `cells` is {(row, column): text}; `xs`/`ys` are the column and row boundaries in pixels.
+    h_lines=False draws the very common layout of a verification matrix: column rules and an outer
+    frame, but nothing between the rows."""
+    img = np.full((PAGE_H, PAGE_W), 255, np.uint8)
+    if frame:
+        cv2.rectangle(img, (xs[0], ys[0]), (xs[-1], ys[-1]), 0, 2)
+    for x in (xs[1:-1] if v_lines else []):
+        cv2.line(img, (x, ys[0]), (x, ys[-1]), 0, 2)
+    for y in (ys[1:-1] if h_lines else []):
+        cv2.line(img, (xs[0], y), (xs[-1], y), 0, 2)
+    lines = []
+    for (r, c), text in sorted(cells.items()):
+        words = _draw_words(img, text, xs[c] + 12, ys[r] + 14, scale=scale)
+        lines.append(se.Line(text, 0.97, se.box_union(w.box for w in words), words))
+    return img, lines
+
+
+# rows of a small verification cross reference matrix: (paragraph, title, which method is marked)
+VCRM_ROWS = [("3.2.1.1", "Detection range", 3), ("3.2.1.2", "Range accuracy", 1),
+             ("3.2.1.3", "Operating modes", 2), ("3.2.1.4", "Track capacity", 3),
+             ("3.2.2.1", "Weight", 0), ("3.2.2.2", "Input power", 3)]
+
+
+def _vcrm_cells(headers=("Paragraph", "Title", "I", "A", "D", "T")) -> dict:
+    cells = {(0, c): h for c, h in enumerate(headers)}
+    for r, (para, title, mark) in enumerate(VCRM_ROWS, start=1):
+        cells[(r, 0)], cells[(r, 1)], cells[(r, 2 + mark)] = para, title, "X"
+    return cells
+
+
+def test_table_with_column_rules_but_no_row_lines_is_found():
+    """The layout that broke the tool on real specifications: an outer frame and column rules, but
+    no line between the rows. A table needs two horizontal lines before it has a row, so without
+    help this table is not found at all - not merely mis-split."""
+    xs = [300, 720, 1180, 1320, 1460, 1600, 1740]
+    ys = [400 + 58 * i for i in range(8)]
+    img, lines = _draw_table(_vcrm_cells(), xs, ys, h_lines=False)
+    found = se.detect_tables(img, lines, DPI, settings(detect_tables=True))
+    assert found, "a table with column rules but no lines between the rows was not detected at all"
+    table = found[0][0]
+    assert (table.n_rows, table.n_cols) == (7, 6), (table.n_rows, table.n_cols, table.grid)
+    assert table.grid[0] == ["Paragraph", "Title", "I", "A", "D", "T"], table.grid[0]
+    assert [r[0] for r in table.grid[1:]] == [row[0] for row in VCRM_ROWS], [r[0] for r in table.grid]
+    assert [r[1] for r in table.grid[1:]] == [row[1] for row in VCRM_ROWS], [r[1] for r in table.grid]
+
+
+def test_fully_ruled_table_is_unchanged_by_the_row_inference():
+    """Inferring the missing row lines must never disturb a table that draws all of them."""
+    xs = [300, 720, 1180, 1320, 1460, 1600, 1740]
+    ys = [400 + 58 * i for i in range(8)]
+    img, lines = _draw_table(_vcrm_cells(), xs, ys, h_lines=True)
+    table = se.detect_tables(img, lines, DPI, settings(detect_tables=True))[0][0]
+    assert (table.n_rows, table.n_cols) == (7, 6), (table.n_rows, table.n_cols, table.grid)
+    assert [r[0] for r in table.grid[1:]] == [row[0] for row in VCRM_ROWS], table.grid
+
+
+def test_row_inference_does_not_split_a_cell_that_wraps_over_two_lines():
+    """A cell whose text wraps must stay one row: the row pitch, not every line of text, decides."""
+    xs, ys = [300, 900, 1500], [400, 520, 640, 760]
+    cells = {(0, 0): "Parameter", (0, 1): "Value",
+             (1, 0): "Operating temperature", (1, 1): "-40 C to +71 C",
+             (2, 0): "Input power", (2, 1): "115 VAC"}
+    img, lines = _draw_table(cells, xs, ys, h_lines=False)
+    # a second, wrapped line inside the first data cell
+    extra = _draw_words(img, "at sea level", xs[0] + 12, ys[1] + 58)
+    lines.append(se.Line("at sea level", 0.97, se.box_union(w.box for w in extra), extra))
+    found = se.detect_tables(img, lines, DPI, settings(detect_tables=True))
+    assert found, "table not detected"
+    table = found[0][0]
+    assert table.n_rows == 3, (table.n_rows, table.grid)
+    assert "Operating temperature" in table.grid[1][0] and "sea level" in table.grid[1][0], table.grid
+
+
+def test_sparse_verification_matrix_is_not_rejected_as_too_empty():
+    """A verification cross reference matrix is mostly empty by design - one or two marks per row.
+    The 'is this really a table?' check must not throw it away for being sparse."""
+    header = ["Paragraph", "Title", "I", "A", "D", "T", "S", "E"]
+    grid = [header]
+    for i, mark_col in enumerate([2, 5, 3, 7, 4, 6]):
+        row = [""] * len(header)
+        row[0], row[1] = f"3.2.{i + 1}", f"Characteristic {i + 1}"
+        row[mark_col] = "X"
+        grid.append(row)
+    n_unique = len(grid) * len(header)
+    n_filled = sum(1 for row in grid for cell in row if cell)
+    assert n_filled < 0.5 * n_unique, "this fixture has to be sparse for the test to mean anything"
+    assert se._is_mark_matrix(grid), grid
+    assert se._plausible_borderless_table(grid, n_unique, n_filled), grid
+
+
+def test_ordinary_sparse_grid_is_still_rejected():
+    """The exemption above must not open the door to any mostly empty grid (forms, drawings)."""
+    grid = [["Item", "Value", "Notes", "Date"], ["Pump", "", "", ""], ["", "", "see sheet 2", ""],
+            ["Valve", "", "", ""], ["", "", "", "12 May"]]
+    n_unique = len(grid) * 4
+    n_filled = sum(1 for row in grid for cell in row if cell)
+    assert not se._is_mark_matrix(grid), grid
+    assert not se._plausible_borderless_table(grid, n_unique, n_filled), grid
+
+
+def _matrix_doc(header: list, legend: str = "") -> se.DocResult:
+    """A one page document holding a verification matrix, optionally preceded by its legend."""
+    grid = [header]
+    for para, mark in [("3.2.1.1", 3), ("3.2.1.2", 1), ("3.2.2.1", 0)]:
+        row = [""] * len(header)
+        row[0] = para
+        row[2 + mark] = "X"
+        grid.append(row)
+    blocks = []
+    if legend:
+        blocks.append(se.Block("paragraph", 1, (300, 300, 1700, 340), lines=make_lines([legend]), text=legend))
+    table = se.TableData(grid=grid, conf=[[1.0] * len(header) for _ in grid], header_rows=1)
+    blocks.append(se.Block("table", 1, (300, 400, 1700, 700), table=table))
+    return se.DocResult(source="t.pdf", engine="standard",
+                        pages=[se.PageInfo(number=1, width=PAGE_W, height=PAGE_H, source_dpi=DPI, dpi=DPI)],
+                        blocks=blocks)
+
+
+def test_verification_matrix_read_from_its_headers():
+    doc = _matrix_doc(["Paragraph", "Title", "I", "A", "D", "T"])
+    matrix = se.RequirementExtractor._verification_matrix(doc)
+    assert matrix["3.2.1.1"].methods == "Test" and not matrix["3.2.1.1"].from_legend, matrix
+    assert matrix["3.2.1.2"].methods == "Analysis", matrix
+    assert matrix["3.2.2.1"].methods == "Inspection", matrix
+
+
+def test_verification_matrix_works_when_the_sideways_headers_could_not_be_read():
+    """Sideways headers often come back from OCR as nothing at all. The matrix is then recognised
+    from its content (columns holding nothing but X marks) and the columns are named from the
+    legend sentence that documents nearly always print above the matrix."""
+    legend = ("Verification of each requirement shall be accomplished by inspection (I), analysis (A), "
+              "demonstration (D), or test (T), as specified in TABLE III.")
+    doc = _matrix_doc(["Paragraph", "Title", "", "", "", ""], legend=legend)
+    matrix = se.RequirementExtractor._verification_matrix(doc)
+    assert matrix["3.2.1.1"].methods == "Test" and matrix["3.2.1.1"].from_legend, matrix
+    assert matrix["3.2.1.2"].methods == "Analysis", matrix
+    assert matrix["3.2.2.1"].methods == "Inspection", matrix
+
+
+def test_verification_matrix_without_headers_or_legend_is_not_guessed():
+    """With neither readable headers nor a legend the methods are unknown: say so, never invent."""
+    doc = _matrix_doc(["Paragraph", "Title", "", "", "", ""])
+    assert se.RequirementExtractor._verification_matrix(doc) == {}
+
+
+def test_verification_matrix_taken_from_the_legend_is_flagged_for_review():
+    """A method read from a column order rather than from a header is a deduction, so the row says so."""
+    legend = ("Verification shall be by inspection (I), analysis (A), demonstration (D), or test (T).")
+    doc = _matrix_doc(["Paragraph", "Title", "", "", "", ""], legend=legend)
+    doc.blocks.append(se.Block("paragraph", 1, (300, 800, 1700, 900),
+                               lines=make_lines(["3.2.1.1 Detection range. The radar shall detect targets at 100 nmi."],
+                                                y0=800)))
+    se.finalize_document(doc, settings())
+    rows = requirements(se.RequirementExtractor(settings()).extract(doc))
+    row = find(rows, "detect targets")
+    assert row.verification.startswith("Test"), row.verification
+    assert "legend" in row.verification, row.verification
+    assert any("verification matrix" in r.lower() for r in row.review_reasons), row.review_reasons
+
+
+def test_verification_matrix_reads_a_two_row_header():
+    """Matrices often group the method columns under a merged 'VERIFICATION METHOD' banner."""
+    grid = [["Paragraph", "Title", "VERIFICATION METHOD", "VERIFICATION METHOD", "VERIFICATION METHOD", "VERIFICATION METHOD"],
+            ["", "", "I", "A", "D", "T"],
+            ["3.2.1.1", "Detection range", "", "", "", "X"],
+            ["3.2.1.2", "Range accuracy", "", "X", "", ""]]
+    table = se.TableData(grid=grid, conf=[[1.0] * 6 for _ in grid], header_rows=2,
+                         merges=[(0, 2, 0, 5)])
+    doc = se.DocResult(source="t.pdf", engine="standard",
+                       pages=[se.PageInfo(number=1, width=PAGE_W, height=PAGE_H, source_dpi=DPI, dpi=DPI)],
+                       blocks=[se.Block("table", 1, (300, 400, 1700, 700), table=table)])
+    matrix = se.RequirementExtractor._verification_matrix(doc)
+    assert matrix["3.2.1.1"].methods == "Test", matrix
+    assert matrix["3.2.1.2"].methods == "Analysis", matrix
+
+
+def test_header_rows_counts_a_merged_banner_above_the_real_headers():
+    xs, ys = [300, 700, 1100, 1500], [400, 460, 520, 580, 640]
+    def cell(r0, c0, r1=None, c1=None):
+        return (xs[c0], ys[r0], xs[(c1 if c1 is not None else c0) + 1], ys[(r1 if r1 is not None else r0) + 1])
+    banner = cell(0, 1, 0, 2)
+    rows = {0: [cell(0, 0), banner, banner], 1: [cell(1, 0), cell(1, 1), cell(1, 2)],
+            2: [cell(2, 0), cell(2, 1), cell(2, 2)], 3: [cell(3, 0), cell(3, 1), cell(3, 2)]}
+    lines = _grid_lines({(0, 0): "Para", (0, 1): "METHOD", (1, 0): "No.", (1, 1): "I", (1, 2): "T",
+                         (2, 0): "3.1.1", (2, 1): "X", (3, 0): "3.1.2", (3, 2): "X"}, xs, ys)
+    restore = _fake_img2table(rows, (xs[0], ys[0], xs[3], ys[4]))
+    try:
+        table = se.detect_tables(blank_page().ocr_image, lines, DPI, settings(detect_tables=True))[0][0]
+    finally:
+        restore()
+    assert table.header_rows == 2, (table.header_rows, table.grid)
+
+
+# an SRS-style borderless table: an ID column beside whole requirement sentences that wrap
+BORDERLESS_REQ_ROWS = [
+    ("SRS-101", "The radar shall detect a one square metre target at a range of 100 nautical",
+     "miles in clear air and in light precipitation without any operator action"),
+    ("SRS-102", "The radar shall acquire and simultaneously track up to 200 separate targets",
+     "while continuing to search the whole of the assigned surveillance volume"),
+    ("SRS-103", "The equipment shall operate over the full ambient temperature range that is",
+     "specified in TABLE II of this specification without degradation of performance"),
+    ("SRS-104", "The system shall complete its built in test and report the result within 30",
+     "seconds of the application of primary power at any ambient temperature"),
+]
+
+
+def _borderless_requirement_lines(id_header: str, text_header: str) -> list:
+    """The table above as OCR lines: rows 64 px apart, the two lines of a wrapped cell 26 px apart."""
+    lines = [make_line(id_header, 200, 400, height=21), make_line(text_header, 520, 400, height=21)]
+    for r, (req_id, first, second) in enumerate(BORDERLESS_REQ_ROWS):
+        y = 455 + 64 * r
+        lines += [make_line(req_id, 200, y, height=21), make_line(first, 520, y, height=21),
+                  make_line(second, 520, y + 26, height=21)]
+    return lines
+
+
+def test_borderless_requirement_table_with_long_sentences_is_kept():
+    """An ID column beside a column of whole requirement sentences is a table, not prose. Such a
+    table holds many words per cell, which is normally the sign of running text, so it used to be
+    thrown away - even though its header row says plainly what the wide column holds."""
+    found = se.detect_aligned_tables(_borderless_requirement_lines("Requirement ID", "Requirement Text"),
+                                     DPI, set())
+    assert found, "a borderless requirement table with real sentences was dropped"
+    grid = found[0][0].grid
+    words_per_cell = (sum(se.word_count(c) for row in grid for c in row)
+                      / max(sum(1 for row in grid for c in row if c), 1))
+    assert words_per_cell > 10, f"fixture must be wordy enough to exercise the limit ({words_per_cell:.1f})"
+    assert len(grid) == 5 and len(grid[0]) == 2, grid
+    assert [r[0] for r in grid[1:]] == ["SRS-101", "SRS-102", "SRS-103", "SRS-104"], grid
+    assert "light precipitation" in grid[1][1], grid[1][1]      # the wrapped line joined its own row
+
+
+def test_wordy_columns_without_a_requirement_header_are_still_prose():
+    """The relaxed limit is earned by the header row alone. The very same wordy layout under
+    headers that promise nothing stays what it looks like: running text, not a table."""
+    assert not se.detect_aligned_tables(_borderless_requirement_lines("Ref", "Notes"), DPI, set())
+
+
+def _i2t_rows(rows: list):
+    """A stand-in for one table as img2table returns it: cell values with the lines that share a
+    cell joined by newlines, which is how a row that swallowed several rows of text shows up."""
+    return types.SimpleNamespace(content={r: [types.SimpleNamespace(value=v) for v in row]
+                                          for r, row in enumerate(rows)})
+
+
+def test_a_table_whose_rows_were_never_ruled_is_recognised():
+    """Every column of the one data row holds several lines at once: the rows were never ruled."""
+    et = _i2t_rows([["Paragraph", "Title", "I", "A", "D", "T"],
+                    ["3.2.1.1\n3.2.1.2\n3.2.2.1", "Detection range\nRange accuracy\nWeight",
+                     "x", "", "", "x\nx"]])
+    assert se._rows_are_under_split(et), "a table with no row separators was not recognised"
+
+
+def test_a_sparse_matrix_whose_rows_were_never_ruled_is_recognised():
+    """A verification matrix is mostly ticks, so only its left-hand column shows the crowding.
+    One column holding more lines than the table has rows, beside columns of nothing but marks,
+    is the giveaway."""
+    et = _i2t_rows([["Paragraph", "I", "A", "D", "T", "S", "E"],
+                    ["3.4.1.1\n3.4.1.2\n3.4.2.1\n3.4.2.2\n3.4.3.1\n3.4.3.2", "x", "x", "", "x", "x", ""]])
+    assert se._rows_are_under_split(et), "a sparse matrix with no row separators was not recognised"
+
+
+def test_a_ruled_table_whose_cells_wrap_is_left_alone():
+    """The case that must NOT be touched: a properly ruled requirement table whose wide column
+    wraps over two or three lines. Treating that as a missing separator would turn every wrapped
+    line into a requirement of its own."""
+    et = _i2t_rows([["Req ID", "Parameter", "Requirement", "Method"],
+                    ["ENV-001", "Operating\ntemperature",
+                     "The radar shall operate within\nspecification from -40 C to +71 C.", "T"],
+                    ["ENV-005", "Salt fog",
+                     "The radar shall withstand exposure to\nsalt fog per MIL-STD-810H,\nMethod 509.7.", "T"],
+                    ["ENV-007", "Rain", "The radar should operate in rainfall\nrates up to 50 mm/hr.", "D"]])
+    assert not se._rows_are_under_split(et), "a ruled table whose cells wrap must be left alone"
+
+
+def test_a_checklist_with_tick_columns_and_a_deep_cell_is_left_alone():
+    """A deeply wrapped cell beside tick columns is still an ordinary table while the table has
+    more rows than any one cell has lines."""
+    et = _i2t_rows([["Step", "Description", "Done", "N/A"],
+                    ["1", "Check the\nconnector\nfor damage", "x", ""],
+                    ["2", "Measure the\ninsulation", "x", ""],
+                    ["3", "Record the\nserial number", "", "x"],
+                    ["4", "Refit the cover", "x", ""]])
+    assert not se._rows_are_under_split(et), "an ordinary checklist must be left alone"
+
+
+def test_rows_are_recut_from_the_text_when_the_rules_do_not_describe_them():
+    """The last resort: cut the rows ourselves, half-way down the white gap between the lines of
+    text, keeping the columns exactly as the printed rules give them."""
+    xs, ys = [300, 800, 1200], (400, 700)
+    cell_boxes = [[(xs[0], ys[0], xs[1], ys[1]), (xs[1], ys[0], xs[2], ys[1])]]
+    lines = []
+    for r, (left, right) in enumerate([("3.2.1.1", "Detection range"), ("3.2.1.2", "Range accuracy"),
+                                       ("3.2.2.1", "Weight")]):
+        y = 420 + 90 * r
+        lines += [make_line(left, xs[0] + 10, y, height=30), make_line(right, xs[1] + 10, y, height=30)]
+    recut = se._resplit_rows(cell_boxes, lines)
+    assert recut is not None and len(recut) == 3, recut
+    assert [cb[0][0] for cb in recut] == [xs[0]] * 3, recut      # columns untouched
+    assert recut[0][0][1] == ys[0] and recut[-1][0][3] == ys[1], recut   # the band is fully covered
+    tops = [cb[0][1] for cb in recut]
+    assert tops == sorted(tops) and len(set(tops)) == 3, tops    # three separate, ordered bands
+    assert se._resplit_rows(cell_boxes, lines[:2]) is None       # one row of text: nothing to cut
+
+
+def test_a_header_band_split_by_the_row_inference_is_put_back_together():
+    """A sideways header needs a tall band, and the fragments read in it ("DEM" above "ON") can
+    look like two rows of text. The slices must be rejoined before the band is read again,
+    otherwise the real header row is mistaken for the table's first row of data."""
+    grid = [["", "", "", "", "DEM", ""],
+            ["Paragraph", "Title", "INS OON", "ANS T IS", "ON", "TEST"],
+            ["3.2.1.1", "Detection range", "", "", "", "X"],
+            ["3.2.2.1", "Weight", "X", "", "", ""]]
+    conf = [[0.4] * 6, [0.9] * 6, [0.99] * 6, [0.99] * 6]
+    words = [[[] for _ in range(6)] for _ in grid]
+    heights = [(300, 372), (372, 552), (552, 619), (619, 686)]     # a sliver above a tall band
+    boxes = [[(100 + 80 * c, y0, 180 + 80 * c, y1) for c in range(6)] for y0, y1 in heights]
+    merges = se._collapse_header_band(grid, conf, boxes, words, [(2, 0, 3, 0)])
+    assert len(grid) == 3, grid
+    assert grid[0] == ["Paragraph", "Title", "INS OON", "ANS T IS", "DEM ON", "TEST"], grid[0]
+    assert boxes[0][4] == (420, 300, 500, 552), boxes[0][4]        # the crop covers both slices
+    assert conf[0][0] == 0.4 and merges == [(1, 0, 2, 0)], (conf[0][0], merges)
+
+
+def test_evenly_sized_rows_are_never_collapsed():
+    """The rejoining above must only ever touch a genuinely tall band, not an ordinary table whose
+    first row happens to have a single filled cell."""
+    grid = [["Notes", "", "", ""], ["Pin", "Signal", "Level", "Use"], ["1", "+28V", "28 V", "Power"],
+            ["2", "RTN", "0 V", "Return"]]
+    conf = [[1.0] * 4 for _ in grid]
+    boxes = [[(100 + 80 * c, 300 + 60 * r, 180 + 80 * c, 360 + 60 * r) for c in range(4)]
+             for r in range(4)]
+    assert se._collapse_header_band(grid, conf, boxes, [[[] for _ in range(4)] for _ in grid], []) == []
+    assert len(grid) == 4 and grid[0][0] == "Notes", grid
+
+
+def test_unrotate_box_maps_sideways_text_back_to_the_page():
+    """The inverse of a 90 degree rotation, used to put a sideways header back on its own column.
+    Getting the direction wrong would silently put every header on the wrong column."""
+    h, w = 200, 80                                   # a tall, narrow header strip
+    # a box in the image produced by turning the strip 90 deg clockwise (that image is w x h)
+    assert se._unrotate_box((10, 5, 60, 25), 90, (h, w)) == (5, 140, 25, 190)
+    assert se._unrotate_box((10, 5, 60, 25), 270, (h, w)) == (55, 10, 75, 60)
+    # a full width box maps back to the full height of the strip, whichever way it was turned
+    for rot in (90, 270):
+        x0, y0, x1, y1 = se._unrotate_box((0, 0, h, w), rot, (h, w))
+        assert (x0, y0, x1, y1) == (0, 0, w, h), (rot, (x0, y0, x1, y1))
+
+
+def test_sideways_column_headers_are_read_and_land_on_their_own_columns():
+    """The point of the sideways pass: "INSPECTION" printed vertically above the third column has
+    to become the THIRD column's header, not the second's or the fourth's. The fake recogniser
+    below returns each name where the real one would find it after the band is turned upright,
+    so what is under test is the mapping back onto the columns, not the recognition."""
+    xs = [300, 720, 1180, 1320, 1460, 1600, 1740]
+    header_box = (xs[0], 300, xs[-1], 560)               # the tall band above the data rows
+    band_w, band_h = header_box[2] - header_box[0], header_box[3] - header_box[1]
+    names = {2: "INSPECTION", 3: "ANALYSIS", 4: "DEMONSTRATION", 5: "TEST"}
+
+    class FakeOcr:
+        def read(self, image, min_conf=None):
+            lines = []
+            for col, name in names.items():
+                # forward 90 deg anticlockwise turn of the band: strip (x, y) -> (y, band_w - x),
+                # so a column's x range becomes a y range in the upright image
+                sx0, sx1 = xs[col] - header_box[0], xs[col + 1] - header_box[0]
+                box = (20, band_w - sx1, band_h - 20, band_w - sx0)
+                lines.append(se.Line(name, 0.95, box, [se.Word(name, 0.95, box)]))
+            return lines
+
+    img = np.full((PAGE_H, PAGE_W), 255, np.uint8)
+    cv2.rectangle(img, (header_box[0], header_box[1]), (header_box[2], header_box[3]), 0, 2)
+    bands = [(xs[c], xs[c + 1]) for c in range(6)]
+    assert se.read_sideways_headers(img, header_box, bands, FakeOcr(), rotation=270) == names
+
+
+def test_sideways_headers_are_only_read_where_the_headers_are_missing():
+    """A header band that OCR already read normally must be left exactly as it is."""
+    xs = [300, 720, 1180, 1320, 1460, 1600, 1740]
+    ys = [400 + 58 * i for i in range(8)]
+    img, lines = _draw_table(_vcrm_cells(), xs, ys, h_lines=False)
+
+    class ExplodingOcr:
+        def read(self, image, min_conf=None):
+            raise AssertionError("the sideways pass must not run when the headers were read normally")
+
+    table = se.detect_tables(img, lines, DPI, settings(detect_tables=True), ocr=ExplodingOcr())[0][0]
+    assert table.grid[0] == ["Paragraph", "Title", "I", "A", "D", "T"], table.grid[0]
 
 
 # =====================================================================================================================
