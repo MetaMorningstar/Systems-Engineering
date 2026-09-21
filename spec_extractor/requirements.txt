@@ -1,16 +1,27 @@
 # Spec Extractor - standard engine (CPU, no internet needed after installation)
-# Install:   python -m pip install -r requirements.txt
-# Python 3.10 - 3.13 (3.10-3.12 recommended: the page-orientation classifier needs <= 3.12;
-# on 3.13 the script uses a slower OCR-based orientation check instead).
-# Versions below were tested together on 2026-09-17; newer minor versions should also work.
+#
+# Install with the tested versions - constraints.txt pins every package to the version that passed the tests:
+#     python -m pip install -r requirements.txt -c constraints.txt
+# On Windows, setup_windows.bat does exactly this.
+#
+# Python: 64-bit 3.10, 3.11, 3.12, 3.13 or 3.14, standard build. All five passed both test levels (2026-09-17).
+#   * 3.11 or 3.12 recommended: the page-orientation classifier (last line) only installs on Python 3.12 and
+#     older. 3.13 and 3.14 use the slower, equally accurate OCR-based orientation check instead.
+#   * 3.10 gets older numpy and ONNX Runtime releases (pinned in constraints.txt); it reaches end of life in
+#     October 2026.
+#   * Not supported: Python 3.15 and newer (img2table 2.0.0 requires Python < 3.15, and ONNX Runtime has no
+#     Python 3.15 packages yet), 32-bit Python, and the optional free-threaded build (python3.14t), for which
+#     OpenCV and img2table publish no ready-made packages (on Windows, neither does ONNX Runtime).
 
 rapidocr>=3.9.2,<4           # OCR: PaddleOCR PP-OCRv6 models are bundled in this package (Apache-2.0)
-onnxruntime>=1.20            # runs the OCR models on the CPU (MIT). Tested 1.30.0
+onnxruntime>=1.20            # runs the OCR models on the CPU (MIT)
 img2table>=2.0.0,<3          # table grid detection (MIT); also installs opencv-contrib-python
-pypdfium2>=4.30              # PDF page rendering (Apache-2.0 / BSD-3). Tested 5.13.0
-pillow>=10.0                 # TIFF / PNG / JPG reading (MIT-CMU). Tested 12.3.0
-numpy>=1.26                  # Tested 2.4.6
-openpyxl>=3.1                # Excel output (MIT). Tested 3.1.5
-python-docx>=1.1             # Word verification report (MIT). Tested 1.2.0
-pyspellchecker>=0.8          # English word list for the review flags (MIT). Tested 0.9.0
-rapid_orientation>=0.0.11; python_version < "3.13"   # fast sideways/upside-down page detection (Apache-2.0)
+pypdfium2>=4.30              # PDF page rendering (Apache-2.0 / BSD-3)
+pillow>=10.0                 # TIFF / PNG / JPG reading (MIT-CMU)
+numpy>=1.26
+openpyxl>=3.1                # Excel output (MIT)
+python-docx>=1.1             # Word verification report (MIT)
+pyspellchecker>=0.8          # English word list for the review flags (MIT)
+# Fast sideways/upside-down page detection (Apache-2.0). Its package allows only Python < 3.13, so pip skips it
+# on 3.13 and 3.14 and the script uses its OCR-based orientation check there (tested, same accuracy).
+rapid_orientation>=0.0.11; python_version < "3.13"

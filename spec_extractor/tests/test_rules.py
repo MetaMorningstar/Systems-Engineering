@@ -13,6 +13,7 @@ tests/run_regression.py as well after changes to OCR, image clean-up or table de
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import tempfile
 import traceback
@@ -863,6 +864,83 @@ def test_unreadable_image_page_does_not_stop_the_file():
 
 
 # =====================================================================================================================
+# Tested configuration: supported Python versions and the pinned package versions (constraints.txt)
+# =====================================================================================================================
+def test_python_version_check():
+    ok = dict(is_64bit=True, free_threaded=False)
+    for version in [(3, 10, 21), (3, 11, 16), (3, 12, 3), (3, 13, 15), (3, 14, 6), (3, 14, 99)]:
+        assert se.python_support_problem(version, **ok) == "", version
+    for version in [(3, 9, 18), (3, 15, 0), (4, 0, 0)]:
+        assert "not a tested version" in se.python_support_problem(version, **ok), version
+    assert "32-bit" in se.python_support_problem((3, 12, 3), is_64bit=False, free_threaded=False)
+    assert "free-threaded" in se.python_support_problem((3, 14, 6), is_64bit=True, free_threaded=True)
+    # setup_windows.bat must accept exactly the same versions (its check and its "py -3.x" search list)
+    bat = (HERE.parent / "setup_windows.bat").read_text(encoding="ascii")
+    (low_major, low), (high_major, high) = se.SUPPORTED_PYTHON
+    assert f"({low_major}, {low}) <= sys.version_info[:2] <= ({high_major}, {high})" in bat
+    assert "Py_GIL_DISABLED" in bat and "sys.maxsize > 2**32" in bat
+    searched = re.search(r"for %%V in \(([^)]*)\)", bat).group(1).split()
+    assert sorted(searched, key=lambda v: tuple(map(int, v.split(".")))) == [f"3.{m}" for m in range(low, high + 1)], searched
+
+
+def test_constraints_file_pins_every_package_for_every_tested_python():
+    from packaging.requirements import Requirement
+    requirements = []
+    for name in ("requirements.txt", "requirements-dev.txt"):
+        for line in (HERE.parent / name).read_text(encoding="utf-8").splitlines():
+            entry = line.split("#", 1)[0].strip()
+            if entry and not entry.startswith("-r"):
+                requirements.append(Requirement(entry))
+    (_, low), (_, high) = se.SUPPORTED_PYTHON
+    for minor in range(low, high + 1):
+        for platform in ("win32", "linux"):
+            pinned = se.tested_versions(python=(3, minor), platform=platform)
+            for req in requirements:
+                name = se.canonical_package_name(req.name)
+                needed = not req.marker or se._conditions_hold(str(req.marker), (3, minor), platform)
+                assert (name in pinned) == needed, (minor, platform, name)
+                if needed:          # the pinned version must also satisfy requirements.txt
+                    assert req.specifier.contains(pinned[name], prereleases=True), (minor, name, pinned[name])
+            for name in se.RESULT_PACKAGES:      # every package the run report checks has a tested version
+                expected = name != "rapid-orientation" or minor < 13
+                assert (name in pinned) == expected, (minor, platform, name)
+    assert se.tested_versions(python=(3, 10), platform="linux")["numpy"] == "2.2.6"
+    assert se.tested_versions(python=(3, 11), platform="linux")["numpy"] == "2.4.6"
+    assert se.tested_versions(python=(3, 14), platform="win32")["numpy"] == "2.5.3"
+    assert "colorama" in se.tested_versions(python=(3, 12), platform="win32")
+    assert "colorama" not in se.tested_versions(python=(3, 12), platform="linux")
+    # Python versions compare as numbers ("3.9" is older than "3.10"), conditions can be combined
+    assert se._conditions_hold('python_version < "3.10"', (3, 9), "linux")
+    assert not se._conditions_hold('sys_platform == "win32" and python_version < "3.11"', (3, 12), "win32")
+    with tempfile.TemporaryDirectory() as tmp:
+        odd = Path(tmp) / "constraints.txt"
+        odd.write_text('numpy==2.5.3; platform_machine == "AMD64"\n', encoding="utf-8")
+        try:
+            se.tested_versions(odd)
+            raise AssertionError("an unsupported condition must be reported, not ignored")
+        except ValueError as exc:
+            assert "unsupported condition" in str(exc), exc
+        assert se.tested_versions(Path(tmp) / "missing.txt") == {}
+
+
+def test_configuration_report_names_every_difference():
+    tested = {"numpy": "2.5.3", "rapidocr": "3.9.2"}
+    assert se.configuration_differences({"numpy": "2.5.3", "rapidocr": "3.9.2"}, tested) == []
+    # the classifier is neither tested nor installed on Python 3.13+: that is the tested setup, not a difference
+    assert se.configuration_differences({"numpy": "2.5.3", "rapid-orientation": None}, tested) == []
+    differences = se.configuration_differences({"numpy": "2.6.0", "rapidocr": None, "rapid-orientation": "0.0.11"}, tested)
+    assert differences == ["numpy 2.6.0 is installed (tested with 2.5.3)",
+                           "rapidocr is not installed (tested with 3.9.2)",
+                           "rapid-orientation 0.0.11 is installed, but it is not part of the tested set for this Python"], differences
+    differences = se.configuration_differences({}, {}, python_problem="Python 3.15.0 is not a tested version")
+    assert differences[0].startswith("Python 3.15.0") and "constraints.txt was not found" in differences[1], differences
+    assert se.configuration_status(docling_used=True)[1][-1] == se.DOCLING_NOTE
+    # every checked package is found under its pip name (the classifier is absent on Python 3.13+ by design)
+    missing = [name for name, version in se.installed_versions().items() if version is None and name != "rapid-orientation"]
+    assert not missing, f"version lookup did not find: {missing}"
+
+
+# =====================================================================================================================
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)]
     failed = 0
@@ -875,6 +953,9 @@ def main() -> int:
             print(f"  FAIL  {name}")
             traceback.print_exc(limit=3)
     print(f"\n{len(tests) - failed} passed, {failed} failed")
+    _software, differences = se.configuration_status()
+    print("Tested configuration: yes" if not differences else
+          "NOTE - not the tested configuration:\n  - " + "\n  - ".join(differences))
     return 1 if failed else 0
 
 

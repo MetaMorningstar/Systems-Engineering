@@ -27,10 +27,13 @@ WHAT IT DOES
      plus ALL_DOCUMENTS_<date>.xlsx when more than one document is processed.
 
 QUICK START
-  1. Install Python 3.11 or 3.12 (3.10 and 3.13 also work) from python.org.
-     Tick "Add python.exe to PATH".
-  2. Open a terminal in this folder and run:
-         python -m pip install -r requirements.txt
+  1. Install a 64-bit Python 3.11 or 3.12 from python.org (3.10, 3.13 and 3.14
+     also work - see "Python versions" in README.md). Tick "Add python.exe to
+     PATH" if the installer offers it.
+  2. Windows: double-click setup_windows.bat. Other systems: open a terminal in
+     this folder and run
+         python -m pip install -r requirements.txt -c constraints.txt
+     (constraints.txt holds the exact package versions the tool was tested with)
   3. Run one of:
          python spec_extractor.py "C:\\Scans\\MySpec.pdf"      (one file)
          python spec_extractor.py "C:\\Scans"                  (every file in a folder)
@@ -85,6 +88,13 @@ DESIGN NOTES (for maintainers)
   * Tests: tests/test_rules.py (seconds, layout + requirement rules) and
     tests/run_regression.py (minutes, whole tool on synthetic aged scans with
     exact ground truth). Run both after any change.
+  * Verified configurations only: both test levels passed on 64-bit Python
+    3.10 to 3.14 with the exact package versions in constraints.txt. Every run
+    compares its own Python and package versions with that tested set and
+    reports the result in the log, the "Run Info" sheet and the Word report
+    (section 1b). The page-orientation classifier is only installed where its
+    maker supports it (Python 3.12 and older); 3.13 and 3.14 use the slower,
+    equally accurate OCR-based orientation check.
 
 FILE LAYOUT OF THIS SCRIPT
    1. Imports and dependency check          7. Document-level clean-up
@@ -102,6 +112,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as _dt
+import functools
 import hashlib
 import json
 import logging
@@ -110,6 +121,7 @@ import os
 import re
 import statistics
 import sys
+import sysconfig
 import time
 import traceback
 import unicodedata
@@ -118,7 +130,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
+
+# The Python versions this release passed both test levels on (64-bit, standard build).
+# Change this only after running tests/test_rules.py and tests/run_regression.py on the new version
+# (and update setup_windows.bat, constraints.txt and README.md to match).
+SUPPORTED_PYTHON = ((3, 10), (3, 14))          # (oldest, newest) as (major, minor)
+
+
+def python_support_problem(version: Optional[tuple] = None, is_64bit: Optional[bool] = None,
+                           free_threaded: Optional[bool] = None) -> str:
+    """Why this Python is not one of the tested ones, as one sentence ("" when it is tested).
+    The arguments exist for the tests; normally the running Python is examined."""
+    version = tuple(sys.version_info[:3]) if version is None else tuple(version)
+    is_64bit = sys.maxsize > 2 ** 32 if is_64bit is None else is_64bit
+    if free_threaded is None:            # the optional build without the GIL, e.g. python3.14t
+        free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+    name = "Python " + ".".join(str(part) for part in version)
+    lowest, highest = SUPPORTED_PYTHON
+    tested = f"a 64-bit Python {lowest[0]}.{lowest[1]} to {highest[0]}.{highest[1]} in its standard build"
+    if free_threaded:
+        return f"{name} is the free-threaded build, but Spec Extractor was tested on {tested}"
+    if not is_64bit:
+        return f"{name} is a 32-bit build, but Spec Extractor was tested on {tested}"
+    if not lowest <= version[:2] <= highest:
+        return f"{name} is not a tested version - Spec Extractor was tested on {tested}"
+    return ""
+
 
 # Keep all traffic on this computer. ONNX Runtime (which runs the OCR models) otherwise sends usage
 # telemetry to Microsoft - measured: 4 connection attempts per run, no document content - and the
@@ -164,16 +202,136 @@ try:
 except ImportError:  # pragma: no cover
     _MISSING.append("python-docx")
 
-if _MISSING:  # pragma: no cover
+if _MISSING:  # pragma: no cover - only reached on an incomplete installation
+    _problem = python_support_problem()
     sys.stderr.write(
-        "\nMissing Python packages: " + ", ".join(_MISSING) +
-        "\nInstall everything with:\n    python -m pip install -r requirements.txt\n\n")
+        "\nMissing Python packages: " + ", ".join(_MISSING) + "\n"
+        # an unsupported Python is the usual reason the packages could not be installed: say so plainly
+        + (f"{_problem}.\nThe OCR and table packages cannot be installed on it, or were not tested with it.\n"
+           "Install the 64-bit Python 3.12 from python.org (it can sit next to other Python versions),\n"
+           "then set up again as described below.\n" if _problem else "")
+        + "Windows:        double-click setup_windows.bat in the spec_extractor folder\n"
+          "Other systems:  python -m pip install -r requirements.txt -c constraints.txt\n\n")
     sys.exit(2)
 
 # Scanned engineering drawings can be very large; these are trusted local files.
 Image.MAX_IMAGE_PIXELS = 400_000_000
 
 LOG = logging.getLogger("spec_extractor")
+
+
+# ---- 1b. Tested configuration: which Python and package versions this run uses ----------------------------
+# constraints.txt (next to this script) pins every package to the version that passed the tests. Each run
+# compares the installed versions of the packages that decide what the tool reads and writes with that file
+# and states the result in the log, the Excel "Run Info" sheet and the Word report. A difference does not
+# stop the run, but the documented accuracy was not measured for it, so it is reported prominently.
+CONSTRAINTS_FILE = Path(__file__).resolve().with_name("constraints.txt")
+RESULT_PACKAGES = ("rapidocr", "onnxruntime", "opencv-python", "opencv-contrib-python", "img2table", "numpy",
+                   "pillow", "pypdfium2", "pyclipper", "shapely", "rapid-orientation", "pyspellchecker",
+                   "openpyxl", "python-docx")
+DOCLING_NOTE = "the optional Docling engine was used - its accuracy has not been measured"
+# one condition of a constraints.txt line, e.g.   python_version < "3.11"   or   sys_platform == "win32"
+_CONDITION = re.compile(r"""^(python_version|sys_platform)\s*(==|!=|<=|>=|<|>)\s*["']([^"']+)["']$""")
+
+
+def canonical_package_name(name: str) -> str:
+    """Compare package names the way pip does: 'Rapid_Orientation' is the same as 'rapid-orientation'."""
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def _conditions_hold(conditions: str, python: tuple, platform: str) -> bool:
+    """True when every condition of a constraints.txt line (joined with 'and') holds for this computer."""
+    for condition in conditions.split(" and "):
+        m = _CONDITION.match(condition.strip())
+        if not m:
+            raise ValueError(f"constraints.txt: unsupported condition {condition.strip()!r} "
+                             "(use python_version or sys_platform comparisons joined with 'and')")
+        key, op, value = m.groups()
+        if key == "python_version":        # compared as numbers, so "3.10" comes after "3.9"
+            left, right = tuple(python[:2]), tuple(int(part) for part in value.split("."))
+        else:
+            left, right = platform, value
+        holds = {"==": left == right, "!=": left != right, "<": left < right,
+                 "<=": left <= right, ">": left > right, ">=": left >= right}[op]
+        if not holds:
+            return False
+    return True
+
+
+def tested_versions(path: Optional[Path] = None, python: Optional[tuple] = None,
+                    platform: Optional[str] = None) -> dict:
+    """{package: version} that constraints.txt pins for this Python and operating system.
+    Returns {} when the file is missing (e.g. only spec_extractor.py was copied somewhere else)."""
+    path = CONSTRAINTS_FILE if path is None else Path(path)
+    python = tuple(sys.version_info[:2]) if python is None else tuple(python)
+    platform = sys.platform if platform is None else platform
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    pinned = {}
+    for line in lines:
+        entry = line.split("#", 1)[0].strip()             # drop comments and blank lines
+        if not entry:
+            continue
+        requirement, _, conditions = entry.partition(";")
+        name, is_pin, version = requirement.partition("==")
+        if not (is_pin and name.strip() and version.strip()):
+            raise ValueError(f"constraints.txt: expected 'name==version', got {line.strip()!r}")
+        if conditions.strip() and not _conditions_hold(conditions, python, platform):
+            continue                                       # this line is for another Python / system
+        pinned[canonical_package_name(name)] = version.strip()
+    return pinned
+
+
+def installed_versions(names: Iterable = RESULT_PACKAGES) -> dict:
+    """{package: installed version, or None when it is not installed}."""
+    from importlib import metadata
+    found = {}
+    for name in names:
+        try:
+            found[canonical_package_name(name)] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            found[canonical_package_name(name)] = None
+    return found
+
+
+def configuration_differences(installed: dict, tested: dict, python_problem: str = "") -> list:
+    """Every way this computer differs from the tested configuration, as readable sentences.
+    An empty list means: a tested Python and exactly the tested version of every checked package."""
+    differences = [python_problem] if python_problem else []
+    if not tested:
+        differences.append(f"{CONSTRAINTS_FILE.name} was not found next to spec_extractor.py, "
+                           "so the package versions could not be checked")
+        return differences
+    for name, have in installed.items():
+        want = tested.get(name)
+        if want is None and have is not None:        # e.g. a package forced onto a Python it does not support
+            differences.append(f"{name} {have} is installed, but it is not part of the tested set for this Python")
+        elif want is not None and have is None:
+            differences.append(f"{name} is not installed (tested with {want})")
+        elif want is not None and have != want:
+            differences.append(f"{name} {have} is installed (tested with {want})")
+    return differences
+
+
+@functools.lru_cache(maxsize=1)
+def _environment_status() -> tuple:
+    """(software versions text, differences) for this computer - worked out once per run."""
+    python = "Python " + ".".join(map(str, sys.version_info[:3])) + (" 64-bit" if sys.maxsize > 2 ** 32 else " 32-bit")
+    try:
+        installed = installed_versions()
+        software = "; ".join([python] + [f"{n} {v}" if v else f"{n} (not installed)" for n, v in installed.items()])
+        differences = configuration_differences(installed, tested_versions(), python_support_problem())
+    except Exception as exc:                        # the check itself must never stop a run
+        software, differences = python, [f"the package versions could not be checked ({exc})"]
+    return software, tuple(differences)
+
+
+def configuration_status(docling_used: bool = False) -> tuple:
+    """-> (software versions text, [differences from the tested configuration]) for the log and reports."""
+    software, differences = _environment_status()
+    return software, list(differences) + ([DOCLING_NOTE] if docling_used else [])
 
 
 # =============================================================================
@@ -3600,9 +3758,13 @@ def write_workbook(path: Path, runs: list, settings: Settings, multi_doc: bool =
     ri.column_dimensions["A"].width = 30
     ri.column_dimensions["B"].width = 110
     n_req = sum(1 for _, items in runs for it in items if it.item_type == "Requirement")
+    software, differences = configuration_status(docling_used=any(d.engine == "docling" for d, _ in runs))
     info = [
         ("Created", _dt.datetime.now().strftime("%Y-%m-%d %H:%M")),
         ("Tool", f"spec_extractor.py {__version__}"),
+        ("Tested configuration", "Yes - Python and package versions match constraints.txt" if not differences
+         else "NO - the documented accuracy was not measured for this setup:\n" + "\n".join(differences)),
+        ("Software", software.replace("; ", "\n")),
         ("Engine", runs[0][0].engine if runs else settings.engine),
         ("Documents", "\n".join(f"{Path(d.source).name}  ({len(d.pages)} pages, {d.seconds:.0f} s)" for d, _ in runs)),
         ("Requirements", n_req),
@@ -3714,6 +3876,9 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
     p.add_run("Source: ").bold = True
     p.add_run(_docx_text(Path(doc.source).name))
     p.add_run(f"\nPages: {len(doc.pages)}    Engine: {doc.engine}    Created: {_dt.datetime.now():%Y-%m-%d %H:%M}")
+    _software, differences = configuration_status(docling_used=doc.engine == "docling")
+    p.add_run(f"\nTool: spec_extractor.py {__version__}    Tested configuration: "
+              + ("yes" if not differences else "NO - see 'Run Info' in the Excel file or spec_extractor_log.txt"))
     n_req = sum(1 for it in items if it.item_type == "Requirement")
     p.add_run(f"\nRequirements: {n_req}    Tables: {sum(1 for it in items if it.item_type == 'Table')}    "
               f"Captions: {sum(1 for it in items if 'Caption' in it.item_type)}    "
@@ -4247,6 +4412,23 @@ def _setup_logging(out_dir: Optional[Path], verbose: bool):
     _quiet_third_party_loggers()
 
 
+def report_configuration(docling_used: bool) -> None:
+    """Log whether this run uses a tested Python and the tested package versions (details in the log file)."""
+    software, differences = configuration_status(docling_used)
+    LOG.debug("Software: %s", software)
+    if not differences:
+        LOG.info("Tested configuration: yes (%s with the package versions in %s)",
+                 software.split(";")[0], CONSTRAINTS_FILE.name)
+        return
+    LOG.warning("NOT the tested configuration - the documented accuracy was not measured for:")
+    for difference in differences:
+        LOG.warning("  - %s", difference)
+    if any(d != DOCLING_NOTE for d in differences):
+        LOG.warning("  To use the tested setup: delete the .venv folder next to spec_extractor.py and run "
+                    "setup_windows.bat again")
+        LOG.warning("  (other systems: python -m pip install -r requirements.txt -c constraints.txt)")
+
+
 def main(argv: Optional[list] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     used_dialog = False
@@ -4274,6 +4456,7 @@ def main(argv: Optional[list] = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     _setup_logging(out_dir, args.verbose)
     LOG.info("spec_extractor %s - %d file(s) - engine: %s - output: %s", __version__, len(files), settings.engine, out_dir)
+    report_configuration(docling_used=settings.engine == "docling")
 
     output_stems = unique_output_stems(files)
     extractor = SpecExtractor(settings)

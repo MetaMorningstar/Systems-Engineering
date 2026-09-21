@@ -1,0 +1,75 @@
+# Spec Extractor - the EXACT package versions this release was tested with (2026-09-17).
+#
+# requirements.txt says WHICH packages the tool needs. This file fixes the VERSION of every package
+# that gets installed, so every computer gets the combination that passed both test levels
+# (tests/test_rules.py and tests/run_regression.py) on 64-bit Python 3.10, 3.11, 3.12, 3.13 and 3.14.
+#
+#   Install:          python -m pip install -r requirements.txt -c constraints.txt
+#   Offline wheels:   python -m pip wheel -r requirements.txt -c constraints.txt -w wheels
+#   setup_windows.bat uses this file automatically.
+#
+# Every run of spec_extractor.py compares the installed versions with this file and states the result
+# in its log, in the Excel "Run Info" sheet and in the Word report ("Tested configuration").
+#
+# MAINTAINERS - changing a version: edit it here, reinstall, run BOTH test levels on EVERY supported
+# Python version, and only hand the folder out when all of them pass. Keep the format simple:
+# one "name==version" per line, optionally followed by ";" and conditions on python_version and/or
+# sys_platform joined with "and" (spec_extractor.py reads this file and understands only those).
+
+# ---- Packages that decide what the tool reads (OCR, image clean-up, tables, PDF/TIFF pages) ------------------
+rapidocr==3.9.2
+onnxruntime==1.23.2; python_version < "3.11"
+onnxruntime==1.30.0; python_version >= "3.11"
+opencv-python==5.0.0.93
+opencv-contrib-python==5.0.0.93
+img2table==2.0.0
+numpy==2.2.6; python_version < "3.11"
+numpy==2.4.6; python_version == "3.11"
+numpy==2.5.3; python_version >= "3.12"
+pillow==12.3.0
+pypdfium2==5.13.0
+pyclipper==1.4.0
+shapely==2.1.2
+pyspellchecker==0.9.0
+# The page-orientation classifier supports only Python 3.12 and older. Python 3.13 and 3.14 do not
+# install it and use the slower OCR-based orientation check (tested; same accuracy).
+rapid_orientation==0.0.11; python_version < "3.13"
+
+# ---- Output files --------------------------------------------------------------------------------------------
+openpyxl==3.1.5
+et-xmlfile==2.0.0
+python-docx==1.2.0
+lxml==6.1.3
+xlsxwriter==3.2.9
+
+# ---- Supporting packages (installed automatically by the packages above) -------------------------------------
+antlr4-python3-runtime==4.9.3
+beautifulsoup4==4.15.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+colorlog==6.12.0
+flatbuffers==25.12.19
+idna==3.20
+omegaconf==2.3.1
+packaging==26.3
+protobuf==7.36.1
+pyyaml==6.0.3
+requests==2.34.2
+six==1.17.0
+soupsieve==2.9.2
+tqdm==4.70.1
+typing-extensions==4.16.0
+urllib3==2.8.0
+# only needed by the older ONNX Runtime used on Python 3.10
+coloredlogs==15.0.1; python_version < "3.11"
+humanfriendly==10.0; python_version < "3.11"
+mpmath==1.3.0; python_version < "3.11"
+sympy==1.14.0; python_version < "3.11"
+# Windows-only console helpers (text colours; they play no part in reading documents)
+colorama==0.4.6; sys_platform == "win32"
+pyreadline3==3.5.6; sys_platform == "win32" and python_version < "3.11"
+
+# ---- Test tools (requirements-dev.txt) -----------------------------------------------------------------------
+reportlab==5.0.1
+rapidfuzz==3.14.5; python_version < "3.11"
+rapidfuzz==3.14.6; python_version >= "3.11"
