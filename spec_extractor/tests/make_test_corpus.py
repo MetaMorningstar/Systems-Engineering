@@ -243,7 +243,8 @@ class Builder:
 
     def matrix(self, caption: str, label_headers: list[str], method_headers: list[str],
                rows: list[list[str]], col_widths: list[float], *, sideways: bool = True,
-               row_lines: bool = False, font_size: float = 9, header_height: float = 84):
+               row_lines: bool = False, font_size: float = 9, header_height: float = 84,
+               legend: str | None = None):
         """A verification cross reference matrix: label columns, then one column per method.
 
         The defaults reproduce the layout of a real MIL-STD matrix, and the one that used to defeat
@@ -254,14 +255,25 @@ class Builder:
         head = [Paragraph(escape(h), cell) for h in label_headers]
         head += [SidewaysText(h, self.body.fontName, font_size, header_height - 8) if sideways
                  else Paragraph(escape(h), cell) for h in method_headers]
-        data = [head] + [[Paragraph(escape(c), cell) for c in r] for r in rows]
-        tbl = Table(data, colWidths=col_widths, repeatRows=1,
-                    rowHeights=[header_height] + [font_size * 2.6] * len(rows))
-        style = [("VALIGN", (0, 0), (-1, 0), "BOTTOM"), ("VALIGN", (0, 1), (-1, -1), "TOP"),
+        # Many matrices carry a LEGEND band above the headers, merged across the whole width, that
+        # explains what the numbered and lettered columns mean.
+        legend_row = ([[Paragraph(escape(legend), ParagraphStyle(
+            f"lg{len(self.story)}", parent=cell, fontSize=font_size - 1.5,
+            leading=(font_size - 1.5) * 1.25))] + [""] * (len(label_headers) + len(method_headers) - 1)]
+            if legend else [])
+        data = legend_row + [head] + [[Paragraph(escape(c), cell) for c in r] for r in rows]
+        tbl = Table(data, colWidths=col_widths, repeatRows=1 + len(legend_row),
+                    rowHeights=([font_size * 4.2] if legend else []) + [header_height]
+                    + [font_size * 2.6] * len(rows))
+        top = len(legend_row)
+        style = [("VALIGN", (0, top), (-1, top), "BOTTOM"), ("VALIGN", (0, top + 1), (-1, -1), "TOP"),
                  ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                  ("BOX", (0, 0), (-1, -1), 0.9, colors.black),
-                 ("LINEAFTER", (0, 0), (-2, -1), 0.9, colors.black),      # column rules
-                 ("LINEBELOW", (0, 0), (-1, 0), 0.9, colors.black)]       # under the headers only
+                 ("LINEAFTER", (0, top), (-2, -1), 0.9, colors.black),    # column rules
+                 ("LINEBELOW", (0, top), (-1, top), 0.9, colors.black)]   # under the headers only
+        if legend:
+            style += [("SPAN", (0, 0), (-1, 0)), ("VALIGN", (0, 0), (-1, 0), "TOP"),
+                      ("LINEBELOW", (0, 0), (-1, 0), 0.9, colors.black)]  # under the legend band
         if row_lines:
             style.append(("GRID", (0, 0), (-1, -1), 0.9, colors.black))
         tbl.setStyle(TableStyle(style))
@@ -270,7 +282,8 @@ class Builder:
         self.spacer(10)
         self.gt.captions.append({"kind": "table", "text": caption})
         self.gt.all_text.append(caption)
-        grid = [label_headers + method_headers] + rows
+        grid = ([[legend] + [""] * (len(label_headers) + len(method_headers) - 1)] if legend else []) \
+            + [label_headers + method_headers] + rows
         self.gt.tables.append({"caption": caption, "rows": grid, "optional": False})
         self.gt.all_text.extend(c for r in grid for c in r if c)
 
@@ -641,6 +654,28 @@ def build_spec_e() -> tuple[bytes, GroundTruth]:
               ["3.4.2.1", "X", "", "", "", "", ""], ["3.4.2.2", "", "", "", "", "X", ""],
               ["3.4.3.1", "", "", "X", "", "", ""], ["3.4.3.2", "", "", "", "", "", "X"]],
              [1.3 * inch] + [0.48 * inch] * 6, sideways=False, header_height=22)
+
+    # A quality conformance matrix: a LEGEND band across the top, upright headers, many narrow
+    # mark columns, and column rules with nothing between the rows. Reported from real material as
+    # coming out as a single row with every X bundled into it.
+    b.page_break()
+    b.para("4.3", "Quality conformance inspection.",
+           [("Each requirement shall be inspected as specified in TABLE IV.", "shall")])
+    b.matrix("TABLE IV. Quality conformance inspection matrix.",
+             ["Requirement reference"], ["1", "2", "3", "4", "A", "B", "C", "D",
+                                        "AQL or percent", "Inspection method"],
+             [["3.4.1.1", "X", "", "X", "", "X", "", "X", "", "2.5", "Visual and functional"],
+              ["3.4.1.2", "", "X", "", "", "", "X", "", "", "1.0", "Dimensional check"],
+              ["3.4.2.1", "X", "", "", "X", "X", "", "", "X", "0.65", "Environmental screen"],
+              ["3.4.2.2", "", "", "X", "", "", "", "X", "", "4.0", "Functional bench test"],
+              ["3.4.3.1", "X", "X", "", "", "X", "X", "", "", "2.5", "Visual and dimensional"]],
+             # the label column is deliberately too narrow for its header, so "Requirement
+             # reference" WRAPS: a two-line header is what used to make the header band
+             # swallow the first record and collapse the whole matrix into one row.
+             [0.95 * inch] + [0.27 * inch] * 8 + [0.6 * inch, 1.45 * inch],
+             sideways=False, header_height=24, font_size=8,
+             legend=("LEGEND:  1 = First article   2 = Periodic   3 = Lot sample   4 = Continuous   "
+                     "A = Visual   B = Dimensional   C = Functional   D = Environmental"))
 
     # a requirement table with a banner merged over the two right-hand columns
     b.banner_table("TABLE III. Interface requirements.",
