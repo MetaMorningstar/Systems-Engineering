@@ -4126,32 +4126,49 @@ class RequirementExtractor:
             ref = marker
         extra_reasons = ["Text continues across pages - check the join"] if b.meta.get("continued_across_pages") else []
 
-        # sentences with requirement keywords (and the non-keyword sentences that explain them)
-        units = []
+        # One block can hold two numbered paragraphs when the scan lost the blank line between them
+        # ("3.2.2.1 Weight. ... 3.2.2.2 Input power. ..."). Cut the sentences at every number found
+        # inside the block, so each part is judged, numbered and titled on its own. The cut must come
+        # BEFORE the keyword test: "... 45 kg. 3.2.2.2 The unit shall ..." is ONE sentence to
+        # split_sentences (a full stop followed by a digit does not end a sentence), and cutting it
+        # afterwards would lose the second requirement.
+        inner = self._inner_paragraphs(text, body_start)
+
+        def paragraph_of(pos: int) -> int:
+            """0 = the block's own paragraph, 1 = the first number found inside it, and so on."""
+            return sum(1 for p in inner if p[3] <= pos)
+
+        pieces = []
         for s0, e0 in split_sentences(text[body_start:]):
             s, e = s0 + body_start, e0 + body_start
+            for cut, _ref, _title, body_at in inner:
+                if s < cut < e:
+                    pieces.append((s, cut))           # the end of the paragraph before the number
+                    s = body_at                       # the number and its title are not requirement text
+                elif cut <= s < body_at:
+                    s = body_at
+            if s < e:
+                pieces.append((s, e))
+
+        # sentences with requirement keywords (and the non-keyword sentences that explain them)
+        units = []
+        for s, e in pieces:
             sent = text[s:e].strip()
+            if not sent:
+                continue
             kw = self.keyword_in(self.repair_keywords(sent)[0])
             if kw:
                 units.append([s, e, kw])
-            elif units and CONTINUATION_START.match(sent) and not sent.endswith(":"):
+            elif (units and paragraph_of(units[-1][0]) == paragraph_of(s)       # never across a paragraph number
+                  and CONTINUATION_START.match(sent) and not sent.endswith(":")):
                 units[-1][1] = e
         if not units:
             return 1
-
-        # One block can hold two numbered paragraphs when the scan lost the blank line between them.
-        # Give each sentence the number and title of the paragraph it actually sits in, and stop a
-        # sentence from swallowing the heading that follows it.
-        heads = [(ref, title)] * len(units)
-        inner = self._inner_paragraphs(text, body_start)
-        for n, u in enumerate(units):
-            cut = next((p for p in inner if u[0] < p[0] < u[1]), None)
-            if cut:
-                u[1] = cut[0]
-            started = [p for p in inner if p[3] <= u[0]]
-            if started:
-                heads[n] = (started[-1][1], started[-1][2])
-                u[0] = max(u[0], started[-1][3])      # the number and title are not part of the text
+        def head_of(u: list) -> tuple:
+            """(number, title) of the paragraph a sentence actually sits in."""
+            k = paragraph_of(u[0])
+            return (ref, title) if k == 0 else tuple(inner[k - 1][1:3])
+        heads = [head_of(u) for u in units]
 
         dpi = dpi_of.get(b.page, 200)
         # a stem inside the block ("... shall provide:" with the first items on the next rows of the same block)
@@ -4192,14 +4209,18 @@ class RequirementExtractor:
                     j += 1
                     continue
                 break
-            # requirements stated before the stem in the same block
-            for s, e, kw in [u for u in units if u[1] <= last[0]]:
-                items.append(self._req_item(b, source, section, ref, title, text, tokens, spans, s, e, kw, "Paragraph", "", extra_reasons))
+            # requirements stated before the stem in the same block (each under its own paragraph number)
+            for u in [u for u in units if u[1] <= last[0]]:
+                u_ref, u_title = head_of(u)
+                items.append(self._req_item(b, source, section, u_ref, u_title, text, tokens, spans, u[0], u[1], u[2],
+                                            "Paragraph", "", extra_reasons))
+            stem_ref, stem_title = head_of(last)            # the list belongs to the stem's paragraph
             if not children:
-                items.append(self._req_item(b, source, section, ref, title, text, tokens, spans, last[0], last[1], last[2],
+                items.append(self._req_item(b, source, section, stem_ref, stem_title, text, tokens, spans, last[0], last[1], last[2],
                                             "Paragraph", "", extra_reasons + ["Ends with ':' but no list items were found below"]))
                 return 1
-            self._list_items(b, children, source, section, ref, title, text, tokens, spans, last, vocab, items, extra_reasons, dpi)
+            self._list_items(b, children, source, section, stem_ref, stem_title, text, tokens, spans, last, vocab, items,
+                             extra_reasons, dpi)
             for sb in skipped:                   # captions / figures that sat inside the list are exported too
                 if sb.kind == "caption" and not sb.meta.get("duplicate_of_table"):
                     items.append(self._caption_item(sb, source, section))

@@ -1686,6 +1686,33 @@ def test_two_numbered_paragraphs_in_one_block_keep_their_own_numbers():
     assert rows[1].title == "Input power", rows[1].title
 
 
+def test_a_second_numbered_paragraph_without_a_title_is_not_lost():
+    """Both paragraphs on ONE line, so they are one block. With no title after the second number,
+    '... 45 kilograms. 3.2.2.2 The equipment shall ...' is a single sentence (a full stop before a
+    digit does not end one); the second requirement must still become its own row, not vanish."""
+    for text in ("3.2.2.1 Weight. The equipment shall not exceed 45 kilograms. "
+                 "3.2.2.2 Input power. The equipment shall operate from 115 VAC.",
+                 "3.2.2.1 Weight. The equipment shall not exceed 45 kilograms. "
+                 "3.2.2.2 The equipment shall operate from 115 VAC."):
+        _doc, items = run({1: [make_line(text)]})
+        rows = requirements(items)
+        assert [(r.doc_ref, r.text) for r in rows] == [
+            ("3.2.2.1", "The equipment shall not exceed 45 kilograms."),
+            ("3.2.2.2", "The equipment shall operate from 115 VAC.")], [(r.doc_ref, r.text) for r in rows]
+
+
+def test_a_list_under_the_second_numbered_paragraph_of_a_block_carries_that_number():
+    """A stem in the second of two merged numbered paragraphs: its list items belong to THAT
+    paragraph, so they must not be filed under the first paragraph's number."""
+    lines = [make_line("3.4.1 Power. The unit shall draw less than 40 W. 3.4.2 Modes. The unit shall provide:")]
+    lines += make_lines([(80, "a. Standby mode."), (80, "b. Operate mode.")], y0=300 + PITCH)
+    _doc, items = run({1: lines})
+    rows = requirements(items)
+    refs = [r.doc_ref for r in rows]
+    assert refs[0] == "3.4.1", [(r.doc_ref, r.text) for r in rows]
+    assert refs[1:] == ["3.4.2 a", "3.4.2 b"], [(r.doc_ref, r.text) for r in rows]
+
+
 def test_a_cross_reference_is_not_mistaken_for_a_new_paragraph():
     """'... as defined in 3.2.1. Testing shall ...' is one paragraph: the number is a reference in
     running text, not a heading, so the second sentence keeps the block's own number."""
