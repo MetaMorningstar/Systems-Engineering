@@ -130,7 +130,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 @functools.lru_cache(maxsize=1)
@@ -160,7 +160,7 @@ def build_id() -> str:
 
 
 def version_line() -> str:
-    """'spec_extractor 1.2.0 (build a1b2c3d)' - the one string every report shows."""
+    """'spec_extractor 1.3.0 (build a1b2c3d)' - the one string every report shows."""
     return f"spec_extractor {__version__} (build {build_id()})"
 
 # The Python versions this release passed both test levels on (64-bit, standard build).
@@ -1146,7 +1146,55 @@ RE_LIST_MARKER = re.compile(
     # against the marker also starts the text. A marker still has to be at the start of the line.
     r"(?:\s+|(?=[A-Z]))(?P<rest>\S.*)$", re.S)
 RE_BARE_MARKER = re.compile(r"^\s*(?:\(?[a-z]\)|[a-z]\.|\(?\d{1,2}[.)]|\((?:i|ii|iii|iv|v|vi|vii|viii|ix|x)\)|[•·◦*\-o])\s*$")
-RE_NUMBERED_ITEM = re.compile(r"^(?P<marker>\d{1,2}\.)\s+(?P<rest>\S.*)$", re.S)
+RE_NUMBERED_ITEM = re.compile(r"^(?P<marker>\d{1,2}\.)(?:\s+|(?=[A-Z][a-z]))(?P<rest>\S.*)$", re.S)   # "1.Input" too
+# Something shaped like a list marker, right or wrong: "c." "C." "(b)" "3)" "iv." - one to four
+# characters closed by "." or ")" - used when the OCR has misread the marker itself.
+RE_MARKER_SHAPE = re.compile(r"^(?P<marker>\(?[A-Za-z0-9]{1,4}[.)])[.,]?(?:\s+|(?=[A-Z]))(?P<rest>\S.*)$", re.S)
+_ROMANS = ("i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii", "xiii", "xiv", "xv",
+           "xvi", "xvii", "xviii", "xix", "xx")
+
+
+def _marker_parts(marker: str):
+    """'b.' -> ('', 'b', '.'), '(iv)' -> ('(', 'iv', ')'), '12)' -> ('', '12', ')'); None for a bullet."""
+    m = re.fullmatch(r"(\(?)([A-Za-z]{1,5}|\d{1,3})([.)]?)", (marker or "").strip())
+    return (m.group(1), m.group(2), m.group(3)) if m and (m.group(1) or m.group(3)) else None
+
+
+def _next_marker(marker: str, roman: bool = False) -> str:
+    """The marker that follows `marker` in the same list: 'b.' -> 'c.', '(2)' -> '(3)', 'iv)' -> 'v)'.
+    Letters and numbers count up one at a time, so a list's markers can be checked against each other."""
+    parts = _marker_parts(marker)
+    if not parts:
+        return ""
+    opening, core, closing = parts
+    if core.isdigit():
+        following = str(int(core) + 1)
+    elif roman and core.lower() in _ROMANS[:-1]:
+        following = _ROMANS[_ROMANS.index(core.lower()) + 1]
+        following = following.upper() if core.isupper() else following
+    elif len(core) == 1 and core.isalpha() and core.lower() != "z":
+        following = chr(ord(core) + 1)
+    else:
+        return ""
+    return opening + following + closing
+
+
+def _previous_marker(marker: str, roman: bool = False) -> str:
+    """The marker before `marker`: 'b.' -> 'a.', '(3)' -> '(2)'; '' for the first one."""
+    parts = _marker_parts(marker)
+    if not parts:
+        return ""
+    opening, core, closing = parts
+    if core.isdigit():
+        before = str(int(core) - 1) if int(core) > 1 else ""
+    elif roman and core.lower() in _ROMANS[1:]:
+        before = _ROMANS[_ROMANS.index(core.lower()) - 1]
+        before = before.upper() if core.isupper() else before
+    elif len(core) == 1 and core.isalpha() and core.lower() != "a":
+        before = chr(ord(core) - 1)
+    else:
+        return ""
+    return opening + before + closing if before else ""
 # Captions: "TABLE II. Title", "Figure 3-1: Title", "FIG. 4 Title", "Exhibit A - Title"
 RE_CAPTION = re.compile(
     r"^(?P<kind>TABLE|Table|FIGURE|Figure|FIG\.?|Fig\.?|EXHIBIT|Exhibit|CHART|Chart|DRAWING|Drawing|PLATE|Plate)"
@@ -1181,6 +1229,47 @@ LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl",
 def clean_para_number(num: str) -> str:
     """'3.2.i.4' -> '3.2.1.4' (a letter l/I/i/| inside a paragraph number is a misread 1)."""
     return re.sub(r"(?<=\.)[lIi|](?=\.|$)", "1", num)
+
+
+def _number_parts(number: str):
+    """'3.2.4' -> (3, 2, 4); 'A.1' -> (-1, 1) (an appendix letter, counted as its own scheme); None when
+    the text is not a paragraph number."""
+    parts = clean_para_number((number or "").strip().rstrip(".")).split(".")
+    out = []
+    for k, part in enumerate(parts):
+        if part.isdigit():
+            out.append(int(part))
+        elif k == 0 and len(part) == 1 and part.isalpha() and part.isupper():
+            out.append(-(ord(part) - ord("A") + 1))           # appendix A, B, ... as -1, -2, ...
+        else:
+            return None
+    return tuple(out) if out else None
+
+
+def plausible_next_number(previous: str, candidate: str, max_skip: int = 3) -> bool:
+    """Is `candidate` a believable next paragraph number after `previous`?
+
+    Paragraph numbers count up. After 3.2.4 may come 3.2.4.1 (its first sub-paragraph), 3.2.5 (the next
+    one) or 3.3 / 4 (the next one a level up), and a few numbers may be skipped because the scan missed a
+    heading. A number that fits none of these - '1.5' or '20' after 3.2.4 - is a value that happens to
+    start a line ("1.5 V peak-to-peak", "20 Hz to 2000 Hz"), not a section. Deeper levels of a new number
+    start low (3.3.1, not 3.3.7). With nothing to compare against, any number is accepted."""
+    p, c = _number_parts(previous), _number_parts(candidate)
+    if p is None or c is None:
+        return True
+    if (p[0] < 0) != (c[0] < 0):
+        return True                                   # the body moves into an appendix, or back: a new scheme
+
+    def starts_low(levels) -> bool:
+        return all(0 <= x <= 2 for x in levels)
+
+    if len(c) > len(p) and c[:len(p)] == p:
+        return starts_low(c[len(p):])                  # a sub-paragraph: 3.2.4 -> 3.2.4.1
+    for k in range(min(len(p), len(c))):
+        if c[k] != p[k]:
+            step = (p[k] - c[k]) if c[k] < 0 else (c[k] - p[k])       # appendix letters count -1, -2, ...
+            return 0 < step <= max_skip and starts_low(c[k + 1:])
+    return c == p                                     # the same number again (a paragraph under its own heading)
 
 
 def normalize_ocr_text(text: str) -> str:
@@ -2204,6 +2293,28 @@ def _merges_without_row(merges: list, row: int) -> list:
     return out
 
 
+def _first_column_counts_like_a_list(cells: list) -> bool:
+    """True when most cells of a first column BEGIN with list markers that count up - "a. Acceleration:",
+    "b. Vibration:", "c. Shock:" or "1.", "2.", "3." - i.e. a list laid out on tab stops, which lines up
+    exactly like a table without ruling lines. A misread marker ("C." for "c.") still counts. So does a
+    first column of short labels ("POWER:", "FAULT:"): a bulleted list whose bullets the OCR did not see."""
+    texts = [(c or "").strip() for c in cells if (c or "").strip()]
+    if len(texts) >= 2 and sum(1 for t in texts if RE_ITEM_LABEL.match(t) and word_count(t) <= 4) >= 0.8 * len(texts):
+        return True                    # "POWER: | Green, ..." - labels and values; the bullets were not read
+    markers = []
+    for text in texts:
+        m = RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text) or RE_MARKER_SHAPE.match(text)
+        if m and _marker_parts(m.group("marker")):
+            markers.append(m.group("marker"))
+        elif _marker_parts(text):
+            markers.append(text)                        # the cell is only a marker: "ii."
+    if len(markers) < max(2, 0.5 * len(texts)):
+        return False
+    roman = any((_marker_parts(mk) or ("", "", ""))[1].lower() in _ROMANS[1:9] for mk in markers)
+    steps = sum(1 for a, b in zip(markers, markers[1:]) if _next_marker(a, roman).lower() == b.lower())
+    return steps >= max(1, 0.5 * (len(markers) - 1))
+
+
 def _plausible_borderless_table(grid: list, n_unique: int, n_filled: int) -> bool:
     """Borderless candidates must look like real tables, not lists, headings or prose that happens
     to line up (monospaced typewriter text lines up very well).
@@ -2222,6 +2333,8 @@ def _plausible_borderless_table(grid: list, n_unique: int, n_filled: int) -> boo
     first_col = [r[0] for r in grid if r and r[0]]
     if first_col and sum(1 for c in first_col if RE_BARE_MARKER.match(c)) >= 0.5 * len(first_col):
         return False                                   # "a. | Search mode." -> that is a list
+    if _first_column_counts_like_a_list(first_col):
+        return False                                   # "a. Acceleration: | 5 g ..." -> a list on tab stops
     if _reads_like_prose(grid):
         return False
     well_filled = sum(1 for c in range(n_cols) if sum(1 for r in grid if c < len(r) and r[c]) >= 0.6 * n_rows)
@@ -2368,8 +2481,41 @@ def _merge_intervals(intervals: list, tolerance: float) -> list:
     return out
 
 
+def _is_tab_not_gutter(left: list, right: list) -> bool:
+    """True when a vertical band of whitespace is the wide TAB inside the rows of a list, not the
+    gutter between two columns of text:
+
+        a.      Acceleration:      5 g in each of the three orthogonal axes
+                                   for 1 minute per axis.
+
+    The OCR returns 'a.', 'Acceleration:' and the value as separate pieces, so the band looks like a
+    column gutter; cutting there would put every label in one column and every value in another.
+    The difference from real columns: the left-hand pieces are list markers or short labels (not lines
+    of running text), and nearly each of them sits on the same line as text on the right."""
+    left_lines = [p for _, p in left if isinstance(p, Line)]
+    right_lines = [p for _, p in right if isinstance(p, Line)]
+    if len(left_lines) != len(left) or not right_lines:
+        return False                                  # a table or figure on one side: a real split
+    rows = _rows_of(left_lines)
+    height = statistics.median([ln.box[3] - ln.box[1] for ln in left_lines + right_lines])
+    centres = [(ln.box[1] + ln.box[3]) / 2 for ln in right_lines]
+    paired = cued = short = 0
+    for row in rows:
+        text = " ".join(ln.text for ln in row).strip()
+        y = (min(ln.box[1] for ln in row) + max(ln.box[3] for ln in row)) / 2
+        paired += any(abs(y - c) <= 0.5 * height for c in centres)
+        marker = bool(RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text) or RE_BARE_MARKER.match(text))
+        cued += marker or text.endswith(":")
+        short += word_count(text) <= 4
+    n = len(rows)
+    # most rows on a shared line, (almost) all of them short, and at least half carry a marker or a
+    # label colon - running text in a column is long and has neither
+    return paired >= 0.6 * n and short >= 0.8 * n and cued >= 0.5 * n
+
+
 def _column_cut(items: list, region_w: float, min_vgap: float):
-    """The widest vertical whitespace band with real text on both sides -> (gap, left, right) or None."""
+    """The widest vertical whitespace band with real text on both sides -> (gap, left, right) or None.
+    The wide tabs inside a list ("a.   Label:   value") are not columns (see _is_tab_not_gutter)."""
     x_spans = _merge_intervals([(it[0][0], it[0][2]) for it in items], 0)
     best = None
     for (a0, a1), (b0, b1) in zip(x_spans, x_spans[1:]):
@@ -2381,7 +2527,7 @@ def _column_cut(items: list, region_w: float, min_vgap: float):
         lw = max(it[0][2] for it in left) - min(it[0][0] for it in left)
         rw = max(it[0][2] for it in right) - min(it[0][0] for it in right)
         if lw >= 0.2 * region_w and rw >= 0.2 * region_w and len(left) >= 2 and len(right) >= 2:
-            if best is None or gap > best[0]:
+            if (best is None or gap > best[0]) and not _is_tab_not_gutter(left, right):
                 best = (gap, left, right)
     return best
 
@@ -2401,7 +2547,8 @@ def xy_cut(items: list, min_hgap: float, min_vgap: float, depth: int = 0) -> lis
     # --- a line across the whole width (running header/footer, page-wide heading or table) hides the
     #     column gutter: cut the region above and below such lines first, then look for columns again.
     #     (Cutting at every horizontal gap would slice two columns into rows and mix their lines.)
-    wide = {id(it) for it in items if it[0][2] - it[0][0] >= 0.6 * region_w}
+    # (A long line that STARTS well to the right - the value column of a tabbed list - is not page-wide.)
+    wide = {id(it) for it in items if it[0][2] - it[0][0] >= 0.6 * region_w and it[0][0] - x_min <= 0.25 * region_w}
     narrow = [it for it in items if id(it) not in wide]
     if wide and len(narrow) >= 4 and _column_cut(narrow, region_w, min_vgap):
         bands, current = [], []
@@ -2458,6 +2605,19 @@ def _ends_sentence(text: str) -> bool:
     return bool(RE_TERMINAL.search(text))
 
 
+# A sentence that leads into a list. It normally ends in ":", but the colon is often left out, or lost
+# on the scan: "... shall meet each of the following.", "... within the following limits.",
+# "... as follows.", "... as specified below." (up to four words may follow "the following").
+RE_LEAD_IN = re.compile(r"(?:\bthe\s+following(?:\s+[A-Za-z][A-Za-z-]*){0,4}|\bas\s+follows"
+                        r"|\b(?:listed|specified|given|shown|defined|described|stated|detailed)\s+below)\s*[.:;]?\s*$", re.I)
+
+
+def _introduces_list(text: str) -> bool:
+    """True for a sentence that leads into a list: it ends in ":" or with a lead-in phrase."""
+    t = (text or "").rstrip()
+    return t.endswith(":") or bool(RE_LEAD_IN.search(t))
+
+
 def _is_heading_text(text: str) -> bool:
     """Short title-like line: '3.2 Characteristics.', '1. SCOPE', 'REQUIREMENTS'."""
     t = text.strip()
@@ -2468,6 +2628,8 @@ def _is_heading_text(text: str) -> bool:
         rest = m.group("rest").strip()
         if RE_CAPTION.match(rest) or _starts_with_unit(rest):
             return False                           # "3.3 V shall ..." / "28 VDC" are quantities
+        if re.match(r"[^.:;]{1,40}:\s+\S", rest):
+            return False                           # "2. Vibration:  20 Hz ..." - a list item's label and value
         # a heading title has no sentence after it ("Detection range. The radar ..." is a paragraph),
         # does not stop in the middle of a phrase ("... requirement in section") and does not start
         # like a sentence ("3.2.1 The primary display units")
@@ -2548,6 +2710,36 @@ def caption_meta(text: str, default_kind: str) -> dict:
     kind = "table" if cap.group("kind").lower().startswith("tab") else "figure"
     return {"caption_kind": kind, "caption_label": f"{cap.group('kind').upper().rstrip('.')} {cap.group('num')}",
             "continued": bool(RE_CONTINUED.search(cap.group("title") or ""))}
+
+
+RE_ITEM_LABEL = re.compile(r"^[A-Z][A-Za-z0-9 /()&,+-]{0,40}:(?:\s|$)")     # "Acceleration:"  "Input voltage:"
+
+
+def _starts_list_item(text: str, row: list) -> bool:
+    """Does a block starting with this line (row = its OCR pieces) look like a list item?
+    An ordinary marker ("a." "(2)" "iv)" "3."), a capital letter followed by a label ("A.  Flow rate:"),
+    or a label on a line laid out with wide tabs ("POWER:        Green, lit when ...") - a bulleted
+    list whose bullets the OCR did not see. A capital letter alone ("A. The unit ...") is not enough."""
+    if RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text):
+        return True
+    shape = RE_MARKER_SHAPE.match(text)
+    if shape and re.fullmatch(r"[A-Z][.)]", shape.group("marker")) and RE_ITEM_LABEL.match(shape.group("rest")):
+        return True
+    return bool(RE_ITEM_LABEL.match(text) and len(row) > 1)
+
+
+def _item_columns(row: list) -> tuple:
+    """(label x, [value x]) - where the text of a list item's first row continues after its marker:
+    the word after the marker (the label, or the text) and, after a label's colon or a wide tab,
+    the value. Lines that start in one of these columns carry on the item."""
+    pieces = sorted(row, key=lambda ln: ln.box[0])
+    words = [w for ln in pieces for w in ln.words]
+    label_x = words[1].box[0] if len(words) > 1 else None
+    values = [ln.box[0] for ln in pieces[1:]]
+    for i, w in enumerate(words[:-1]):
+        if w.text.endswith(":"):
+            values.append(words[i + 1].box[0])
+    return label_x, [x for x in values if label_x is None or x > label_x + 1]
 
 
 def classify_text_block(text: str, n_rows: int) -> tuple:
@@ -2675,16 +2867,32 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
     out = []
     current = []          # rows of the block being built
     current_leaf = None
+    item_by_position = False   # the block being built starts a list item found by its indent, not its marker
     current_right = None  # right edge of the column of the block being built
 
     def flush():
-        nonlocal current, current_right
+        nonlocal current, current_right, item_by_position
         current_right = None
         if not current:
             return
         all_lines = [ln for row in current for ln in row]
         text = " ".join(" ".join(ln.text for ln in row) for row in current)
         kind, meta = classify_text_block(text, len(current))
+        if kind == "paragraph" and _starts_list_item(text, current[0]) and not RE_PARA_NUM.match(text):
+            shape = RE_MARKER_SHAPE.match(text)
+            kind, meta = "list_item", {"marker": shape.group("marker") if shape else ""}
+        if kind == "list_item" and len(current) > 1:
+            _, value_xs = _item_columns(current[0])
+            if value_xs:
+                vx = min(value_xs) - 0.3 * stats.line_h
+                label_rows = sum(1 for row in current if any(ln.box[0] < vx for ln in row))
+                if label_rows > 1:
+                    meta["value_x"] = float(vx)          # see _block_rows
+        if item_by_position and kind == "paragraph":
+            # "C.  Shock: ..." level with "b.  Vibration: ..." - the marker was misread, the item is not
+            shape = RE_MARKER_SHAPE.match(text)
+            kind, meta = "list_item", {"marker": shape.group("marker") if shape else "", "marker_by_position": True}
+        item_by_position = False
         out.append(Block(kind, page_no, box_union(ln.box for ln in all_lines), lines=all_lines, text=text, meta=meta))
         current = []
 
@@ -2742,7 +2950,7 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             # same for every item; so the indentation is given slightly more weight than the marker.
             # The line above must have finished its sentence, which is what keeps a cell still
             # wrapping from being taken for the next item.
-            in_list = bool(RE_LIST_MARKER.match(first_text) or RE_NUMBERED_ITEM.match(first_text))
+            in_list = _starts_list_item(first_text, current[0])
             item_by_indent = (in_list and sentence_ended and not continues
                               and abs(row_box[0] - first_box[0]) <= 0.6 * stats.line_h
                               and (row_text[:1].isupper() or row_text[:1].isdigit()))
@@ -2754,6 +2962,29 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             x_overlap = min(row_box[2], block_box[2]) - max(row_box[0], block_box[0])
             narrow = max(1, min(row_box[2] - row_box[0], block_box[2] - block_box[0]))
             prev_h, row_h = prev_box[3] - prev_box[1], row_box[3] - row_box[1]
+            # A list item laid out with wide tabs - "a.   Acceleration:   5 g in each ..." - carries on
+            # under its label or its value. A line that starts in one of those columns belongs to the
+            # item whatever it begins with: "2.5 G peak ...", "20 Hz to 2000 Hz" and "3 hours per axis"
+            # are values, not new sections, and the line above a value need not reach the margin.
+            # Only a new marker, a line back at the marker, or a jump in type size ends the item.
+            # A line that starts with the paragraph number that should come NEXT - "3.5.1 Discrete ..."
+            # under "3.5 INTERFACE CONDITIONS" - begins a new paragraph even when the scan turned the
+            # line above into something that does not look finished (a speck read as a period).
+            row_num, first_num = RE_PARA_NUM.match(row_text), RE_PARA_NUM.match(first_text)
+            numbered_next = bool(row_num and first_num and "." in row_num.group("num")
+                                 and _starts_new_item(row_text) and not _ENDS_MID_PHRASE.search(prev_text)
+                                 and clean_para_number(row_num.group("num")) != clean_para_number(first_num.group("num"))
+                                 and plausible_next_number(clean_para_number(first_num.group("num")),
+                                                           clean_para_number(row_num.group("num"))))
+            label_x, value_xs = _item_columns(current[0]) if in_list else (None, [])
+            at_label = label_x is not None and abs(row_box[0] - label_x) <= 0.6 * stats.line_h
+            # "Shock:  40 g ..." in the label column after a finished item: the next item, its marker lost
+            lost_marker = (at_label and sentence_ended and bool(RE_ITEM_LABEL.match(row_text))
+                           and bool(RE_ITEM_LABEL.match(first_text.split(None, 1)[-1])))
+            hanging = (in_list and not _is_heading_text(first_text) and not lost_marker
+                       and (at_label or any(abs(row_box[0] - x) <= 0.6 * stats.line_h for x in value_xs))
+                       and not RE_LIST_MARKER.match(row_text) and not RE_NUMBERED_ITEM.match(row_text)
+                       and -0.3 * stats.line_h <= gap < 2.5 * stats.line_h)
             new_block = (
                 gap < -0.3 * stats.line_h                                        # jumped back up (new column)
                 or (leaf_idx != current_leaf and x_overlap < 0.3 * narrow)          # different column
@@ -2762,14 +2993,25 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                 or (_is_heading_text(prev_text) and len(current) == 1 and not row_text[:1].islower()
                     and (prev_text.rstrip().endswith((".", ":")) or prev_text.isupper() or _starts_new_item(row_text)
                          or _is_heading_text(row_text) or wider_gap or next_word_fits))
-                or (prev_text.rstrip().endswith(":") and row_box[0] > first_box[0] + 0.6 * stats.line_h)  # list starts
+                or (_introduces_list(prev_text) and row_box[0] > first_box[0] + 0.6 * stats.line_h      # list starts
+                    and (prev_text.rstrip().endswith(":") or len(row) > 1 or RE_LIST_MARKER.match(row_text)
+                         or RE_NUMBERED_ITEM.match(row_text) or RE_BARE_MARKER.match(row[0].text)))
                 or ((_starts_new_item(row_text) or _is_heading_text(row_text)) and (sentence_ended or wider_gap))
                 or (sentence_ended and prev_box[2] < block_box[2] - 0.25 * (block_box[2] - block_box[0])
                     and len(current) > 1)                                           # short last line of a paragraph
                 or (max(prev_h, row_h) > 1.45 * max(1, min(prev_h, row_h)))         # font size change
+                or lost_marker                                                      # next item, marker lost
+                or numbered_next                                                    # 3.5 -> 3.5.1
             )
+            if new_block and hanging and max(prev_h, row_h) <= 1.45 * max(1, min(prev_h, row_h)):
+                new_block = False
             if new_block:
                 flush()
+                # only a line that starts with something SHAPED like a marker ("C." "e." "3)"): a numbered
+                # paragraph ("3.4 Mass. ...") or a sentence level with the list is not an item
+                item_by_position = bool((sibling_item and item_by_indent and RE_MARKER_SHAPE.match(row_text)
+                                         and not RE_LIST_MARKER.match(row_text) and not RE_NUMBERED_ITEM.match(row_text))
+                                        or lost_marker)
         current.append(row)
         current_leaf = leaf_idx
     flush()
@@ -2791,7 +3033,7 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             run.append(run[-1] + 1)
         numbers = [int(numbered_heading(out[x]).group("marker").rstrip(".")) for x in run]
         before = out[k - 1] if k > 0 else None
-        after_stem = (before is not None and before.page == out[k].page and before.text.rstrip().endswith(":")
+        after_stem = (before is not None and before.page == out[k].page and _introduces_list(before.text)
                       and (before.kind == "heading" or word_count(before.text) <= 3             # "NOTES:"
                            or out[k].box[0] > before.box[0] + 0.3 * stats.line_h))              # indented under a stem
         # A numbered line sitting level with the list item just above it is that list's next item,
@@ -2845,7 +3087,9 @@ passthrough picosecond pinout pinouts pitot postflight powerdown powerup pulsewi
 reqs runtime scanline serializer sidelobe sidelobes singlemode softcopy subassemblies subcomponent subcomponents
 subtier teleoperated teleoperation testset testsets timestamp timestamped timestamps undervoltage uninterruptible
 uplink uplinks verif virtualization waypoint waypoints webserver wideband workaround writeback zeroization zeroize
-zeroized""".split())
+zeroized
+rms vrms grms arms rpm psig psid vdc vac dbm dbw ghz gpm cfm pps bps kbps mbps gbps msec usec nsec hrs typ kva kvar lbf
+""".split())
 
 
 class WordChecker:
@@ -3046,7 +3290,10 @@ def block_token_rows(block: Block, ctx: TextContext) -> list:
                     continue
             current.append((w.text, w.conf))
             last = (len(raw_rows) - 1, len(current) - 1)
-    return [word_tokens((Word(t, c, (0, 0, 0, 0)) for t, c in r), ctx) for r in raw_rows]
+    token_rows = [word_tokens((Word(t, c, (0, 0, 0, 0)) for t, c in r), ctx) for r in raw_rows]
+    # the first word of each further line is marked (a 4th field), so a check can tell a full stop at
+    # the end of a line from a speck in the middle of one
+    return [[(r[0][0], r[0][1], r[0][2], True)] + r[1:] if k and r else r for k, r in enumerate(token_rows)]
 
 
 def block_tokens(block: Block, ctx: TextContext) -> list:
@@ -3056,11 +3303,21 @@ def block_tokens(block: Block, ctx: TextContext) -> list:
 
 def _block_rows(block: Block) -> list:
     """Rows of a block in reading order. A paragraph joined across a page break keeps its pages
-    in order (sorting all lines by height alone would put page 2 before page 1)."""
+    in order (sorting all lines by height alone would put page 2 before page 1).
+    A list item whose label wraps beside a value on tab stops ("Storage      -55 C to +85 C for" /
+    "temperature:  up to 5 years.") is read label first, then value: its first row holds the marker,
+    every line of the label and the first value line; the rest of the value follows."""
     bounds = list(block.meta.get("segments") or [0]) + [len(block.lines)]
     rows = []
     for a, z in zip(bounds, bounds[1:]):
         rows.extend(_rows_of(block.lines[a:z]))
+    value_x = block.meta.get("value_x")
+    if value_x and len(bounds) == 2 and rows:
+        left = [ln for row in rows for ln in row if ln.box[0] < value_x]
+        right = [[ln for ln in row if ln.box[0] >= value_x] for row in rows]
+        right = [r for r in right if r]
+        if left and right:
+            rows = [left + right[0]] + right[1:]
     return rows
 
 
@@ -3671,6 +3928,8 @@ class RequirementExtractor:
         alternation = "|".join(r"\s+".join(re.escape(part) for part in k.split()) for k in keys)
         self.re_keyword = re.compile(r"(?<![A-Za-z])(" + alternation + r")(?![A-Za-z])", re.I)
         self.classes = {" ".join(k.lower().split()): v for k, v in settings.keywords.items()}
+        self.last_number = ""            # the latest paragraph number seen, for the sequence check
+        self.joined_blocks = {}          # list item block uid -> blocks holding more of its text
 
     # ---- helpers --------------------------------------------------------------------
     def keyword_in(self, text: str) -> Optional[str]:
@@ -3730,6 +3989,10 @@ class RequirementExtractor:
         for a, b, c in zip(tokens, tokens[1:], tokens[2:] + [("", 1.0, "")]):
             if (re.search(r"[A-Za-z0-9]\.$", a[0]) and not re.fullmatch(r"(?:[A-Za-z]\.){1,3}", a[0])
                     and a[0][:-1].lower() not in ABBREVIATIONS
+                    and not RE_BARE_MARKER.match(b[0])          # "... limits. 1." - a lead-in and its list item
+                    # a full stop that ends a LINE, with the next line starting with a number, ends a
+                    # sentence ("... operating." / "2.5 C per minute ..." in a list's value column)
+                    and not (len(b) > 3 and b[3] and b[0][:1].isdigit())
                     and (b[0][:1].islower() or b[0][:1].isdigit()
                          or (re.fullmatch(r"\d+\.", a[0]) and RE_UNIT.fullmatch(b[0].rstrip(".,;:")))
                          or (re.fullmatch(r"\([A-Za-z0-9&/-]{1,12}\)[,;:]?", b[0]) and c[0][:1].islower()))):
@@ -3757,6 +4020,8 @@ class RequirementExtractor:
         blocks = [b for b in doc.blocks if b.kind not in ("page_header", "page_footer")]
         self.id_prefixes = self._learn_id_prefixes(blocks)
         section = ""
+        self.last_number = ""            # the latest paragraph number, for the sequence check
+        self.joined_blocks = {}
         i = 0
         while i < len(blocks):
             b = blocks[i]
@@ -3765,6 +4030,8 @@ class RequirementExtractor:
             if b.kind == "heading":
                 num, title = b.meta.get("number", ""), b.meta.get("title", b.text)
                 section = f"{num} {title}".strip() if num else title
+                if _number_parts(num):
+                    self.last_number = num
                 i += 1
                 continue
             if b.kind == "caption":
@@ -4097,17 +4364,32 @@ class RequirementExtractor:
         offset = len(text) - len(body)
         return ref, title, body, offset
 
-    def _inner_paragraphs(self, text: str, body_start: int) -> list:
+    def _starts_section(self, text: str) -> bool:
+        """Does this paragraph begin a new SECTION, which ends a list? "3.4 Weight. ..." after 3.3 does.
+        A list item's own number ("1. Input voltage:") does not, and neither does a value that happens
+        to start a line ("2.5 C per minute ...", "20 Hz to 2000 Hz") - its number does not follow the
+        section numbering (see plausible_next_number)."""
+        m = RE_PARA_NUM.match(text or "")
+        if not m:
+            return False
+        if "." not in m.group("num") and RE_NUMBERED_ITEM.match(text):
+            return False                                  # "1. Input voltage: ..." - an item of the list
+        return plausible_next_number(self.last_number, clean_para_number(m.group("num")))
+
+    def _inner_paragraphs(self, text: str, body_start: int, previous: str = "") -> list:
         """[(cut, ref, title, body offset)] for numbered paragraphs that begin INSIDE one block.
         A scan often loses the blank line between "3.2.2.1 Weight. ..." and "3.2.2.2 Input power.
         ...", leaving both in the same block; without this every sentence would be filed under the
         first number.  parse_head decides what really is a heading, so a quantity ("3.3 V shall")
-        and a cross-reference in running text ("... comply with 3.2.1. Testing ...") are left alone."""
+        and a cross-reference in running text ("... comply with 3.2.1. Testing ...") are left alone.
+        A number must also FOLLOW the one before it (`previous`, then each number accepted here): in
+        "3.2.4 ... per axis. 2.5 G peak ..." the 2.5 is a value, not paragraph 2.5."""
         found = []
         for m in RE_INNER_PARA_NUM.finditer(text, body_start):
             ref, title, _body, off = self.parse_head(text[m.start("num"):])
-            if ref:
+            if ref and plausible_next_number(previous, ref):
                 found.append((m.start(), ref, title, m.start("num") + off))
+                previous = ref
         return found
 
     def _text_block_items(self, blocks: list, i: int, source: str, section: str, vocab: set, dpi_of: dict, items: list) -> int:
@@ -4132,7 +4414,9 @@ class RequirementExtractor:
         # BEFORE the keyword test: "... 45 kg. 3.2.2.2 The unit shall ..." is ONE sentence to
         # split_sentences (a full stop followed by a digit does not end a sentence), and cutting it
         # afterwards would lose the second requirement.
-        inner = self._inner_paragraphs(text, body_start)
+        inner = self._inner_paragraphs(text, body_start, ref if _number_parts(ref) else self.last_number)
+        if _number_parts(ref) or inner:
+            self.last_number = inner[-1][1] if inner else ref
 
         def paragraph_of(pos: int) -> int:
             """0 = the block's own paragraph, 1 = the first number found inside it, and so on."""
@@ -4175,12 +4459,12 @@ class RequirementExtractor:
         inline_items = []
         stem_unit = None
         for u in units:
-            if text[u[0]:u[1]].strip().endswith(":") and u[1] < len(text.rstrip()) - 1:
+            if _introduces_list(text[u[0]:u[1]]) and u[1] < len(text.rstrip()) - 1:
                 row_entries = self._row_entries(b, vocab, text, spans, start_char=u[1])
                 if row_entries:
                     stem_unit, inline_items = u, row_entries
                     break
-        if stem_unit is None and text[units[-1][0]:units[-1][1]].strip().endswith(":"):
+        if stem_unit is None and _introduces_list(text[units[-1][0]:units[-1][1]]):
             stem_unit = units[-1]
         last = stem_unit
         if last is not None:
@@ -4203,7 +4487,18 @@ class RequirementExtractor:
                     children.extend(self._child_entries(nb, vocab))
                     j += 1
                     continue
-                if (nb.kind == "paragraph" and nb.box[0] > b.box[0] + 0.15 * dpi and not RE_PARA_NUM.match(nb.text)
+                if (nb.kind == "paragraph" and children and children[-1][2].kind == "list_item"
+                        and nb.box[0] > children[-1][0] + 0.15 * dpi and not RE_MARKER_SHAPE.match(nb.text)
+                        and not RE_ITEM_LABEL.match(nb.text) and not self._starts_section(nb.text)
+                        and not _starts_with_delimited_id(nb.text) and word_count(nb.text) <= 60):
+                    # more of the item above - its value carried on after a larger gap or a page break,
+                    # and may start with a number ("2.5 C per minute ...") - not a new item
+                    x0, c_tokens, child = children[-1]
+                    children[-1] = (x0, c_tokens + block_tokens(nb, vocab), child)
+                    self.joined_blocks.setdefault(child.uid, []).append(nb)
+                    j += 1
+                    continue
+                if (nb.kind == "paragraph" and nb.box[0] > b.box[0] + 0.15 * dpi and not self._starts_section(nb.text)
                         and not _starts_with_delimited_id(nb.text) and word_count(nb.text) <= 60):
                     children.extend(self._child_entries(nb, vocab))   # indented items without visible bullets
                     j += 1
@@ -4216,8 +4511,10 @@ class RequirementExtractor:
                                             "Paragraph", "", extra_reasons))
             stem_ref, stem_title = head_of(last)            # the list belongs to the stem's paragraph
             if not children:
+                promised = text[last[0]:last[1]].strip().endswith(":")
                 items.append(self._req_item(b, source, section, stem_ref, stem_title, text, tokens, spans, last[0], last[1], last[2],
-                                            "Paragraph", "", extra_reasons + ["Ends with ':' but no list items were found below"]))
+                                            "Paragraph", "", extra_reasons + (["Ends with ':' but no list items were found below"]
+                                                                              if promised else [])))
                 return 1
             self._list_items(b, children, source, section, stem_ref, stem_title, text, tokens, spans, last, vocab, items,
                              extra_reasons, dpi)
@@ -4254,11 +4551,95 @@ class RequirementExtractor:
         token_rows = block_token_rows(child, ctx)
         all_tokens = [t for r in token_rows for t in r]
         text = tokens_text(all_tokens)[0]
-        if (len(rows) > 1 and not (RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text))
+        # ... but only when the rows start level with each other: rows that start further right hang
+        # under the first row's text (a wrapped value after a wide tab), so the block is ONE item
+        row_x0 = [min(ln.box[0] for ln in rl) for rl in rows]
+        row_h = statistics.median([max(ln.box[3] for ln in rl) - min(ln.box[1] for ln in rl) for rl in rows])
+        level = all(abs(x - row_x0[0]) <= 0.6 * row_h for x in row_x0)
+        if (len(rows) > 1 and level and not (RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text))
                 and all(r and word_count(" ".join(t[0] for t in r)) <= 10 and (r[0][0][:1].isupper() or r[0][0][:1].isdigit())
                         for r in token_rows)):
             return [(min(ln.box[0] for ln in rl), tr, child) for rl, tr in zip(rows, token_rows) if tr]
         return [(child.box[0], all_tokens, child)]
+
+    @staticmethod
+    def _marker_columns(children: list, tol: float) -> list:
+        """x of each list item, where an item whose marker was lost ("Shock:  40 g ...", starting in
+        the label column) is placed at the marker column of the neighbour whose label it lines up
+        with - so it is counted as that neighbour's sibling, not as a sub-item."""
+        info = []
+        for x0, c_tokens, child in children:
+            text = tokens_text(c_tokens)[0]
+            marked = bool(RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text) or RE_MARKER_SHAPE.match(text))
+            label_x = None
+            if marked and child.kind == "list_item" and child.lines:
+                rows = _block_rows(child)
+                label_x = _item_columns(rows[0])[0] if rows else None
+            info.append((marked, label_x))
+        out = [x0 for x0, _, _ in children]
+        for k, (x0, _, _) in enumerate(children):
+            if info[k][0]:
+                continue
+            for j in (k - 1, k + 1, k - 2, k + 2):
+                if 0 <= j < len(children) and info[j][0] and info[j][1] is not None and abs(x0 - info[j][1]) <= tol:
+                    out[k] = children[j][0]
+                    break
+        return out
+
+    @staticmethod
+    def _sequence_markers(children: list, tol: float) -> list:
+        """[(marker, body, note)] per list item, with each marker checked against its neighbours.
+
+        Markers count up (a, b, c / 1, 2, 3 / i, ii, iii / (a), (b)), so an item's marker can be
+        expected from the item before it. A marker that the scan misread ("C." for "c.", "e." for "c.")
+        or lost is replaced by the expected one when the neighbours agree, and the change is reported
+        for review. A list that really skips a letter keeps it: a valid marker is only replaced when the
+        NEXT item's marker confirms the expected one."""
+        found = []
+        for x0, c_tokens, _child in children:
+            c_text = tokens_text(c_tokens)[0]
+            m = RE_LIST_MARKER.match(c_text) or RE_NUMBERED_ITEM.match(c_text)
+            shape = None if m else RE_MARKER_SHAPE.match(c_text)
+            if m:
+                found.append([x0, m.group("marker"), m.group("rest"), True])
+            elif shape:
+                found.append([x0, shape.group("marker"), shape.group("rest"), False])   # marker-like, not valid here
+            else:
+                found.append([x0, "", c_text, False])
+
+        def sibling(k: int, step: int):
+            """Index of the previous/next item at the same level (stops at a parent item)."""
+            j = k + step
+            while 0 <= j < len(found):
+                if abs(found[j][0] - found[k][0]) <= tol:
+                    return j
+                if found[j][0] < found[k][0] - tol:
+                    return None
+                j += step
+            return None
+
+        cores = [(_marker_parts(f[1]) or ("", "", ""))[1].lower() for f in found]
+        roman = any(c in _ROMANS[1:9] for c in cores) or (bool(cores) and cores[0] == "i")
+        out = []
+        for k, (x0, marker, body, valid) in enumerate(found):
+            note = ""
+            before, after = sibling(k, -1), sibling(k, 1)
+            if before is not None:
+                expected = _next_marker(found[before][1], roman)
+                confirmed = after is not None and found[after][1] == _next_marker(expected, roman)
+            else:                                       # the first item: expected from the one after it
+                expected = _previous_marker(found[after][1], roman) if after is not None and found[after][3] else ""
+                confirmed = bool(expected) and not marker
+            if expected and marker != expected:
+                case_only = marker.lower() == expected.lower()
+                if (not valid and marker and (case_only or confirmed)) or (valid and confirmed) \
+                        or (not marker and (confirmed or bool(RE_ITEM_LABEL.match(body)))):
+                    note = (f"List marker read as '{marker}' - taken as '{expected}' from the sequence" if marker
+                            else f"List marker missing - taken as '{expected}' from the sequence")
+                    marker = expected
+                    found[k][1] = marker                       # the next item is checked against this one
+            out.append((marker, body, note))
+        return out
 
     def _list_items(self, stem_block, children, source, section, ref, title, text, tokens, spans, stem_unit, vocab, items, extra, dpi=200.0):
         """children = [(x0, tokens, block)] in reading order."""
@@ -4268,10 +4649,14 @@ class RequirementExtractor:
         stem_tokens = [tok for tok, (a, z) in zip(tokens, spans) if a < stem_e and z > stem_s]
         stack = []          # nested stems: (x0, marker, text, tokens)
         rows = []           # (block, marker_path, tokens)
+        columns = self._marker_columns(children, tol)
+        children = [(columns[k], c_tokens, child) for k, (_x0, c_tokens, child) in enumerate(children)]
+        sequenced = self._sequence_markers(children, tol)
+        marker_notes = {}   # id(child tokens) -> note about a marker taken from the sequence
         for k, (x0, c_tokens, child) in enumerate(children):
-            c_text = tokens_text(c_tokens)[0]
-            m = RE_LIST_MARKER.match(c_text) or RE_NUMBERED_ITEM.match(c_text)
-            c_marker, c_body = (m.group("marker"), m.group("rest")) if m else ("", c_text)
+            c_marker, c_body, marker_note = sequenced[k]
+            if marker_note:
+                marker_notes[id(c_tokens)] = marker_note
             while stack and x0 <= stack[-1][0] + tol:
                 stack.pop()
             nxt = children[k + 1] if k + 1 < len(children) else None
@@ -4281,10 +4666,12 @@ class RequirementExtractor:
             path = [(mk, bd) for _, mk, bd, _ in stack] + [(c_marker, c_body.strip())]
             path_tokens = [t for *_, tk in stack for t in tk] + c_tokens
             rows.append((child, path, path_tokens))
+            if marker_note:
+                marker_notes[id(path_tokens)] = marker_note
         if not self.settings.split_list_items:
             joined = stem_text + " " + " ".join(" ".join(f"{mk} {bd}".strip() for mk, bd in path) for _, path, _ in rows)
             all_tokens = stem_tokens + [t for _, _, tk in rows for t in tk]
-            conf, reasons = self.review_for_tokens(all_tokens, joined, extra + stem_notes)
+            conf, reasons = self.review_for_tokens(all_tokens, joined, extra + stem_notes + list(dict.fromkeys(marker_notes.values())))
             pages = sorted({p for blk in [stem_block] + [r[0] for r in rows] for p in blk.pages})
             items.append(ExtractedItem("Requirement", source, _page_label(pages), section, doc_ref=ref, title=title,
                                        text=joined.strip(), keyword=stem_kw, req_class=self.classes.get(stem_kw, ""),
@@ -4295,15 +4682,17 @@ class RequirementExtractor:
         for child, path, path_tokens in rows:
             item_text = " ".join(f"{mk} {bd}".strip() for mk, bd in path)
             full, notes = self.repair_keywords(f"{stem_text} {item_text}")
-            conf, reasons = self.review_for_tokens(stem_tokens + path_tokens, full, extra + stem_notes + notes)
-            pages = sorted(set(stem_block.pages) | set(child.pages))
+            marker_note = [marker_notes[id(path_tokens)]] if id(path_tokens) in marker_notes else []
+            conf, reasons = self.review_for_tokens(stem_tokens + path_tokens, full, extra + stem_notes + notes + marker_note)
+            joined = self.joined_blocks.get(child.uid, [])
+            pages = sorted(set(stem_block.pages) | set(child.pages) | {pg for blk in joined for pg in blk.pages})
             marker_ref = ".".join(mk.strip("().") for mk, _ in path if mk and mk not in "•·*-o◦")
             items.append(ExtractedItem("Requirement", source, _page_label(pages), section,
                                        doc_ref=(f"{ref} {marker_ref}".strip() if marker_ref else ref), title=title,
                                        text=full, keyword=stem_kw, req_class=self.classes.get(stem_kw, ""),
                                        found_in="List item under stem", context=stem_text, ocr_conf=conf,
                                        review_reasons=reasons, quality_notes=self.quality_notes(full),
-                                       block_uids=list(dict.fromkeys([stem_block.uid, child.uid]))))
+                                       block_uids=list(dict.fromkeys([stem_block.uid, child.uid] + [blk.uid for blk in joined]))))
 
     def _req_item(self, b, source, section, ref, title, text, tokens, spans, s, e, kw, found_in, context, extra) -> ExtractedItem:
         sentence = text[s:e].strip()

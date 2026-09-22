@@ -193,6 +193,41 @@ class Builder:
             self.list_item(stem, keyword, marker, item, doc_id, indent=indent, item_gap=item_gap)
         self.spacer(6)
 
+    def tabbed_list(self, lead: str, stem: str, keyword: str, items: list[tuple[str, str, str]], num: str,
+                    widths: tuple = (0.45 * inch, 1.6 * inch, 3.7 * inch), indent: float = 0.35 * inch,
+                    item_gap: float = 5):
+        """A lead-in sentence and items laid out on wide TAB STOPS, as on a typed page:
+
+            a.      Acceleration:      5 g in each of the three orthogonal axes
+                                       for 1 minute per axis.
+
+        items = [(marker, label, value)]; the label may be "" (marker and value only), and "|" in a
+        value forces a line break there (to put a number at the start of a value line). Expected
+        output: one row per item = "<stem> <marker> <label> <value>", paragraph number "<num> <marker>"."""
+        text = f"{lead} {stem}".strip()
+        self.story.append(self._p(text, self.body, spaceAfter=6))
+        self.gt.all_text.append(text)
+        cell = ParagraphStyle(f"tab{len(self.story)}", parent=self.body, spaceBefore=0, spaceAfter=0)
+        rows, style = [], [("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                           ("RIGHTPADDING", (0, 0), (-1, -1), 4), ("TOPPADDING", (0, 0), (-1, -1), 0),
+                           ("BOTTOMPADDING", (0, 0), (-1, -1), item_gap)]
+        labelled = any(label for _, label, _ in items)
+        for marker, label, value in items:
+            value_markup = "<br/>".join(escape(part.strip()) for part in value.split("|"))
+            row = ["", Paragraph(escape(marker), cell)]
+            if labelled:
+                row.append(Paragraph(escape(label), cell))
+            row.append(Paragraph(value_markup, cell))
+            rows.append(row)
+            words = " ".join(x for x in (stem, marker, label, " ".join(part.strip() for part in value.split("|"))) if x)
+            self.gt.all_text.append(words)
+            self.gt.requirements.append(GTReq(words, keyword, "list", f"{num} {marker.strip('().')}"))
+        col = [indent, widths[0]] + ([widths[1]] if labelled else []) + [widths[2] + (0 if labelled else widths[1])]
+        t = Table(rows, colWidths=col, hAlign="LEFT")
+        t.setStyle(TableStyle(style))
+        self.story.append(t)
+        self.spacer(8)
+
     def table(self, caption: str | None, rows: list[list[str]], col_widths: list[float], *,
               req_col: int | None = None, id_col: int | None = None, keyword_of=None,
               ruled: bool = True, caption_above: bool = True, font: str | None = None, font_size: float = 9,
@@ -926,6 +961,52 @@ def build_spec_d() -> tuple[list[bytes], GroundTruth]:
 # --------------------------------------------------------------------------------------
 # Rasterize + degrade ("scan") the pages
 # --------------------------------------------------------------------------------------
+def build_spec_h() -> tuple[bytes, GroundTruth]:
+    """Lists laid out on wide tab stops - marker, a label such as "Acceleration:", and a value that may
+    run over several lines and start with a number - as reported from real specifications. The hard
+    parts: the OCR returns marker, label and value as separate pieces (so the tabs look like column
+    gutters), lead-ins without a colon, and value lines that start with a number such as "2.5 C" or
+    "3.5 Seconds", which must not be taken for new sections."""
+    body = ParagraphStyle("H", fontName=FONTS["type"], fontSize=11, leading=14.5)
+    head = ParagraphStyle("HH", parent=body, fontName=FONTS["type"])
+    b = Builder("specH", body, head, body)
+    b.heading("3. REQUIREMENTS")
+    b.para("3.1", "General.", [("The equipment shall meet the requirements of this section.", "shall")])
+    b.tabbed_list("3.2 Environmental conditions.", "The equipment shall meet each of the following:", "shall", [
+        ("a.", "Acceleration:", "5 g in each of the three orthogonal axes for 1 minute per axis."),
+        ("b.", "Vibration:", "20 Hz to 2000 Hz random, 0.04 g2/Hz, 3 hours per axis, 7.7 g rms overall."),
+        ("c.", "Shock:", "40 g, 11 ms half-sine pulse, 3 shocks in each direction."),
+        ("d.", "Temperature:", "-40 C to +71 C operating.|2.5 C per minute maximum rate of change."),
+    ], "3.2")
+    b.tabbed_list("3.3 Electrical conditions.", "The equipment shall operate within the following limits.", "shall", [
+        ("1.", "Input voltage:", "24 to 32 VDC, 28 VDC nominal."),
+        ("2.", "Ripple:", "1.5 V peak-to-peak maximum, 10 Hz to 50 kHz."),
+        ("3.", "Power:", "150 W maximum at 28 VDC."),
+    ], "3.3")
+    b.para("3.4", "Weight.", [("The equipment shall not exceed 45 kilograms.", "shall")])
+    b.page_break()
+    b.heading("3.5 INTERFACE CONDITIONS")
+    b.tabbed_list("3.5.1 Discrete signals.", "The discrete outputs shall be as follows:", "shall", [
+        ("(1)", "", "28 VDC open/ground, 500 mA sink maximum."),
+        ("(2)", "", "5 V TTL compatible, 2.4 V minimum high level."),
+        ("(3)", "", "1.5 ms maximum switching time."),
+    ], "3.5.1")
+    b.tabbed_list("3.5.2 Timing.", "The unit shall meet the timing specified below.", "shall", [
+        ("a.", "Power-up time:", "2.0 s maximum from application of power."),
+        ("b.", "Warm-up time:", "Full rated output within|3.5 Seconds of power application."),
+        ("c.", "Reset time:", "100 ms maximum."),
+    ], "3.5.2")
+    b.para("3.5.3", "Grounding.", [("The unit shall provide a single-point ground.", "shall")])
+    b.heading("4. VERIFICATION")
+    b.para("4.1", "Methods.", [("Compliance with section 3 shall be verified by test.", "shall")])
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=1.0 * inch, rightMargin=1.0 * inch,
+                            topMargin=1.0 * inch, bottomMargin=1.0 * inch, title="SPEC-H-0120")
+    doc.build(b.story)
+    return buf.getvalue(), b.gt
+
+
 def rasterize(pdf_bytes: bytes, dpi: int) -> list[np.ndarray]:
     pdf = pdfium.PdfDocument(pdf_bytes)
     pages = [np.array(pdf[i].render(scale=dpi / 72, grayscale=True).to_pil().convert("L")) for i in range(len(pdf))]
@@ -1074,9 +1155,18 @@ def main():
         gt_g = None
         print(f"NOTE: {pages_dir} holds no specG_page*.png - Document G skipped")
 
+    # ---- Document H: lists on wide tab stops (built last, with its own random numbers, so adding it
+    #      does not change a single pixel of the documents above) ------------------------------
+    rng_h = np.random.default_rng(args.seed + 8)
+    pdf_h, gt_h = build_spec_h()
+    (out / "specH_source_digital.pdf").write_bytes(pdf_h)
+    save_pdf([degrade(p, PROFILES["scan"], rng_h) for p in rasterize(pdf_h, 300)], out / "specH_scan.pdf", 300)
+    save_tiff([degrade(p, PROFILES["photocopy"], rng_h) for p in rasterize(pdf_h, 200)], out / "specH_photocopy.tif", (200, 200))
+    (out / "specH_groundtruth.json").write_text(json.dumps(gt_h.to_json(), indent=2))
+
     for f in sorted(out.iterdir()):
         print(f"{f.stat().st_size / 1e6:7.2f} MB  {f.name}")
-    for gt in (gt_a, gt_b, gt_c, gt_d, gt_e, gt_g):
+    for gt in (gt_a, gt_b, gt_c, gt_d, gt_e, gt_g, gt_h):
         if gt is None:
             continue
         print(f"{gt.doc}: {len(gt.requirements)} requirements, {len(gt.captions)} captions, {len(gt.tables)} tables")

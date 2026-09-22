@@ -1758,6 +1758,225 @@ def test_a_project_term_is_not_flagged_just_because_english_has_a_near_word():
 
 
 # =====================================================================================================================
+# Lists on wide tab stops, list lead-ins, and the numbering sequence
+# =====================================================================================================================
+TAB_STEM = "3.2.4 Environmental conditions. The equipment shall meet each of the following:"
+TAB_ITEMS = [("a.", "Acceleration:", ["5 g in each of the three orthogonal axes", "for 1 minute per axis."]),
+             ("b.", "Vibration:", ["20 Hz to 2000 Hz random, 0.04 g2/Hz,", "3 hours per axis, 7.7 g rms overall."]),
+             ("c.", "Shock:", ["40 g, 11 ms half-sine pulse,", "3 shocks in each direction."]),
+             ("d.", "Temperature:", ["-40 C to +71 C operating."])]
+TAB_AFTER = "3.2.5 Weight. The equipment shall not exceed 45 kilograms."
+
+
+def _tabbed_page(items=TAB_ITEMS, stem=TAB_STEM, after=TAB_AFTER, x_mark=LEFT + 80, x_label=LEFT + 220,
+                 x_value=LEFT + 560, y0=300, item_gap=0.4) -> list:
+    """A lead-in and items laid out on wide tab stops. Marker, label and value are SEPARATE OCR lines,
+    which is what the OCR returns when the gaps are wide (checked on rendered pages)."""
+    lines, y = [make_line(stem, LEFT, y0)], y0 + PITCH
+    for marker, label, values in items:
+        y += int(item_gap * PITCH)
+        parts = ([(x_mark, marker)] if marker else []) + ([(x_label, label)] if label else []) + [(x_value, values[0])]
+        lines += [make_line(text, x, y) for x, text in parts]
+        for more in values[1:]:
+            y += PITCH
+            lines.append(make_line(more, x_value, y))
+        y += PITCH
+    if after:
+        lines.append(make_line(after, LEFT, y + PITCH))
+    return lines
+
+
+def _joined(values) -> str:
+    return " ".join(values)
+
+
+def test_a_list_on_wide_tab_stops_keeps_each_label_with_its_value():
+    """The wide tab between 'Acceleration:' and its value is not the gutter between two columns:
+    each row carries its marker, label and the whole multi-line value."""
+    _doc, items = run({1: _tabbed_page()})
+    rows = [(r.doc_ref, r.text) for r in requirements(items)]
+    expected = [(f"3.2.4 {m[0]}", f"{TAB_STEM.split('. ', 1)[1]} {m} {label} {_joined(v)}") for m, label, v in TAB_ITEMS]
+    assert rows[:4] == expected, rows
+    assert rows[4] == ("3.2.5", "The equipment shall not exceed 45 kilograms."), rows
+
+
+def test_numbered_items_on_tab_stops_are_items_not_headings():
+    """'2. Vibration:  20 Hz ...' looks like a numbered heading ('2. SCOPE'), but a heading never
+    holds a label and a value."""
+    items_ = [(f"{k}.", label, v) for k, (_, label, v) in enumerate(TAB_ITEMS, 1)]
+    doc, items = run({1: _tabbed_page(items_)})
+    assert [b.kind for b in doc.blocks] == ["paragraph"] + ["list_item"] * 4 + ["paragraph"], \
+        [(b.kind, b.text) for b in doc.blocks]
+    assert [r.doc_ref for r in requirements(items)] == ["3.2.4 1", "3.2.4 2", "3.2.4 3", "3.2.4 4", "3.2.5"]
+    assert not se._is_heading_text("2. Vibration: 20 Hz to 2000 Hz random,")
+    assert se._is_heading_text("2. SCOPE")
+
+
+def test_a_lead_in_without_a_colon_still_leads_into_its_list():
+    """'... each of the following.' / 'within the following limits.' introduce a list as surely as a
+    colon does; without one the items used to be attached to nothing."""
+    for stem in ("3.2.4 Environmental conditions. The equipment shall meet each of the following.",
+                 "3.2.4 Electrical conditions. The equipment shall operate within the following limits.",
+                 "3.2.4 Timing. The unit shall meet the timing specified below.",
+                 "3.2.4 Modes. The radar modes shall be as follows."):
+        _doc, items = run({1: _tabbed_page(stem=stem)})
+        refs = [r.doc_ref for r in requirements(items)]
+        assert refs == ["3.2.4 a", "3.2.4 b", "3.2.4 c", "3.2.4 d", "3.2.5"], (stem, refs)
+    for text in ("The equipment shall meet each of the following:", "It shall be as follows.",
+                 "within the following limits.", "as specified below.", "the following test conditions apply."):
+        assert se._introduces_list(text), text
+    for text in ("The equipment shall follow the procedure.", "The unit shall operate below 40 C.",
+                 "The following shall apply to all units."):
+        assert not se._introduces_list(text), text
+
+
+def test_a_lead_in_phrase_with_no_list_below_is_an_ordinary_requirement():
+    """Without a colon, 'the following' followed by no list is just a sentence: no 'no list items'
+    warning (a colon promised a list; the phrase alone did not)."""
+    _doc, items = run({1: make_lines(["3.6 Test. The unit shall pass the tests in the following.", None,
+                                      "3.7 Mass. The unit shall weigh 5 kg."])})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.6", "3.7"], [(r.doc_ref, r.text) for r in rows]
+    assert not any("no list items" in r for r in rows[0].review_reasons), rows[0].review_reasons
+
+
+def test_value_lines_that_start_with_numbers_stay_in_their_item():
+    """A value line may end with a full stop and the next may start with a number - '2.5 G peak',
+    '20 Hz', '1.5 V' - which used to be taken for a new section or a heading. A line that starts in
+    the item's value column belongs to the item."""
+    items_ = [("a.", "Forward:", ["9.0 G for 3 seconds.", "2.5 G sustained thereafter."]),
+              ("b.", "Ripple:", ["1.5 V peak-to-peak maximum,", "10 Hz to 50 kHz."]),
+              ("c.", "Vertical:", ["6.0 G down and 2.0 G up.", "3.2 G down sustained."])]
+    doc, items = run({1: _tabbed_page(items_)})
+    assert not any(b.kind == "heading" for b in doc.blocks), [(b.kind, b.text) for b in doc.blocks]
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.2.4 a", "3.2.4 b", "3.2.4 c", "3.2.5"], [(r.doc_ref, r.text) for r in rows]
+    assert rows[0].text.endswith("Forward: 9.0 G for 3 seconds. 2.5 G sustained thereafter."), rows[0].text
+    assert not any("Stray period" in reason for r in rows for reason in r.review_reasons), \
+        [r.review_reasons for r in rows]               # a full stop at a line end before a number is not a speck
+
+
+def test_a_misread_list_marker_is_taken_from_the_sequence_and_reported():
+    """'c.' read as 'C.' - the letters count a, b, ?, d, so it is c. The change is reported for
+    review, because the tool, not the page, supplied the letter."""
+    items_ = [TAB_ITEMS[0], TAB_ITEMS[1], ("C.", "Shock:", TAB_ITEMS[2][2]), TAB_ITEMS[3]]
+    _doc, items = run({1: _tabbed_page(items_)})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.2.4 a", "3.2.4 b", "3.2.4 c", "3.2.4 d", "3.2.5"], [(r.doc_ref, r.text) for r in rows]
+    assert " c. Shock: " in rows[2].text, rows[2].text
+    assert any("taken as 'c.' from the sequence" in reason for reason in rows[2].review_reasons), rows[2].review_reasons
+    assert not any("from the sequence" in reason for r in rows[:2] + rows[3:] for reason in r.review_reasons)
+
+
+def test_a_lost_list_marker_is_taken_from_the_sequence():
+    """The photocopy lost 'a.' and 'c.' altogether: each of those rows starts with its label, in the
+    label column. The item before and after say which letter it was."""
+    items_ = [("", "Acceleration:", TAB_ITEMS[0][2]), TAB_ITEMS[1], ("", "Shock:", TAB_ITEMS[2][2]), TAB_ITEMS[3]]
+    _doc, items = run({1: _tabbed_page(items_)})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.2.4 a", "3.2.4 b", "3.2.4 c", "3.2.4 d", "3.2.5"], [(r.doc_ref, r.text) for r in rows]
+    assert rows[2].text.endswith("c. Shock: 40 g, 11 ms half-sine pulse, 3 shocks in each direction."), rows[2].text
+
+
+def test_a_list_that_really_skips_a_letter_keeps_its_letters():
+    """a, b, d: a valid marker is only replaced when the NEXT item confirms the expected one, so a
+    list that genuinely skips c is left as printed. A misread one between two agreeing neighbours
+    (a, b, e, d) is corrected."""
+    f = se.RequirementExtractor._sequence_markers
+    tokens = lambda text: [(w, 1.0, "") for w in text.split()]
+    kids = lambda markers: [(100, tokens(f"{m} Item {m}"), se.Block("list_item", 1, (0, 0, 1, 1))) for m in markers]
+    assert [m for m, _, _ in f(kids(["a.", "b.", "d."]), 10)] == ["a.", "b.", "d."]
+    assert [m for m, _, _ in f(kids(["a.", "b.", "e.", "d."]), 10)] == ["a.", "b.", "c.", "d."]
+    assert [m for m, _, _ in f(kids(["(1)", "(2)", "(4)"]), 10)] == ["(1)", "(2)", "(4)"]
+    assert [m for m, _, _ in f(kids(["i.", "ii.", "iii.", "iv."]), 10)] == ["i.", "ii.", "iii.", "iv."]
+    assert se._next_marker("b.") == "c." and se._next_marker("(9)") == "(10)" and se._next_marker("iv)", roman=True) == "v)"
+    assert se._previous_marker("b.") == "a." and se._previous_marker("1.") == ""
+
+
+def test_section_numbers_must_follow_in_sequence():
+    """Paragraph numbers count up: after 3.2.4 come 3.2.4.1, 3.2.5, 3.3 or 4 (a few may be skipped,
+    since the scan can miss a heading). '1.5' or '20' after 3.2.4 is a value, not a section."""
+    f = se.plausible_next_number
+    for previous, candidate in (("3.2.4", "3.2.5"), ("3.2.4", "3.2.4.1"), ("3.2.4", "3.3"), ("3.2.4", "4"),
+                                ("3.2.4", "3.3.1"), ("3.2.4", "3.2.7"), ("", "7.1"), ("6.3", "A.1"),
+                                ("A.1", "A.2"), ("3.2.l.3", "3.2.1.4"), ("9.2", "10"), ("3", "3.1.1")):
+        assert f(previous, candidate), (previous, candidate)
+    for previous, candidate in (("3.2.4", "1.5"), ("3.2.4", "2.5"), ("3.2.4", "20"), ("3.2.5", "3.2.4"),
+                                ("3.2.4", "3.2"), ("3.2.4", "3.9.1"), ("3.2.4", "3.3.7")):
+        assert not f(previous, candidate), (previous, candidate)
+
+
+def test_a_value_inside_a_paragraph_is_not_a_new_paragraph():
+    """'... per axis. 2.5 G peak ...' inside paragraph 3.2.4: 2.5 does not follow 3.2.4, so it is a
+    value and the paragraph is not split there (3.2.5 would have been)."""
+    _doc, items = run({1: [make_line("3.2.4 Shock. The unit shall survive 40 G for 11 ms per axis. "
+                                     "2.5 G Peak shall not be exceeded in the vertical axis.")]})
+    rows = requirements(items)
+    assert rows and all(r.doc_ref == "3.2.4" for r in rows), [(r.doc_ref, r.text) for r in rows]
+    assert any("2.5 G Peak shall not be exceeded" in r.text for r in rows), [r.text for r in rows]
+
+
+def test_the_next_paragraph_number_starts_a_new_paragraph_even_without_a_full_stop():
+    """A speck turned '3.5 INTERFACE CONDITIONS' into '3.5 INTERFACE. CONDITIONS', which no longer looks
+    like a heading; '3.5.1' on the next line is the number that should come next, so it still starts
+    its own paragraph and its requirements carry 3.5.1."""
+    _doc, items = run({1: make_lines(["3.5 INTERFACE. CONDITIONS",
+                                      "3.5.1 Discrete signals. The discrete outputs shall be isolated."])})
+    assert [r.doc_ref for r in requirements(items)] == ["3.5.1"], [(r.doc_ref, r.text) for r in requirements(items)]
+
+
+def test_a_list_on_tab_stops_is_not_a_borderless_table():
+    """Items on tab stops line up exactly like a table without ruling lines. A first column that
+    counts a., b., c. (or holds only labels, when the bullets were not read) is a list."""
+    f = se._first_column_counts_like_a_list
+    assert f(["a. Acceleration:", "b. Vibration:", "c. Shock:"]) and f(["i.", "ii.", "iii.", "iv."])
+    assert f(["1.", "2.", "3."]) and f(["POWER:", "FAULT:", "STANDBY:"]) and f(["a. Search", "b. Track", "C. Test"])
+    assert not f(["CI-01", "CI-02", "CI-03"]) and not f(["MIL-STD-461G", "MIL-STD-704F", "MIL-STD-810H"])
+    assert not f(["Parameter", "Voltage", "Current", "Power"]) and not f(["ENV-001", "ENV-002"])
+    grid = [["a. Acceleration:", "5 g in each axis"], ["b. Vibration:", "20 Hz to 2000 Hz"], ["c. Shock:", "40 g, 11 ms"]]
+    assert not se._plausible_borderless_table(grid, 6, 6)
+    grid = [["Parameter", "Value", "Unit"], ["Voltage", "28", "VDC"], ["Current", "3.2", "A"], ["Power", "90", "W"]]
+    assert se._plausible_borderless_table(grid, 12, 12)
+
+
+def test_a_label_that_wraps_is_read_before_its_value():
+    """'Storage' / 'temperature:' wraps in the label column beside a two-line value: the row reads
+    'Storage temperature: -55 C to +85 C for up to 5 years', not the two columns interleaved."""
+    items_ = [("a.", "Storage", ["-55 C to +85 C for", "up to 5 years."]), ("b.", "Altitude:", ["Up to 12,200 m."])]
+    lines = _tabbed_page(items_, after=None)
+    lines.append(make_line("temperature:", LEFT + 220, lines[3].box[1]))      # the label's 2nd line, beside value line 2
+    _doc, items = run({1: lines})
+    rows = requirements(items)
+    assert rows[0].text.endswith("a. Storage temperature: -55 C to +85 C for up to 5 years."), rows[0].text
+    assert rows[1].doc_ref == "3.2.4 b", [(r.doc_ref, r.text) for r in rows]
+
+
+def test_a_long_value_line_is_not_taken_for_a_page_wide_line():
+    """A value line can be long, but it starts far to the right; only a line that starts near the
+    left edge (a running header, a title, a full line of a paragraph) divides the page before the
+    column check. Here the lead-in's first line and the paragraph after the list are page-wide,
+    and the first line of each value is nearly as long: taking those for page-wide lines left each
+    label without its value, and the tabs were then cut as column gutters (seen on a photocopy)."""
+    x_mark, x_label, x_value = LEFT + 80, LEFT + 200, LEFT + 470
+    lines = [make_line("3.2.4 Environmental conditions. The equipment shall meet each of the", LEFT, 300),
+             make_line("following:", LEFT, 300 + PITCH)]
+    y = 300 + 2 * PITCH + 20
+    for marker, label, first, more in (
+            ("a.", "Acceleration:", "5 g in each of the three orthogonal axes of the unit,", "for 1 minute."),
+            ("b.", "Vibration:", "20 Hz to 2000 Hz random at 0.04 g2/Hz in each axis,", "3 hours per axis."),
+            ("c.", "Shock:", "40 g, 11 ms half-sine pulse, three shocks each way,", "in each axis.")):
+        lines += [make_line(marker, x_mark, y), make_line(label, x_label, y), make_line(first, x_value, y),
+                  make_line(more, x_value, y + PITCH)]
+        y += 2 * PITCH + 20
+    lines.append(make_line("3.2.5 Weight. The equipment shall not exceed forty-five kilograms.", LEFT, y + PITCH))
+    _doc, items = run({1: lines})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.2.4 a", "3.2.4 b", "3.2.4 c", "3.2.5"], [(r.doc_ref, r.text) for r in rows]
+    assert rows[1].text.endswith("b. Vibration: 20 Hz to 2000 Hz random at 0.04 g2/Hz in each axis, 3 hours per axis."), \
+        rows[1].text
+
+
+# =====================================================================================================================
 # Command line and file handling
 # =====================================================================================================================
 def test_page_selection():
