@@ -1885,10 +1885,10 @@ def test_a_list_that_really_skips_a_letter_keeps_its_letters():
     f = se.RequirementExtractor._sequence_markers
     tokens = lambda text: [(w, 1.0, "") for w in text.split()]
     kids = lambda markers: [(100, tokens(f"{m} Item {m}"), se.Block("list_item", 1, (0, 0, 1, 1))) for m in markers]
-    assert [m for m, _, _ in f(kids(["a.", "b.", "d."]), 10)] == ["a.", "b.", "d."]
-    assert [m for m, _, _ in f(kids(["a.", "b.", "e.", "d."]), 10)] == ["a.", "b.", "c.", "d."]
-    assert [m for m, _, _ in f(kids(["(1)", "(2)", "(4)"]), 10)] == ["(1)", "(2)", "(4)"]
-    assert [m for m, _, _ in f(kids(["i.", "ii.", "iii.", "iv."]), 10)] == ["i.", "ii.", "iii.", "iv."]
+    assert [m for m, *_ in f(kids(["a.", "b.", "d."]), 10)] == ["a.", "b.", "d."]
+    assert [m for m, *_ in f(kids(["a.", "b.", "e.", "d."]), 10)] == ["a.", "b.", "c.", "d."]
+    assert [m for m, *_ in f(kids(["(1)", "(2)", "(4)"]), 10)] == ["(1)", "(2)", "(4)"]
+    assert [m for m, *_ in f(kids(["i.", "ii.", "iii.", "iv."]), 10)] == ["i.", "ii.", "iii.", "iv."]
     assert se._next_marker("b.") == "c." and se._next_marker("(9)") == "(10)" and se._next_marker("iv)", roman=True) == "v)"
     assert se._previous_marker("b.") == "a." and se._previous_marker("1.") == ""
 
@@ -1974,6 +1974,251 @@ def test_a_long_value_line_is_not_taken_for_a_page_wide_line():
     assert [r.doc_ref for r in rows] == ["3.2.4 a", "3.2.4 b", "3.2.4 c", "3.2.5"], [(r.doc_ref, r.text) for r in rows]
     assert rows[1].text.endswith("b. Vibration: 20 Hz to 2000 Hz random at 0.04 g2/Hz in each axis, 3 hours per axis."), \
         rows[1].text
+
+
+
+# ---- what must NOT change: layouts that look like a list on tab stops but are not (from an adversarial review) ----
+def test_a_short_list_in_one_column_of_a_two_column_page_is_not_read_across_the_page():
+    """Left column: a lead-in and short items 'a. MIL-STD-461G'; right column: numbered prose on the same
+    line grid. The gutter is a real column gutter, not a tab: nothing may be read across it."""
+    left, right = LEFT, LEFT + 780
+    lines = []
+    left_rows = ["2.1 Documents. The following", "documents form a part of this", "specification:",
+                 "a. MIL-STD-461G", "b. MIL-STD-704F", "c. MIL-STD-810H", "d. MIL-STD-1275E", "e. MIL-STD-1553B"]
+    right_rows = ["3.1 Power. The unit shall operate", "from the 28 VDC aircraft bus and", "shall draw no more than 150 W in",
+                  "any mode of operation. 3.2", "Cooling. The unit shall be cooled", "by the aircraft ECS and shall not",
+                  "require any liquid coolant during", "ground running."]
+    for k, (a, b) in enumerate(zip(left_rows, right_rows)):
+        lines += [make_line(a, left + (40 if a[:2] in ("a.", "b.", "c.", "d.", "e.") else 0), 300 + k * PITCH),
+                  make_line(b, right, 300 + k * PITCH)]
+    doc, items = run({1: lines})
+    assert not any("MIL-STD" in b.text and "shall" in b.text for b in doc.blocks), [b.text for b in doc.blocks]
+    rows = requirements(items)
+    assert any(r.doc_ref == "3.1" and r.text.startswith("The unit shall operate from the 28 VDC aircraft bus") for r in rows), \
+        [(r.doc_ref, r.text) for r in rows]
+
+
+def test_a_list_set_in_two_columns_gives_one_row_per_item():
+    """a-c on the left, d-f on the right: a list set in columns, read column by column."""
+    lines = [make_line("3.2.7 Documents. The unit shall comply with the following:", LEFT, 300)]
+    for k, (a, b) in enumerate([("a. MIL-STD-461G", "d. MIL-STD-1275E"), ("b. MIL-STD-704F", "e. MIL-STD-1553B"),
+                                ("c. MIL-STD-810H", "f. MIL-STD-883L")]):
+        lines += [make_line(a, LEFT + 80, 300 + (k + 1) * PITCH), make_line(b, LEFT + 700, 300 + (k + 1) * PITCH)]
+    _doc, items = run({1: lines})
+    rows = requirements(items)
+    assert sorted(r.doc_ref for r in rows) == [f"3.2.7 {c}" for c in "abcdef"], [(r.doc_ref, r.text) for r in rows]
+    assert all(r.text.count("MIL-STD") == 1 for r in rows), [r.text for r in rows]
+
+
+def test_paragraphs_after_a_list_are_not_pulled_into_its_last_item():
+    """A blank line after a finished item ends the item, even when the next paragraph is indented to where
+    the item's text starts; a numbered sub-paragraph after the list keeps its own number."""
+    lines = make_lines(["3.2.4 Modes. The radar shall provide the following modes:", (40, "(a) Search mode."),
+                        (40, "(b) Track mode."), None, (100, "The radar shall switch between modes in less than"),
+                        "one second.", None, (100, "3.2.4.1 Mode memory. The radar shall retain the selected mode."), None,
+                        "3.2.5 Weight. The radar shall weigh less than 450 kg."])
+    _doc, items = run({1: lines})
+    rows = [(r.doc_ref, r.text) for r in requirements(items)]
+    assert ("3.2.4 b", "The radar shall provide the following modes: (b) Track mode.") in rows, rows
+    assert any(t.startswith("The radar shall switch between modes") and "(b)" not in t for _, t in rows), rows
+    assert ("3.2.4.1", "The radar shall retain the selected mode.") in rows, rows
+
+
+def test_a_value_that_wraps_back_under_its_label_keeps_its_order():
+    """Only a LABEL that wraps beside its value is read label-first. A value line that wraps back under the
+    label column, with nothing beside it, stays after the value's first line."""
+    items_ = [("a.", "Operating temperature:", ["-40 C to +71 C with the unit powered"]),
+              ("b.", "Altitude:", ["Sea level to 15,000 m."])]
+    lines = _tabbed_page(items_, after=None, x_value=LEFT + 600)
+    lines.append(make_line("and cooling air at the rate given in Figure 3.", LEFT + 220, lines[3].box[1] + PITCH))
+    lines = [ln if ln.box[1] < lines[3].box[1] + PITCH // 2 or ln.text.startswith("and cooling") else
+             make_line(ln.text, ln.box[0], ln.box[1] + PITCH) for ln in lines]
+    _doc, items = run({1: lines})
+    rows = requirements(items)
+    assert rows[0].text.endswith("a. Operating temperature: -40 C to +71 C with the unit powered and cooling air at the rate "
+                                 "given in Figure 3."), rows[0].text
+
+
+def test_a_real_table_with_label_like_first_cells_stays_a_table():
+    """'Input voltage: | The unit shall ... | Test' under a caption, with a header row, is a table - its
+    first cells end with ':' but a caption, a header row and a third column say so."""
+    assert not se._first_column_counts_like_a_list(["Parameter", "Input voltage:", "Power:", "Weight:"], 3)
+    assert not se._first_column_counts_like_a_list(["Input voltage:", "Power:", "Weight:"], 3)
+    assert se._first_column_counts_like_a_list(["POWER:", "FAULT:", "STANDBY:"], 2)
+    grid = [["Input voltage:", "The unit shall operate from 28 VDC.", "Test"], ["Power:", "The unit shall draw 150 W.", "Test"],
+            ["Weight:", "The unit shall weigh 5 kg.", "Inspection"]]
+    tbox = (LEFT, 400, LEFT + 1200, 540)
+    caption = [make_line("TABLE I. Characteristics.", LEFT + 300, 340)]
+    lead_in = [make_line("3.2 Limits. The unit shall meet each of the following:", LEFT, 340)]
+    assert not se._tab_list_in_context(grid, tbox, caption, DPI)
+    assert se._tab_list_in_context(grid, tbox, lead_in, DPI)
+    markers = [make_line(f"{k}.", LEFT - 100, 400 + 48 * (k - 1)) for k in (1, 2, 3)]
+    assert se._tab_list_in_context(grid, tbox, markers, DPI)
+
+
+def test_notes_are_not_list_items():
+    """'NOTE:  text' after a list, 'Note.' level with the items and a 'Note:' line inside an item are not
+    items of the list: none of them gets a letter, and no letter is used twice."""
+    assert not se._is_item_label("NOTE: The operator shall confirm.") and not se._is_item_label("WARNING: High voltage.")
+    assert not se._is_item_label("SRS-101: The software shall log.") and se._is_item_label("Input voltage: 28 VDC")
+    assert se.RE_MARKER_SHAPE.match("C. Shock:") and not se.RE_MARKER_SHAPE.match("Note. The unit shall be off.")
+    lines = _tabbed_page([TAB_ITEMS[0], TAB_ITEMS[1]], after=None)
+    y = max(ln.box[1] for ln in lines) + 2 * PITCH
+    lines += [make_line("NOTE:", LEFT, y), make_line("The operator shall confirm each change.", LEFT + 560, y)]
+    _doc, items = run({1: lines})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows][:2] == ["3.2.4 a", "3.2.4 b"], [(r.doc_ref, r.text) for r in rows]
+    assert not any(r.doc_ref.startswith("3.2.4 c") for r in rows), [(r.doc_ref, r.text) for r in rows]
+    note = [r for r in rows if "operator shall confirm" in r.text]
+    assert note and TAB_STEM.split(". ", 1)[1] not in note[0].text, [(r.doc_ref, r.text) for r in rows]
+
+
+def test_a_note_inside_an_item_stays_in_that_item():
+    items_ = [("a.", "Acceleration:", ["5 g in each of the three axes."]), ("b.", "Vibration:", ["20 Hz to 2000 Hz random."]),
+              ("c.", "Shock:", ["40 g, 11 ms half-sine."])]
+    lines = _tabbed_page(items_, after=None)
+    y_b = next(ln.box[1] for ln in lines if ln.text == "b.")
+    moved = [make_line(ln.text, ln.box[0], ln.box[1] + PITCH) if ln.box[1] >= y_b else ln for ln in lines]
+    moved.append(make_line("Note: The unit shall be powered during this test.", LEFT + 220, y_b))
+    _doc, items = run({1: moved})
+    rows = requirements(items)
+    refs = [r.doc_ref for r in rows]
+    assert refs == ["3.2.4 a", "3.2.4 b", "3.2.4 c"], [(r.doc_ref, r.text) for r in rows]
+    assert "Note: The unit shall be powered during this test." in rows[0].text, rows[0].text
+
+
+def test_the_following_day_is_not_a_lead_in_and_a_mid_paragraph_phrase_splits_nothing():
+    """'... retested on the following day.' and '... as described below.' inside ordinary paragraphs:
+    every sentence stays a whole requirement of its own."""
+    _doc, items = run({1: make_lines([
+        "3.4.1 Retest. A unit that fails shall be repaired and retested on the",
+        "following day. The results of the retest shall be recorded in the test",
+        "log and the log shall be signed by the quality inspector before the",
+        "unit is returned to stock.", None,
+        "3.6.2 Failures. Each failure shall be recorded and analysed as described below.",
+        "The analysis shall identify the cause of the failure and the corrective action",
+        "taken. The unit shall then be retested for a period of not less than 50 hours."])})
+    texts_ = [r.text for r in requirements(items)]
+    assert "The results of the retest shall be recorded in the test log and the log shall be signed by the quality " \
+           "inspector before the unit is returned to stock." in texts_, texts_
+    assert "The analysis shall identify the cause of the failure and the corrective action taken." in texts_, texts_
+    assert not any(r.found_in.startswith("List") for r in requirements(items)), [r.found_in for r in requirements(items)]
+
+
+def test_a_wrapped_cross_reference_does_not_split_a_paragraph():
+    """'... established in paragraph' / '3.2.5. The weight shall ...' - the line above ran to the margin, so
+    the number is a cross-reference in the sentence, not the start of paragraph 3.2.5."""
+    _doc, items = run({1: make_lines([
+        "3.2.4 Weight. The weight of the complete unit, including the mounting tray and all",
+        "cables, shall not exceed the limit established for the installation in paragraph",
+        "3.2.5. The weight shall be verified by measurement with all fluids drained."])})
+    assert {r.doc_ref for r in requirements(items)} == {"3.2.4"}, [(r.doc_ref, r.text) for r in requirements(items)]
+
+
+def test_a_titled_paragraph_ends_a_list_whatever_its_number():
+    """'3.2.8 Weight. The ...' after a list: a skip, or 3.2.5 misread as 3.2.8 - a paragraph with a run-in
+    title is a paragraph, not more of the list."""
+    lines = _tabbed_page(TAB_ITEMS[:2], after="3.2.8 Weight. The equipment shall not exceed 45 kilograms.")
+    _doc, items = run({1: lines})
+    assert [r.doc_ref for r in requirements(items)] == ["3.2.4 a", "3.2.4 b", "3.2.8"], \
+        [(r.doc_ref, r.text) for r in requirements(items)]
+
+
+def test_a_titled_inner_paragraph_is_split_whatever_its_number():
+    _doc, items = run({1: [make_line("3.2.4 Weight. The unit shall weigh less than 45 kg. "
+                                     "3.2.8 Input power. The unit shall operate from 28 VDC.")]})
+    assert [r.doc_ref for r in requirements(items)] == ["3.2.4", "3.2.8"], [(r.doc_ref, r.text) for r in requirements(items)]
+
+
+def test_a_value_carried_onto_the_next_page_stays_with_its_item():
+    """Item d's value goes on at the top of page 2 with '2.5 C per minute ...' - not a heading, not a new
+    section; and the items after it are still found."""
+    page1 = _tabbed_page([TAB_ITEMS[0], TAB_ITEMS[1], ("c.", "Temperature:", ["-40 C to +71 C operating,"])], after=None)
+    page2 = [make_line("2.5 C per minute maximum rate of change.", LEFT + 560, 300),
+             make_line("d.", LEFT + 80, 300 + 2 * PITCH), make_line("Humidity:", LEFT + 220, 300 + 2 * PITCH),
+             make_line("95 percent for 10 days.", LEFT + 560, 300 + 2 * PITCH),
+             make_line("3.2.5 Weight. The unit shall weigh 5 kg.", LEFT, 300 + 4 * PITCH)]
+    _doc, items = run({1: page1, 2: page2})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.2.4 a", "3.2.4 b", "3.2.4 c", "3.2.4 d", "3.2.5"], [(r.doc_ref, r.text) for r in rows]
+    assert rows[2].text.endswith("c. Temperature: -40 C to +71 C operating, 2.5 C per minute maximum rate of change."), rows[2].text
+
+
+def test_an_item_that_opens_a_sub_list_keeps_its_sub_items():
+    """'a. Search mode, which shall include:' / 'a. Vibration:  as follows:' - the lines below are the
+    item's sub-items (one row each, under the item), not more of its text and not new letters."""
+    _doc, items = run({1: make_lines(["3.2.4 Modes. The radar shall provide the following modes:",
+                                      (40, "a. Search mode, which shall include:"), (100, "Long range scan"),
+                                      (100, "Short range scan"), (40, "b. Track mode.")])})
+    rows = [(r.doc_ref, r.text) for r in requirements(items)]
+    assert sum(1 for ref, _ in rows if ref.startswith("3.2.4 a")) == 2, rows
+    assert any(t.endswith("include: Long range scan") for _, t in rows) and any(t.endswith("include: Short range scan") for _, t in rows), rows
+    x_mark, x_label, x_value = LEFT + 80, LEFT + 220, LEFT + 560
+    lines = [make_line(TAB_STEM, LEFT, 300), make_line("a.", x_mark, 348), make_line("Vibration:", x_label, 348),
+             make_line("as follows:", x_value, 348),
+             make_line("Random:", x_label, 396), make_line("20 Hz to 2000 Hz, 0.04 g2/Hz.", x_value, 396),
+             make_line("Sine:", x_label, 444), make_line("5 g peak, 5 Hz to 500 Hz.", x_value, 444),
+             make_line("b.", x_mark, 510), make_line("Shock:", x_label, 510), make_line("40 g, 11 ms half-sine.", x_value, 510)]
+    _doc, items = run({1: lines})
+    refs = [r.doc_ref for r in requirements(items)]
+    assert refs.count("3.2.4 b") == 1 and "3.2.4 c" not in refs, [(r.doc_ref, r.text) for r in requirements(items)]
+
+
+def test_requirement_ids_under_a_lead_in_keep_their_ids():
+    """'SRS-101:   The software shall ...' on tab stops under a lead-in: SRS-101 is the requirement's ID,
+    not a list label."""
+    lines = [make_line("3.1 Logging. The software shall meet the following:", LEFT, 300)]
+    for k, (rid, text) in enumerate([("SRS-101:", "The software shall log each command."),
+                                     ("SRS-102:", "The software shall log each fault.")]):
+        lines += [make_line(rid, LEFT + 80, 348 + k * PITCH), make_line(text, LEFT + 300, 348 + k * PITCH)]
+    _doc, items = run({1: lines})
+    refs = [r.doc_ref for r in requirements(items)]
+    assert "SRS-101" in " ".join(refs) and "SRS-102" in " ".join(refs), [(r.doc_ref, r.text) for r in requirements(items)]
+
+
+def test_several_lost_markers_in_a_row_are_counted_forward():
+    f = se.RequirementExtractor._sequence_markers
+    tokens = lambda text: [(w, 1.0, "") for w in text.split()]
+    kids = [(100, tokens(t), se.Block("list_item", 1, (0, 0, 1, 1))) for t in
+            ("a. Search:", "Track: follows targets.", "Map: ground map.", "d. Test:")]
+    assert [m for m, *_ in f(kids, 10)] == ["a.", "b.", "c.", "d."]
+
+
+
+def test_a_note_between_items_keeps_its_own_row_and_the_letters_go_on_after_it():
+    """a, b, NOTE, C. (misread), d: the NOTE is neither numbered nor glued to b, and 'C.' is still read as c
+    - the letter is expected from the last item that has one."""
+    f = se.RequirementExtractor._sequence_markers
+    tokens = lambda text: [(w, 1.0, "") for w in text.split()]
+    kids = [(100, tokens(t), se.Block("list_item", 1, (0, 0, 1, 1))) for t in
+            ("a. Voltage: 28 VDC.", "b. Ripple: 1.5 V.", "NOTE: The limits apply at the connector.", "C. Power: 150 W.",
+             "d. Current: 5 A.")]
+    out = f(kids, 10)
+    assert [m for m, *_ in out] == ["a.", "b.", "", "c.", "d."], out
+    assert not any(merge for *_, merge in out), out
+    assert "from the sequence" in out[3][2], out[3]
+
+
+def test_a_misread_next_letter_starts_the_next_item_without_a_full_stop():
+    """Items without final punctuation ('b. MIL-STD-704F') never end a sentence, so a misread 'C.' level
+    with them used to be folded into the item above. The next letter of the list starts the next item."""
+    _doc, items = run({1: make_lines(["3.2.7 Documents. The unit shall comply with the following:",
+                                      (80, "a. MIL-STD-461G"), (80, "b. MIL-STD-704F"), (80, "C. MIL-STD-810H"),
+                                      (80, "d. MIL-STD-1275E")])})
+    rows = [(r.doc_ref, r.text) for r in requirements(items)]
+    assert [ref for ref, _ in rows] == ["3.2.7 a", "3.2.7 b", "3.2.7 c", "3.2.7 d"], rows
+    assert rows[1][1].endswith("b. MIL-STD-704F") and rows[2][1].endswith("c. MIL-STD-810H"), rows
+
+
+def test_a_blank_line_after_a_finished_item_ends_it():
+    """'c. Ground mapping mode.', a blank line, then an indented sentence: a paragraph of its own, not more
+    of item c - even on a page whose paragraph spacing is wide."""
+    _doc, items = run({1: make_lines(["3.2.4 Modes. The radar shall provide the following modes:", (40, "a. Search mode."),
+                                      (40, "b. Track mode."), (40, "c. Ground mapping mode."), None,
+                                      (60, "The radar shall switch modes in less than one second.")])})
+    rows = [(r.doc_ref, r.text) for r in requirements(items)]
+    assert rows[2] == ("3.2.4 c", "The radar shall provide the following modes: c. Ground mapping mode."), rows
+    assert any(t.endswith("The radar shall switch modes in less than one second.") and " c. " not in t for _, t in rows), rows
 
 
 # =====================================================================================================================
