@@ -130,7 +130,38 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
+
+
+@functools.lru_cache(maxsize=1)
+def build_id() -> str:
+    """A short identifier of the code that is actually running, printed beside the version.
+
+    It is a fingerprint of this file's own bytes, so it changes whenever ANY line of the tool
+    changes - a merge, a hand edit, a half-applied patch - without the version number having to be
+    remembered. Two people can compare build ids to be sure they are running the same thing. When
+    the folder is a git checkout the commit is shown as well, which is what identifies a merge;
+    a folder handed out without git still gets the fingerprint. Neither needs the network."""
+    try:
+        fingerprint = hashlib.sha1(Path(__file__).read_bytes()).hexdigest()[:7]
+    except OSError:
+        return "unknown"
+    commit = ""
+    try:                                   # read .git directly: no git command, no subprocess
+        head = (Path(__file__).resolve().parent.parent / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = Path(__file__).resolve().parent.parent / ".git" / head.split(" ", 1)[1].strip()
+            commit = ref.read_text(encoding="utf-8").strip()[:7] if ref.exists() else ""
+        else:
+            commit = head[:7]
+    except (OSError, IndexError):
+        commit = ""
+    return f"{fingerprint} commit {commit}" if commit else fingerprint
+
+
+def version_line() -> str:
+    """'spec_extractor 1.2.0 (build a1b2c3d)' - the one string every report shows."""
+    return f"spec_extractor {__version__} (build {build_id()})"
 
 # The Python versions this release passed both test levels on (64-bit, standard build).
 # Change this only after running tests/test_rules.py and tests/run_regression.py on the new version
@@ -1102,18 +1133,25 @@ def prepare_page(raw: RawPage, settings: Settings, orientation: OrientationDetec
 # ---- 6a. Text patterns shared by layout analysis and requirement extraction ----
 # Paragraph / heading numbers: "3", "3.2", "3.2.1.4", "A.1.2" (optionally followed by a period)
 RE_PARA_NUM = re.compile(r"^(?P<num>(?:\d{1,2}(?:\.(?:\d{1,3}|[lIi|](?=[.\s'`·]))){0,7}|[A-Z](?:\.\d{1,3}){1,7}))(?P<dot>\.?)(?:\s+|['`´’·,]\s*(?=[A-Z]))(?P<rest>\S.*)$", re.S)
+# A paragraph number that starts a NEW paragraph part-way through a block: it follows the end of a
+# sentence and a capitalised word follows it.  A single-level number ("1.") is a list marker, so at
+# least one sub-level is required; the space after the number may be lost ("3.2.2.2.Input power.").
+RE_INNER_PARA_NUM = re.compile(r"(?<=[.:;])\s+(?P<num>\d{1,2}(?:\.[\dlIi|]{1,3}){1,7})\.?\s*(?=[A-Z])")
 # List markers: a.  a)  (a)  (1)  1)  iv)  (iv)  bullets.  "1." is handled separately.
 RE_LIST_MARKER = re.compile(
     r"^(?P<marker>\([a-z]\)|[a-z][.)]|\(\d{1,2}\)|\d{1,2}\)|\((?:i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii)\)"
     r"|(?:i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii)[.)]|[•●▪■‣⁃∙·◦]"
     r"|[–—*\-o](?=\s+[A-Z0-9]))"          # dash / 'o' bullets only before a capital or digit
-    r"(?:\s+|(?<=\))(?=[A-Z]))(?P<rest>\S.*)$", re.S)
+    # The space after a marker may be lost ("c.Built-in test mode."), so a capital letter hard
+    # against the marker also starts the text. A marker still has to be at the start of the line.
+    r"(?:\s+|(?=[A-Z]))(?P<rest>\S.*)$", re.S)
 RE_BARE_MARKER = re.compile(r"^\s*(?:\(?[a-z]\)|[a-z]\.|\(?\d{1,2}[.)]|\((?:i|ii|iii|iv|v|vi|vii|viii|ix|x)\)|[•·◦*\-o])\s*$")
 RE_NUMBERED_ITEM = re.compile(r"^(?P<marker>\d{1,2}\.)\s+(?P<rest>\S.*)$", re.S)
 # Captions: "TABLE II. Title", "Figure 3-1: Title", "FIG. 4 Title", "Exhibit A - Title"
 RE_CAPTION = re.compile(
     r"^(?P<kind>TABLE|Table|FIGURE|Figure|FIG\.?|Fig\.?|EXHIBIT|Exhibit|CHART|Chart|DRAWING|Drawing|PLATE|Plate)"
-    r"\s*(?P<num>(?:[A-Z]-)?\d{1,3}(?:[.\-]\d{1,3})*[A-Za-z]?|[IVXLCl1|]{1,8}(?=[\s.:\-–—]))"
+    # a speck read as a period or comma between the word and its number ("TABLE. IV.")
+    r"[.,]?\s*(?P<num>(?:[A-Z]-)?\d{1,3}(?:[.\-]\d{1,3})*[A-Za-z]?|[IVXLCl1|]{1,8}(?=[\s.:\-–—]))"
     r"(?P<delim>\s*[.:\-–—]+)?\s*(?P<title>.*)$", re.S)
 RE_CONTINUED = re.compile(r"\(?\s*(?:continued|cont'?d\.?|concluded)\s*\)?\s*\.?$", re.I)
 # Explicit requirement identifiers: [SRS-101], SRS-103:, PRF-201, SYS_PWR_012 ...
@@ -1180,6 +1218,16 @@ def remove_ocr_specks(text: str) -> str:
     text = re.sub(r"(?<![\w.])([A-Za-z][a-z]{2,})\.([a-z]{2,})(?!\w|\.\w)",
                   lambda m: m.group(0) if m.group(2) in _FILE_EXTENSIONS or m.group(1).lower() == "www"
                   else f"{m.group(1)} {m.group(2)}", text)
+    # the space after a full stop lost between two words: "inspection.Each" -> "inspection. Each".
+    # Only a lower-case word followed by a capitalised one, so MIL-STD-461G, file names and
+    # initials such as "U.S.Navy" are left alone.
+    text = re.sub(r"(?<![\w.])([a-z]{3,})\.([A-Z][a-z]{2,})", r"\1. \2", text)
+    # the space after a paragraph number lost, or read as a period: "4.2Extended verification." and
+    # "3.2.2.2.Input power." both become "4.2 Extended ..." / "3.2.2.2. Input ...", so the heading is
+    # seen as its own paragraph.  Only numbers that already have a sub-level ("4.2", not "1.") are
+    # touched, which leaves list markers ("1.Built-in") and part numbers (MIL-STD-1553B) alone; a
+    # period that is really a full stop is kept, so "in 3.2.1.The unit" -> "in 3.2.1. The unit".
+    text = re.sub(r"(?<![\w.])(\d{1,2}(?:\.\d{1,3}){1,7}\.?)(?=[A-Z][a-z])", r"\1 ", text)
     # dot stuck to the front of a word: "The .interface" -> "The interface"
     text = re.sub(r"(?:(?<=\s)|^)\.(?=[a-z]{3,}\b)", "", text)
     # apostrophe speck after a word (not a plural possessive): "radar' shall" -> "radar shall"
@@ -1488,13 +1536,17 @@ def _better_row_split(printed: list, inferred: list) -> list:
         cb = _et_box(cand)
         overlaps = [i for i, (et, _) in enumerate(printed)
                     if box_intersection(cb, _et_box(et)) > 0.5 * min(box_area(cb), box_area(_et_box(et)))]
+        # The inference can split a table and still leave several records sharing a row - it gives
+        # up early on a badly printed page. Where its own reading is STILL under-split, cutting its
+        # rows from the text (_resplit_rows) is tried first, with the inference behind it.
+        readings = ([(cand, "resplit")] if _rows_are_under_split(cand) else []) + [(cand, "inferred")]
         if not overlaps:
-            kept.append([(cand, "inferred")])        # nothing was found here without the inferred rows
+            kept.append(readings)                    # nothing was found here without the inferred rows
             continue
         for i in overlaps:
             et = printed[i][0]
             if len(cand.content) > len(et.content) and _rows_are_under_split(et):
-                kept[i] = [(cand, "inferred"), printed[i]]    # prefer it, but keep the fallback
+                kept[i] = readings + [printed[i]]    # prefer them, but keep the printed fallback
     # Where the printed rules still do not describe the rows and the inference offered nothing
     # better, cut the rows ourselves from where the text sits (_resplit_rows).
     for i, alts in enumerate(kept):
@@ -1524,22 +1576,50 @@ def _gap_threshold(gaps: list, median_h: float) -> Optional[float]:
 
     Both spacings come from the table's leading, so both are constant through it while differing
     from table to table - which is why this is measured per table instead of being a fixed number.
-    The dividing line is the biggest step in the sorted gaps, and None when there is no real step,
-    meaning every line is spaced alike and so is a record of its own."""
+
+    The split is taken at the LOWEST clear step in the sorted gaps, not the biggest one. The gaps
+    INSIDE a record are all alike, but the gaps BETWEEN records are not: a tall header band, or a
+    legend, sits closer to the first record than the records sit to one another. Taking the biggest
+    step then draws the line between two kinds of record gap and swallows a whole record into the
+    header. None when no step is clear, meaning every line is spaced alike and so is a record of
+    its own."""
     if len(gaps) < 3:
         return None
     ordered = sorted(gaps)
-    step, at = max((ordered[i + 1] - ordered[i], i) for i in range(len(ordered) - 1))
-    if step < 0.3 * max(median_h, 1.0):
-        return None
-    return (ordered[at] + ordered[at + 1]) / 2
+    least = 0.25 * max(median_h, 1.0)
+    for i in range(len(ordered) - 1):
+        if ordered[i + 1] - ordered[i] >= least:
+            return (ordered[i] + ordered[i + 1]) / 2
+    return None
 
 
-def _record_breaks(row_ink: list, row_columns: list, median_h: float) -> list:
-    """Which rows of text BEGIN a record of a table, given each row's ink (y0, y1) and the set of
-    columns it fills. A record is one row of the table plus the lines its cells wrap onto.
+def _looks_like_row_key(text: str) -> bool:
+    """A left-hand cell that NAMES a record: a paragraph number (3.2.1.4) or an identifier
+    (SRS-101, IFC-010). A cell holding one of these cannot be a line that something wrapped onto."""
+    t = (text or "").strip()
+    return bool(RE_MATRIX_PARA.match(t) or (RE_ID_CELL.match(t) and any(ch.isdigit() for ch in t)))
 
-    Three things are tried, strongest first:
+
+def _gap_starts(row_ink: list, median_h: float) -> set:
+    """Rows that begin a record judged on spacing alone (see _gap_threshold). Where every line is
+    spaced alike there is nothing to group, so every line is a record of its own."""
+    gaps = [row_ink[i][0] - row_ink[i - 1][1] for i in range(1, len(row_ink))]
+    cut = _gap_threshold(gaps, median_h)
+    if cut is None:
+        return set(range(len(row_ink)))
+    return {0} | {i for i, gap in enumerate(gaps, start=1) if gap > cut}
+
+
+def _record_breaks(row_ink: list, row_columns: list, median_h: float, row_keys: list = None) -> list:
+    """Which rows of text BEGIN a record of a table, given each row's ink (y0, y1), the set of
+    columns it fills, and (where known) the text of its left-hand cell. A record is one row of the
+    table plus the lines its cells wrap onto.
+
+    A row whose left-hand cell holds a new key - a paragraph number or an identifier - always
+    begins a record, whatever the spacing says. That is what stops a tall header band, whose ink
+    reaches down close to the first record, from swallowing it.
+
+    Otherwise three things are tried, strongest first:
       1. The key column. Where the left-hand column carries a value on some rows but not others -
          an ID, a paragraph number, a signal name - those rows are the records and the rest are
          wrapped lines. This is what the table itself says, so it is believed first.
@@ -1549,14 +1629,18 @@ def _record_breaks(row_ink: list, row_columns: list, median_h: float) -> list:
     n = len(row_ink)
     if n < 2:
         return list(range(n))
+    by_spacing = _gap_starts(row_ink, median_h)
+    named = {i for i, key in enumerate(row_keys or []) if _looks_like_row_key(key)}
+    if 2 <= len(named) < n:
+        # The left-hand column NAMES the records, which settles the data rows outright. What sits
+        # above the first named row is the table's header and legend bands - they have no key of
+        # their own, so their spacing is what separates them from one another.
+        first = min(named)
+        return sorted({0} | named | {i for i in by_spacing if i < first})
     keyed = [i for i, cols in enumerate(row_columns) if 0 in cols]
     if 2 <= len(keyed) < n:
-        return keyed if keyed and keyed[0] == 0 else [0] + keyed
-    gaps = [row_ink[i][0] - row_ink[i - 1][1] for i in range(1, n)]
-    cut = _gap_threshold(gaps, median_h)
-    if cut is None:
-        return list(range(n))
-    return [0] + [i for i, gap in enumerate(gaps, start=1) if gap > cut]
+        return sorted({0} | set(keyed))
+    return sorted(by_spacing)
 
 
 def _merge_continuation_rows(cell_boxes: list, lines: list) -> list:
@@ -1568,7 +1652,7 @@ def _merge_continuation_rows(cell_boxes: list, lines: list) -> list:
     three lines and all of them belong to the record that started it."""
     if len(cell_boxes) < 2:
         return cell_boxes
-    row_ink, row_columns = [], []
+    row_ink, row_columns, row_keys = [], [], []
     for row in cell_boxes:
         inside, columns = [], set()
         for c, cb in enumerate(row):
@@ -1581,8 +1665,10 @@ def _merge_continuation_rows(cell_boxes: list, lines: list) -> list:
         row_ink.append((min((ln.box[1] for ln in inside), default=fallback[1]),
                         max((ln.box[3] for ln in inside), default=fallback[3])))
         row_columns.append(columns)
+        first = [ln for ln in lines if row and row[0] is not None and box_center_inside(ln.box, row[0])]
+        row_keys.append(_join_words_in_reading_order([w for ln in first for w in ln.words]))
     heights = [ln.box[3] - ln.box[1] for ln in lines]
-    starts = _record_breaks(row_ink, row_columns, statistics.median(heights) if heights else 0.0)
+    starts = _record_breaks(row_ink, row_columns, statistics.median(heights) if heights else 0.0, row_keys)
     if len(starts) == len(cell_boxes):
         return cell_boxes
     merged = []
@@ -1602,17 +1688,24 @@ def _resplit_rows(cell_boxes: list, lines: list) -> Optional[list]:
     horizontal cuts are new: a grid row that has swallowed several rows of text is cut half-way
     down the white gap between them, and the columns are left exactly as the printed rules give
     them. Returns None when there was nothing to cut."""
-    out, changed = [], False
+    out, changed, cut_to = [], False, None
     for row in cell_boxes:
         present = [cb for cb in row if cb is not None]
         if not present:
             out.append(row)
             continue
         band = box_union(present)
+        # A cell merged down the table gives every row it covers the same tall box, so the same
+        # band arrives again and again. Cutting it each time would repeat the whole table, so an
+        # area already cut is passed over.
+        if cut_to is not None and band[3] <= cut_to + 1:
+            continue
         text_rows = _rows_of([ln for ln in lines if box_center_inside(ln.box, band)])
         if len(text_rows) < 2:
             out.append(row)
+            cut_to = band[3] if cut_to is None else max(cut_to, band[3])
             continue
+        cut_to = band[3] if cut_to is None else max(cut_to, band[3])
         cuts = [band[1]]
         for above, below in zip(text_rows, text_rows[1:]):
             cuts.append(int((max(ln.box[3] for ln in above) + min(ln.box[1] for ln in below)) / 2))
@@ -1623,18 +1716,28 @@ def _resplit_rows(cell_boxes: list, lines: list) -> Optional[list]:
     return out if changed else None
 
 
+def _is_merged_band(row: list) -> bool:
+    """A row that is one piece of text merged across the table - a title, a banner, or the LEGEND
+    a quality conformance matrix prints above its columns. A merged cell repeats its text in every
+    position it covers, which is what this recognises."""
+    cells = [(c or "").strip() for c in row if (c or "").strip()]
+    return len(cells) > 1 and len(set(cells)) == 1
+
+
 def _header_row_count(grid: list, merges: list) -> int:
     """How many rows at the top of a table are header rows (nearly always one).
 
-    A second row counts when the first is a banner merged across several columns - the
-    "VERIFICATION METHOD" band printed above the I / A / D / T letters of a verification matrix -
-    and the row underneath reads like headers as well."""
-    if not grid or not _looks_like_header(grid[0]):
+    A second row counts when the first is a band across the whole width and the row underneath
+    reads like headers: a "VERIFICATION METHOD" banner over the I / A / D / T letters, or a LEGEND
+    explaining what the numbered and lettered columns mean. A legend is ordinary prose and reads
+    nothing like a header, so it is recognised by its shape - one text merged across the table -
+    which is what used to leave such a matrix with no header row recognised at all."""
+    if not grid:
         return 0
     banner = any(r0 == 0 and r1 == 0 and c1 > c0 for r0, c0, r1, c1 in merges or [])
-    if banner and len(grid) > 2 and _looks_like_header(grid[1]):
+    if (banner or _is_merged_band(grid[0])) and len(grid) > 2 and _looks_like_header(grid[1]):
         return 2
-    return 1
+    return 1 if _looks_like_header(grid[0]) else 0
 
 
 # ---- 6c-2. Sideways (rotated) column headers -------------------------------------------
@@ -1838,22 +1941,31 @@ def _method_column_run(data_rows: list, n_cols: int) -> list:
     marked = [c for c in range(n_cols) if marks_only(c)]
     if len(marked) < 2:
         return []
-    run = list(range(min(marked), n_cols))
-    if any(values(c) and not marks_only(c) for c in run):
+    # The block starts at the first marked column and runs right over any empty columns after the
+    # last one - a method can be unused on a given page - stopping at the first column holding
+    # text. It does NOT have to reach the right-hand edge: a quality conformance matrix puts an
+    # AQL and an inspection method to the right of its marks. It is not widened to the LEFT, where
+    # an empty label column would be swallowed as though it were a method.
+    lo, hi = min(marked), max(marked)
+    while hi + 1 < n_cols and not values(hi + 1):
+        hi += 1
+    if any(values(c) and not marks_only(c) for c in range(lo, hi + 1)):
         return []                       # a column of text sits among them: not a block of methods
-    return run
+    return list(range(lo, hi + 1))
 
 
 def _is_mark_matrix(grid: list) -> bool:
     """True for a verification cross-reference matrix: a column of paragraph numbers beside two or
     more columns that hold nothing but tick marks. Such a table is mostly empty on purpose, so the
     "is this really a table?" checks must not judge it on how many of its cells are filled."""
-    if len(grid) < 3 or len(_mark_columns(grid[1:])) < 2:
-        return False
-    for c in range(max((len(r) for r in grid), default=0)):
-        values = [(r[c] or "").strip() for r in grid[1:] if c < len(r) and (r[c] or "").strip()]
-        if len(values) >= max(2, 0.6 * (len(grid) - 1)) and all(RE_MATRIX_PARA.match(v) for v in values):
-            return True
+    for skip in (1, 2):                 # one header row, or a legend band above it
+        data = grid[skip:]
+        if len(data) < 2 or len(_mark_columns(data)) < 2:
+            continue
+        for c in range(max((len(r) for r in grid), default=0)):
+            values = [(r[c] or "").strip() for r in data if c < len(r) and (r[c] or "").strip()]
+            if len(values) >= max(2, 0.6 * len(data)) and all(RE_MATRIX_PARA.match(v) for v in values):
+                return True
     return False
 
 
@@ -1885,9 +1997,13 @@ def _reads_like_prose(grid: list) -> bool:
         cells = [c for c in row if c]
         for cell in cells:
             m = RE_PARA_NUM.match(cell)
-            if m and "." in m.group("num") + m.group("dot") and m.group("rest")[:1].isalpha():
+            # A heading names something, so what follows the number has to be a word. Without that,
+            # a verification matrix cell holding a column number beside its tick ("1 X") reads as
+            # the heading "1. X" and the whole table is dismissed as running text.
+            heading_word = bool(m and re.search(r"[A-Za-z]{3,}", m.group("rest")))
+            if m and "." in m.group("num") + m.group("dot") and heading_word:
                 return True                            # "4.1 Verification ..." : a numbered paragraph
-            if _is_heading_text(cell) and word_count(cell) >= 2 and RE_PARA_NUM.match(cell):
+            if heading_word and _is_heading_text(cell) and word_count(cell) >= 2:
                 return True                            # "4. VERIFICATION"
         # one sentence running across the cells: "manufactured and" | "finished" | "in accordance with".
         # A lone tick in a verification matrix column ("Detection range" | "x") is not a word, so it
@@ -1965,7 +2081,9 @@ def detect_aligned_tables(lines: list, dpi: float, claimed: set) -> list:
             continue
         row_ink = [(rows[r]["box"][1], rows[r]["box"][3]) for r in run]
         row_cols = [{_nearest_band(w, provisional) for _i, ws in rows[r]["segs"] for w in ws} for r in run]
-        starts = set(_record_breaks(row_ink, row_cols, char_h))
+        row_keys = [_join_words_in_reading_order([w for _i, ws in rows[r]["segs"] for w in ws
+                                                  if _nearest_band(w, provisional) == 0]) for r in run]
+        starts = set(_record_breaks(row_ink, row_cols, char_h, row_keys))
         # The bands are measured from the record rows only: a wrapped line breaks where its text
         # happens to end, and letting that count would invent columns of its own.
         bands = _merge_intervals([(min(w.box[0] for w in ws), max(w.box[2] for w in ws))
@@ -2617,7 +2735,18 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             # "(CB12)" at the start of a line needs evidence that the line before really ended: it is often
             # a designator in the middle of a wrapped sentence.
             strong_id = bool(re.match(r"^\s*(?:\[(?:" + RE_REQ_ID + r")\]|(?:" + RE_REQ_ID + r")\s*:)\s*[A-Z\"(\[]", row_text))
-            row_is_item = bool(RE_LIST_MARKER.match(row_text) or strong_id
+            # Inside a list, a line that starts level with the item above begins the NEXT item even
+            # when its own marker cannot be recognised - misread ("c." read as "C." or as "3."),
+            # run together with the text, or dropped altogether. A marker is one or two characters,
+            # which is exactly what OCR loses or mistakes, while a list's indentation is printed the
+            # same for every item; so the indentation is given slightly more weight than the marker.
+            # The line above must have finished its sentence, which is what keeps a cell still
+            # wrapping from being taken for the next item.
+            in_list = bool(RE_LIST_MARKER.match(first_text) or RE_NUMBERED_ITEM.match(first_text))
+            item_by_indent = (in_list and sentence_ended and not continues
+                              and abs(row_box[0] - first_box[0]) <= 0.6 * stats.line_h
+                              and (row_text[:1].isupper() or row_text[:1].isdigit()))
+            row_is_item = bool(RE_LIST_MARKER.match(row_text) or strong_id or item_by_indent
                                or (_starts_with_delimited_id(row_text) and (sentence_ended or next_word_fits or wider_gap)))
             sibling_item = row_is_item and row_box[0] <= first_box[0] + 0.6 * stats.line_h
             outdented = (bool(RE_LIST_MARKER.match(first_text) or RE_NUMBERED_ITEM.match(first_text))
@@ -2665,10 +2794,16 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
         after_stem = (before is not None and before.page == out[k].page and before.text.rstrip().endswith(":")
                       and (before.kind == "heading" or word_count(before.text) <= 3             # "NOTES:"
                            or out[k].box[0] > before.box[0] + 0.3 * stats.line_h))              # indented under a stem
+        # A numbered line sitting level with the list item just above it is that list's next item,
+        # not a section heading: "a. ... b. ... 3. ..." is a list whose third marker was misread.
+        # "3. REQUIREMENTS" after a list is still a heading, which is what the all-capitals test is for.
+        after_item = (before is not None and before.page == out[k].page and before.kind == "list_item"
+                      and abs(out[k].box[0] - before.box[0]) <= 0.6 * stats.line_h
+                      and not RE_NUMBERED_ITEM.match(out[k].text).group("rest").isupper())
         # "1. Note text ...", "2. Note text ..." - but not "3. REQUIREMENTS" / "4. VERIFICATION" (empty section)
         consecutive = (len(run) >= 2 and all(y == x + 1 for x, y in zip(numbers, numbers[1:]))
                        and not all(RE_NUMBERED_ITEM.match(out[x].text).group("rest").isupper() for x in run))
-        if after_stem or consecutive:
+        if after_stem or consecutive or after_item:
             for x in run:
                 out[x].kind, out[x].meta = "list_item", {"marker": numbered_heading(out[x]).group("marker")}
         k = run[-1] + 1
@@ -2705,8 +2840,8 @@ cryptos cybersecurity databus datagram datagrams datalink datalinks deconflictio
 downlinks duplexer duplexers dwg dwgs failover failsafe geofence geofencing geolocation georeference georeferenced
 geospatial gimbaled hardcopy hypervisor interoperate interoperates interoperating keyloader lidar lifecycle loopback
 mainlobe metadata microamp microamps microservice microservices middleware milliamp milliamps milliwatt milliwatts
-monopulse multimode multipath narrowband offboard onboard overcurrent overtemperature overvoltage packetized
-passthrough picosecond pinout pinouts postflight powerdown powerup pulsewidth pushbuttons qty readback realtime req
+monopulse multimode multipath narrowband navaid offboard onboard overcurrent overtemperature overvoltage packetized
+passthrough picosecond pinout pinouts pitot postflight powerdown powerup pulsewidth pushbuttons qty readback realtime req
 reqs runtime scanline serializer sidelobe sidelobes singlemode softcopy subassemblies subcomponent subcomponents
 subtier teleoperated teleoperation testset testsets timestamp timestamped timestamps undervoltage uninterruptible
 uplink uplinks verif virtualization waypoint waypoints webserver wideband workaround writeback zeroization zeroize
@@ -2758,6 +2893,20 @@ class WordChecker:
                 return other
         return ""
 
+    def _document_twin(self, word: str) -> str:
+        """An ordinary English word one edit away from an unknown word that THIS document also uses
+        ("systen" printed beside "system"). That pairing is evidence the scan misread a normal word
+        rather than that the document has a term of its own: a specification that writes "boresight"
+        or "monopulse" does not also write "foresight" or anything one edit from them. Returns "" when
+        there is no such word, which leaves genuine project vocabulary unflagged."""
+        best, best_freq = "", 0.0
+        for cand in self.spell.edit_distance_1(word):
+            if len(cand) >= 4 and self.counts.get(cand, 0) and cand in self.spell:
+                freq = self.spell.word_usage_frequency(cand)
+                if freq > best_freq:
+                    best, best_freq = cand, freq
+        return best
+
     def clean(self, raw: str) -> str:
         return remove_ocr_specks(strip_accents(raw) if self.settings.english_text else raw)
 
@@ -2792,10 +2941,19 @@ class WordChecker:
             if not re.fullmatch(r"[A-Za-z][a-z]{2,}", part):
                 continue                       # acronyms, IDs, numbers and short words are not checked
             w = part.lower()
-            if self.counts.get(w, 0) >= 2:
-                continue                       # repeated in the document: a real term (or a consistent one)
+            repeated = self.counts.get(w, 0) >= 2
             if w not in self.spell:
-                return "not in the English dictionary"
+                # A word the document repeats is normally a project term, not a misread. But OCR
+                # repeats ITS mistakes too - the same word misread the same way on every page - and
+                # those are the errors most easily missed. So a repeated unknown word is still
+                # reported when the document ALSO uses the ordinary word one edit away from it.
+                twin = self._document_twin(w) if repeated else ""
+                if repeated and not twin:
+                    continue
+                return (f"not in the English dictionary (the document also writes '{twin}')"
+                        if twin else "not in the English dictionary")
+            if repeated:
+                continue                       # repeated in the document: a real term (or a consistent one)
             freq = self.spell.word_usage_frequency(w)
             if freq < 1e-6:
                 for cand in self.spell.edit_distance_1(w):
@@ -3939,6 +4097,19 @@ class RequirementExtractor:
         offset = len(text) - len(body)
         return ref, title, body, offset
 
+    def _inner_paragraphs(self, text: str, body_start: int) -> list:
+        """[(cut, ref, title, body offset)] for numbered paragraphs that begin INSIDE one block.
+        A scan often loses the blank line between "3.2.2.1 Weight. ..." and "3.2.2.2 Input power.
+        ...", leaving both in the same block; without this every sentence would be filed under the
+        first number.  parse_head decides what really is a heading, so a quantity ("3.3 V shall")
+        and a cross-reference in running text ("... comply with 3.2.1. Testing ...") are left alone."""
+        found = []
+        for m in RE_INNER_PARA_NUM.finditer(text, body_start):
+            ref, title, _body, off = self.parse_head(text[m.start("num"):])
+            if ref:
+                found.append((m.start(), ref, title, m.start("num") + off))
+        return found
+
     def _text_block_items(self, blocks: list, i: int, source: str, section: str, vocab: set, dpi_of: dict, items: list) -> int:
         """Handle a paragraph/list item (and, for a stem, the list below it). Returns blocks consumed."""
         b = blocks[i]
@@ -3967,6 +4138,20 @@ class RequirementExtractor:
                 units[-1][1] = e
         if not units:
             return 1
+
+        # One block can hold two numbered paragraphs when the scan lost the blank line between them.
+        # Give each sentence the number and title of the paragraph it actually sits in, and stop a
+        # sentence from swallowing the heading that follows it.
+        heads = [(ref, title)] * len(units)
+        inner = self._inner_paragraphs(text, body_start)
+        for n, u in enumerate(units):
+            cut = next((p for p in inner if u[0] < p[0] < u[1]), None)
+            if cut:
+                u[1] = cut[0]
+            started = [p for p in inner if p[3] <= u[0]]
+            if started:
+                heads[n] = (started[-1][1], started[-1][2])
+                u[0] = max(u[0], started[-1][3])      # the number and title are not part of the text
 
         dpi = dpi_of.get(b.page, 200)
         # a stem inside the block ("... shall provide:" with the first items on the next rows of the same block)
@@ -4023,8 +4208,8 @@ class RequirementExtractor:
             return j - i
 
         found_in = "List item" if b.kind == "list_item" else "Paragraph"
-        for s, e, kw in units:
-            items.append(self._req_item(b, source, section, ref, title, text, tokens, spans, s, e, kw, found_in, "", extra_reasons))
+        for (s, e, kw), (u_ref, u_title) in zip(units, heads):
+            items.append(self._req_item(b, source, section, u_ref, u_title, text, tokens, spans, s, e, kw, found_in, "", extra_reasons))
         return 1
 
     def _row_entries(self, b: Block, ctx, text: str, spans: list, start_char: int) -> list:
@@ -4360,7 +4545,7 @@ def write_workbook(path: Path, runs: list, settings: Settings, multi_doc: bool =
     software, differences = configuration_status(docling_used=any(d.engine == "docling" for d, _ in runs))
     info = [
         ("Created", _dt.datetime.now().strftime("%Y-%m-%d %H:%M")),
-        ("Tool", f"spec_extractor.py {__version__}"),
+        ("Tool", f"spec_extractor.py {__version__}   (build {build_id()})"),
         ("Tested configuration", "Yes - Python and package versions match constraints.txt" if not differences
          else "NO - the documented accuracy was not measured for this setup:\n" + "\n".join(differences)),
         ("Software", software.replace("; ", "\n")),
@@ -4476,7 +4661,7 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
     p.add_run(_docx_text(Path(doc.source).name))
     p.add_run(f"\nPages: {len(doc.pages)}    Engine: {doc.engine}    Created: {_dt.datetime.now():%Y-%m-%d %H:%M}")
     _software, differences = configuration_status(docling_used=doc.engine == "docling")
-    p.add_run(f"\nTool: spec_extractor.py {__version__}    Tested configuration: "
+    p.add_run(f"\nTool: spec_extractor.py {__version__} (build {build_id()})    Tested configuration: "
               + ("yes" if not differences else "NO - see 'Run Info' in the Excel file or spec_extractor_log.txt"))
     n_req = sum(1 for it in items if it.item_type == "Requirement")
     p.add_run(f"\nRequirements: {n_req}    Tables: {sum(1 for it in items if it.item_type == 'Table')}    "
@@ -4944,7 +5129,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--docling-models", help="folder with pre-downloaded Docling models (offline use)")
     g.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto", help="device for the Docling engine")
     p.add_argument("-v", "--verbose", action="store_true", help="more detailed log")
-    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__} (build {build_id()})")
     return p
 
 
@@ -5062,7 +5247,7 @@ def main(argv: Optional[list] = None) -> int:
     out_dir = settings.output_dir or ((first if first.is_dir() else first.parent) / "extraction_output")
     out_dir.mkdir(parents=True, exist_ok=True)
     _setup_logging(out_dir, args.verbose)
-    LOG.info("spec_extractor %s - %d file(s) - engine: %s - output: %s", __version__, len(files), settings.engine, out_dir)
+    LOG.info("%s - %d file(s) - engine: %s - output: %s", version_line(), len(files), settings.engine, out_dir)
     report_configuration(docling_used=settings.engine == "docling")
 
     output_stems = unique_output_stems(files)

@@ -1401,6 +1401,336 @@ def test_a_page_saved_at_screen_size_is_enlarged_enough_to_read():
 
 
 # =====================================================================================================================
+# Version and build identity
+# =====================================================================================================================
+def test_readme_states_the_same_version_as_the_code():
+    """The version at the top of the README is what a user compares against the line a run prints,
+    so the two must never drift apart. Raise both in the same commit."""
+    readme = (HERE.parent / "README.md").read_text(encoding="utf-8")
+    stated = re.search(r"^>\s*##\s*Version\s+([0-9]+\.[0-9]+\.[0-9]+)\s*$", readme, re.M)
+    assert stated, "README.md must carry a '> ## Version X.Y.Z' heading at the top"
+    assert stated.group(1) == se.__version__, (stated.group(1), se.__version__)
+
+
+def test_build_id_fingerprints_the_code_that_is_running():
+    """The build id has to follow the FILE, not the version number, so that a folder carrying a
+    half-applied patch or an unreleased edit cannot claim to be a released version."""
+    import hashlib
+    expected = hashlib.sha1(Path(se.__file__).read_bytes()).hexdigest()[:7]
+    assert se.build_id().startswith(expected), (se.build_id(), expected)
+    assert se.version_line() == f"spec_extractor {se.__version__} (build {se.build_id()})"
+    assert se.version_line().startswith(f"spec_extractor {se.__version__} (build {expected}")
+
+
+# =====================================================================================================================
+# Lists: spacing is trusted over the marker character
+#
+# A marker is one or two characters, which is exactly what OCR drops or mistakes, while a list's
+# indentation is printed identically for every item. These cases all come from real reports of a
+# list's LAST entry being glued onto the entry above it, or dropped out of the list altogether.
+# =====================================================================================================================
+LIST_STEM = "The radar shall provide the following modes:"
+LIST_ITEMS = ["Long range search mode.", "Track-while-scan mode.", "Built-in test mode."]
+
+
+def _list_rows(markers, items=None, indent=36, stem=LIST_STEM):
+    """The stem followed by one line per item, each line "<marker> <text>" at `indent`."""
+    items = items or LIST_ITEMS
+    return [stem] + [(indent, f"{m} {t}".strip()) for m, t in zip(markers, items)]
+
+
+def _list_requirements(rows):
+    _doc, items = run({1: make_lines(rows)})
+    return [it.text for it in requirements(items)]
+
+
+def test_every_ordinary_list_format_yields_one_row_per_item():
+    """The formats a specification actually uses, each of which must give one row per item."""
+    for name, markers in (("letters", ["a.", "b.", "c."]),
+                          ("letters in brackets", ["(a)", "(b)", "(c)"]),
+                          ("digits with a period", ["1.", "2.", "3."]),
+                          ("digits in brackets", ["(1)", "(2)", "(3)"]),
+                          ("digits with a bracket", ["1)", "2)", "3)"]),
+                          ("roman numerals", ["i.", "ii.", "iii."]),
+                          ("dashes", ["-", "-", "-"]),
+                          ("bullets", ["•", "•", "•"])):
+        rows = _list_requirements(_list_rows(markers))
+        assert len(rows) == 3, (name, rows)
+        assert all(LIST_STEM in r for r in rows), (name, rows)
+        assert rows[-1].endswith(LIST_ITEMS[-1]), (name, rows)
+
+
+def test_list_spacing_variations_all_yield_one_row_per_item():
+    """The same list set with different spacing: tight, a blank line between items, a wide tab
+    between the marker and its text, and an item indented differently from its siblings."""
+    tight = _list_requirements(_list_rows(["a.", "b.", "c."]))
+    spaced = _list_requirements([LIST_STEM, (36, "a. Long range search mode."), None,
+                                 (36, "b. Track-while-scan mode."), None, (36, "c. Built-in test mode.")])
+    tabbed = _list_requirements(_list_rows(["a." + " " * 8, "b." + " " * 8, "c." + " " * 8]))
+    ragged = _list_requirements([LIST_STEM, (36, "a. Long range search mode."),
+                                 (36, "b. Track-while-scan mode."), (96, "c. Built-in test mode.")])
+    for name, rows in (("tight", tight), ("blank line between", spaced),
+                       ("wide tab after the marker", tabbed), ("last item indented further", ragged)):
+        assert len(rows) == 3, (name, rows)
+        assert rows[-1].endswith(LIST_ITEMS[-1]), (name, rows)
+
+
+def test_a_misread_marker_does_not_end_the_list():
+    """The heart of it: the last marker comes back as the wrong letter, the wrong case, a digit
+    where letters were used, or glued to its text. None of those may end the list, because the
+    indentation still says the line is an item."""
+    for name, last in (("wrong letter", "e."), ("a letter shaped like another", "o."),
+                       ("upper case", "C."), ("a digit among letters", "3."),
+                       ("a bracket instead of a period", "c)"), ("run together with the text", "c.Built-in")):
+        markers = ["a.", "b.", last]
+        items = LIST_ITEMS[:2] + (["test mode."] if last == "c.Built-in" else [LIST_ITEMS[2]])
+        rows = _list_requirements(_list_rows(markers, items))
+        assert len(rows) == 3, (name, rows)
+        assert "test mode." in rows[-1], (name, rows)
+        assert LIST_STEM in rows[-1], (name, rows)
+
+
+def test_a_marker_lost_altogether_does_not_end_the_list():
+    """The marker is gone, not merely wrong. The line still sits level with the items above it and
+    the item above finished its sentence, so it is the next item."""
+    rows = _list_requirements([LIST_STEM, (36, "a. Long range search mode."),
+                               (36, "b. Track-while-scan mode."), (36, "Built-in test mode.")])
+    assert len(rows) == 3, rows
+    assert rows[-1].endswith("Built-in test mode."), rows
+
+
+def test_a_misread_digit_does_not_end_a_numbered_list():
+    for last in ("8.", "5.", "l."):
+        rows = _list_requirements(_list_rows(["1.", "2.", last]))
+        assert len(rows) == 3, (last, rows)
+        assert rows[-1].endswith(LIST_ITEMS[-1]), (last, rows)
+
+
+def test_a_wrapped_item_is_still_one_item():
+    """The guard on all of the above: a line that merely continues the sentence of the item above
+    must NOT become an item of its own, however it is indented."""
+    rows = _list_requirements([LIST_STEM, (36, "a. Long range search mode."),
+                               (36, "b. Track-while-scan mode."),
+                               (36, "c. Built-in test mode which shall run at power"),
+                               (36, "on and at the operator's request.")])
+    assert len(rows) == 3, rows
+    assert "operator's request." in rows[-1], rows
+
+
+def test_a_heading_after_a_list_is_still_a_heading():
+    """The counter-case to treating a numbered line level with a list as the next item: a section
+    heading in capitals after a list stays a heading and does not join the list."""
+    doc, items = run({1: make_lines([LIST_STEM, (36, "a. Long range search mode."),
+                                     (36, "b. Track-while-scan mode."), (36, "c. Built-in test mode."),
+                                     (36, "4. VERIFICATION"),
+                                     "4.1 Tests. Tests shall be witnessed by the procuring activity."])})
+    headings = [b.text for b in doc.blocks if b.kind == "heading"]
+    assert "4. VERIFICATION" in headings, [b.kind + ":" + b.text for b in doc.blocks]
+    assert len(requirements(items)) == 4, texts(items)
+
+
+def test_a_wide_tab_list_that_also_loses_a_marker_is_a_known_limitation():
+    """Documented, not fixed. With a WIDE TAB the marker is its own OCR box, so an item whose
+    marker is also lost leaves only its text, sitting exactly where a wrapped line would sit and
+    following a finished sentence. Nothing in the geometry separates the two, so the text joins the
+    item above. Pinned here so a future change to the list rules shows up as a change in THIS
+    behaviour rather than passing unnoticed."""
+    lines = [make_line(LIST_STEM, LEFT, 300)]
+    y = 300 + PITCH
+    for marker, text in (("a.", LIST_ITEMS[0]), ("b.", LIST_ITEMS[1]), (None, LIST_ITEMS[2])):
+        if marker:
+            lines.append(make_line(marker, LEFT + 36, y))
+        lines.append(make_line(text, LEFT + 300, y))
+        y += PITCH
+    _doc, items = run({1: lines})
+    rows = [it.text for it in requirements(items)]
+    assert len(rows) == 2, rows                      # the third item is not recovered
+    assert rows[-1].endswith(LIST_ITEMS[2]), rows    # its text is kept, on the item above
+
+
+# =====================================================================================================================
+# Verification matrices with a legend band
+#
+# The shape reported from real material: a LEGEND across the top, then a header row whose own label
+# wraps, then many narrow mark columns, with the columns ruled and nothing between the rows. It came
+# out as one row holding every requirement, with the X marks bundled into it.
+# =====================================================================================================================
+def test_the_split_is_taken_at_the_lowest_clear_step():
+    """Measured off such a matrix. The gaps inside a record are alike, but the gaps BETWEEN records
+    are not: the header band sits 20 px above the first record while the records sit 46-49 px
+    apart. Cutting at the BIGGEST step lands between those two kinds of record gap and swallows the
+    first record into the header; cutting at the lowest clear step keeps them apart."""
+    gaps = [2, 64, 1, 20, 49, 49, 48, 46, 47, 47]
+    cut = se._gap_threshold(gaps, 40)
+    assert cut is not None and 2 < cut < 20, cut
+    assert [g > cut for g in gaps] == [False, True, False, True, True, True, True, True, True, True]
+
+
+def test_the_lowest_step_rule_still_groups_a_wrapped_requirement_table():
+    """The same rule on the gaps of a requirement table whose cells wrap over three lines."""
+    gaps = [18, 1, 3, 23, -2, -2, 24, 22, -1, 0]
+    cut = se._gap_threshold(gaps, 36)
+    assert cut is not None and 3 < cut < 18, cut
+    assert [g > cut for g in gaps] == [True, False, False, True, False, False, True, True, False, False]
+
+
+def test_a_matrix_cell_holding_a_column_number_and_a_tick_is_not_a_heading():
+    """"1 X" - a column header run together with the tick below it - used to read as the heading
+    "1. X", so the whole matrix was dismissed as running text and the broken reading kept."""
+    matrix = [["Requirement reference", "1 X", "2", "3 X", "4"],
+              ["3.2.1.2", "", "X", "", ""],
+              ["3.2.1.3", "X", "", "", "X"],
+              ["3.2.2.1", "", "", "X", ""]]
+    assert not se._reads_like_prose(matrix), matrix
+    # a real numbered heading inside a grid is still caught
+    assert se._reads_like_prose([["4. VERIFICATION", ""], ["4. VERIFICATION", ""],
+                                 ["Each requirement shall be", "verified as specified"]])
+
+
+def test_row_keys_tell_a_record_from_a_wrapped_header():
+    """A legend band of two lines, then a header whose label wraps onto a second line, then the
+    records. Only the records carry a key in the left-hand column, and the bands above the first
+    key are separated from each other by their spacing."""
+    ink = [(0, 30), (32, 62), (107, 137), (134, 164), (178, 208), (208, 238),
+           (239, 269), (300, 330), (330, 360), (360, 390), (389, 419)]
+    keys = ["LEGEND: 1 = First article", "Dimensional C = Functional", "Requirement", "reference",
+            "3.4.1.1", "", "3.4.1.2", "3.4.2.1", "3.4.2.2", "", "3.4.3.1"]
+    cols = [set(range(11))] * 2 + [{0, 1}, set(range(11))] + [set(range(7)), {0}, set(range(5)),
+                                                              set(range(7)), set(range(5)), {0}, set(range(7))]
+    starts = se._record_breaks(ink, cols, 32.5, keys)
+    assert starts == [0, 2, 4, 6, 7, 8, 10], starts     # legend, header, then one per requirement
+
+
+def test_what_counts_as_a_row_key():
+    """A paragraph number or an identifier names a record; a word, a band of legend text, a tick or
+    an empty cell does not. "2.5" counts, because paragraph 2.5 is a perfectly ordinary key - it
+    reads as an AQL percentage only in the AQL column, and this is asked of the LEFT-HAND column."""
+    for key in ("3.2.1.4", "3.4.1.1", "SRS-101", "IFC-010", "A.1.2", "2.5"):
+        assert se._looks_like_row_key(key), key
+    for not_key in ("Requirement", "reference", "LEGEND: 1 = First article", "", "Visual", "X",
+                    "Inspection method", "Visual and functional"):
+        assert not se._looks_like_row_key(not_key), not_key
+
+
+def test_a_legend_matrix_with_a_wrapped_header_keeps_one_row_per_requirement():
+    """End to end on a drawn page: legend band, a header whose label wraps, eleven columns, column
+    rules and no line between the rows. Every requirement must keep its own row and its own marks."""
+    xs = [260, 700, 810, 920, 1030, 1140, 1250, 1360, 1470, 1620, 1810]
+    img = np.full((PAGE_H, PAGE_W), 255, np.uint8)
+    top, head_top, first = 360, 470, 600
+    rows = [("3.2.1.1", [0, 2], [0, 2], "2.5"), ("3.2.1.2", [1], [1], "1.0"),
+            ("3.2.1.3", [0, 3], [0, 3], "0.65"), ("3.2.2.1", [2], [2], "4.0")]
+    bottom = first + 64 * len(rows)
+    cv2.rectangle(img, (xs[0], top), (xs[-1], bottom), 0, 2)
+    for x in xs[1:-1]:
+        cv2.line(img, (x, head_top), (x, bottom), 0, 2)          # column rules below the legend
+    cv2.line(img, (xs[0], head_top), (xs[-1], head_top), 0, 2)   # under the legend
+    cv2.line(img, (xs[0], first - 16), (xs[-1], first - 16), 0, 2)   # under the headers
+    lines = []
+
+    def put(text, x, y, scale=0.62):
+        words = _draw_words(img, text, x, y, scale=scale)
+        lines.append(se.Line(text, 0.97, se.box_union(w.box for w in words), words))
+
+    put("LEGEND: 1 = First article  2 = Periodic  3 = Lot sample  4 = Continuous", xs[0] + 10, top + 14)
+    put("A = Visual  B = Dimensional  C = Functional  D = Environmental", xs[0] + 10, top + 46)
+    put("Requirement", xs[0] + 10, head_top + 12)                # the label WRAPS onto a second line
+    put("reference", xs[0] + 10, head_top + 44)
+    for c, label in enumerate(["1", "2", "3", "4", "A", "B", "C", "D"]):
+        put(label, xs[c + 1] + 12, head_top + 44)
+    put("AQL", xs[9] + 12, head_top + 44)
+    for r, (ref, nums, letters, aql) in enumerate(rows):
+        y = first + 64 * r
+        put(ref, xs[0] + 10, y)
+        for c in nums:
+            put("X", xs[c + 1] + 12, y)
+        for c in letters:
+            put("X", xs[c + 5] + 12, y)
+        put(aql, xs[9] + 12, y)
+    found = se.detect_tables(img, lines, DPI, settings(detect_tables=True))
+    assert found, "a matrix with a legend band and a wrapped header was not detected"
+    grid = found[0][0].grid
+    assert len(grid) == 2 + len(rows), [r[0] for r in grid]      # legend, header, one per requirement
+    assert "LEGEND" in grid[0][0], grid[0]
+    assert grid[1][0].replace(" ", "").startswith("Requirement"), grid[1]
+    assert [r[0] for r in grid[2:]] == [r[0] for r in rows], [r[0] for r in grid]
+    for r, (ref, nums, letters, aql) in enumerate(rows):
+        marked = [c for c in range(1, 9) if grid[2 + r][c].strip()]
+        assert marked == sorted([n + 1 for n in nums] + [l + 5 for l in letters]), (ref, marked, grid[2 + r])
+
+
+def test_a_lost_space_after_a_paragraph_number_is_repaired():
+    """A photocopy loses the space after a paragraph number, or reads it as a speck of dirt.
+    Both are repaired, while list markers, part numbers and file names are left untouched."""
+    assert se.remove_ocr_specks("4.2Extended verification.") == "4.2 Extended verification."
+    assert se.remove_ocr_specks("3.2.2.2.Input power.") == "3.2.2.2. Input power."
+    assert se.remove_ocr_specks("3.1Purpose.") == "3.1 Purpose."
+    # a real full stop in front of the capital survives, so a cross-reference still reads as one
+    assert se.remove_ocr_specks("per 3.2.1.The unit") == "per 3.2.1. The unit"
+    for unchanged in ("MIL-STD-1553B bus", "MIL-STD-461G.Method", "1.Built-in test", "10.The unit",
+                      "514.8Requires", "config.xml", "3.2.2.1"):
+        assert se.remove_ocr_specks(unchanged) == unchanged, unchanged
+
+
+def test_two_numbered_paragraphs_in_one_block_keep_their_own_numbers():
+    """A faint scan can lose the blank line between two numbered paragraphs, leaving both in one
+    block. Each requirement must still carry the number of the paragraph it was written under."""
+    lines = make_lines(["3.2.2.1 Weight. The equipment shall not exceed 45 kilograms.",
+                        "3.2.2.2 Input power. The equipment shall operate from 115 VAC."])
+    _doc, items = run({1: lines})          # no blank line between them: the layout sees ONE block
+    rows = requirements(items)
+    assert len(rows) == 2, texts(items)
+    assert [r.doc_ref for r in rows] == ["3.2.2.1", "3.2.2.2"], [r.doc_ref for r in rows]
+    assert "45 kilograms" in rows[0].text and "3.2.2.2" not in rows[0].text, rows[0].text
+    assert rows[1].text.startswith("The equipment shall operate"), rows[1].text
+    assert rows[1].title == "Input power", rows[1].title
+
+
+def test_a_cross_reference_is_not_mistaken_for_a_new_paragraph():
+    """'... as defined in 3.2.1. Testing shall ...' is one paragraph: the number is a reference in
+    running text, not a heading, so the second sentence keeps the block's own number."""
+    lines = make_lines(["3.4.1 Test method. The unit shall be tested as defined in 3.2.1.",
+                        "Testing shall be witnessed by the procuring activity."])
+    _doc, items = run({1: lines})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.4.1"] * len(rows), [(r.doc_ref, r.text) for r in rows]
+
+
+def test_a_quantity_inside_a_paragraph_is_not_a_new_paragraph():
+    """'3.3 V shall' after a full stop is a voltage, not paragraph 3.3."""
+    lines = make_lines(["3.5.1 Supply. The rail shall be regulated. 3.3 V shall be held to 2 percent."])
+    _doc, items = run({1: lines})
+    rows = requirements(items)
+    assert rows and all(r.doc_ref == "3.5.1" for r in rows), [(r.doc_ref, r.text) for r in rows]
+
+
+def _checker(words: list) -> "se.WordChecker":
+    from collections import Counter
+    counts = Counter(w.lower() for w in words)
+    return se.WordChecker(counts, settings(), Counter())
+
+
+def test_an_ocr_misread_repeated_on_every_page_is_still_flagged():
+    """The OCR repeats its mistakes, so 'repeated in the document' cannot mean 'a real term' on its
+    own. 'systen' printed beside 'system' is reported; a project term of its own is not."""
+    ck = _checker(["system", "systen", "systen", "systen", "the", "status"])
+    assert "system" in ck.issue("systen", "systen"), ck.issue("systen", "systen")
+    ck = _checker(["monopulse", "monopulse", "monopulse", "boresight", "boresight", "radar"])
+    assert ck.issue("monopulse", "monopulse") == "", ck.issue("monopulse", "monopulse")
+    assert ck.issue("boresight", "boresight") == "", ck.issue("boresight", "boresight")
+
+
+def test_a_project_term_is_not_flagged_just_because_english_has_a_near_word():
+    """A term of the program's own ('hardpoint') is one edit from nothing the document uses, so
+    there is no evidence of a misread and it is left alone however often it appears. The tool also
+    carries its own engineering dictionary, so 'boresight' and 'monopulse' are known words."""
+    ck = _checker(["hardpoint"] * 4 + ["radar", "antenna", "mounted"])
+    assert ck.issue("hardpoint", "hardpoint") == "", ck.issue("hardpoint", "hardpoint")
+    for term in ("boresight", "monopulse", "pitot", "waveguide"):
+        assert _checker([term]).issue(term, term) == "", term
+
+
+# =====================================================================================================================
 # Command line and file handling
 # =====================================================================================================================
 def test_page_selection():
