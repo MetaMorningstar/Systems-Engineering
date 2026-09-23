@@ -14,3 +14,6 @@ extraction_output/
 spec_extractor_log.txt
 spec_extractor/tests/corpus/
 spec_extractor/tests/_results/
+spec_extractor/tests/list_suite/images/
+spec_extractor/tests/list_suite/expectations.json
+spec_extractor/tests/list_suite/_results/

@@ -32,7 +32,10 @@ import openpyxl
 from rapidfuzz.distance import Levenshtein
 
 BULLETS = "•·◦*"
-STRUCTURAL_REASONS = ("continues across pages", "Repeated in the page")   # deliberate checks, not OCR suspicions
+# Deliberate checks, not OCR suspicions: the tool joined text across pages, found a repeated notice, or
+# took a list marker from the sequence ("C." -> "c.") - each is reported so a person can confirm the
+# decision, and the row text is right, so such a flag does not count as a false alarm.
+STRUCTURAL_REASONS = ("continues across pages", "Repeated in the page", "from the sequence")
 
 
 def norm(text: str) -> str:
