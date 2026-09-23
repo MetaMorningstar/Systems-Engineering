@@ -2360,21 +2360,33 @@ def _join_wrapped_labels(cells: list) -> list:
     return out
 
 
+def _is_caption_text(text: str) -> bool:
+    """'TABLE I. Interface characteristics.' is a caption; 'Table 4 gives the limits ...' is a sentence
+    (the same test the layout step uses for caption blocks)."""
+    t = (text or "").strip()
+    cap = RE_CAPTION.match(t)
+    if not cap or word_count(t) > 40 or _modal_re().search(t):
+        return False
+    title = (cap.group("title") or "").strip()
+    return bool(cap.group("delim") or not title or title[:1].isupper() or RE_CONTINUED.search(title))
+
+
 def _caption_next_to(tbox, lines: list) -> bool:
-    """Is the line right above or right below a grid a table caption ("TABLE I. Interface ...")?"""
+    """Is the line right above a grid (a blank line may stand between them), or the line straight under
+    it, a table caption ("TABLE I. Interface ...")? A caption further down, after a blank line, is more
+    often the NEXT table's or figure's than this one's."""
     if not lines:
         return False
     h = statistics.median([ln.box[3] - ln.box[1] for ln in lines])
     centre = lambda ln: (ln.box[1] + ln.box[3]) / 2
-    # (a blank line may stand between the table and its caption)
     for near in ([ln for ln in lines if tbox[1] - 3.5 * h <= ln.box[3] <= tbox[1] + 0.3 * h and centre(ln) < tbox[1]
                   and ln.box[0] < tbox[2] and ln.box[2] > tbox[0]],
-                 [ln for ln in lines if tbox[3] - 0.3 * h <= ln.box[1] <= tbox[3] + 3.5 * h and centre(ln) > tbox[3]
+                 [ln for ln in lines if tbox[3] - 0.3 * h <= ln.box[1] <= tbox[3] + 1.2 * h and centre(ln) > tbox[3]
                   and ln.box[0] < tbox[2] and ln.box[2] > tbox[0]]):
         if near:
             y = centre(min(near, key=lambda ln: abs(centre(ln) - (tbox[1] + tbox[3]) / 2)))
             row = sorted((ln for ln in near if abs(centre(ln) - y) <= 0.5 * h), key=lambda ln: ln.box[0])
-            if RE_CAPTION.match(" ".join(ln.text for ln in row).strip()):
+            if _is_caption_text(" ".join(ln.text for ln in row)):
                 return True
     return False
 
@@ -2408,7 +2420,7 @@ def _tab_list_in_context(grid: list, tbox, lines: list, dpi: float) -> bool:
         y = centre(max(above, key=lambda ln: ln.box[3]))
         row = sorted((ln for ln in above if abs(centre(ln) - y) <= 0.5 * h), key=lambda ln: ln.box[0])
         text = " ".join(ln.text for ln in row).strip()
-    if RE_CAPTION.match(text):
+    if _is_caption_text(text):
         return False
     lead_in = _introduces_list(text)
     # the row above is an item of the same list: a label at the grid's left edge with its value beside it
@@ -2645,38 +2657,54 @@ def _is_tab_not_gutter(left: list, right: list) -> bool:
     if sum(beside) < max(1, 0.6 * (n - lone_stems)) or cued < 0.5 * n:
         return False
     right_texts = [" ".join(ln.text for ln in r).strip() for r in right_rows]
-    # numbered paragraphs on the right: two in sequence ("3.1 Power. ...", "3.2 Cooling. ..."), or one
-    # that follows a numbered paragraph on the left ("3.4 Modes. ..." | "3.5 Power. ..."). ONE titled
-    # number inside a value is a cross-reference ("as specified in 4.5.3 Random vibration. Levels ...").
-    titled = [RE_PARA_NUM.match(t).group("num") for t in right_texts if _is_titled_number(t)]
+    left_y = [centre(row) for row in rows]
+    all_left_y = [centre(row) for row in all_rows]
+    # the left rows where an item STARTS: a marker, or a label after a complete one. A label's second
+    # line ("temperature:" under "a. Storage") sits beside the value's second line, which runs on.
+    starts_y = [y for k, (t, y) in enumerate(zip(left_texts, left_y))
+                if RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t) or RE_MARKER_SHAPE.match(t) or _marker_parts(t)
+                or (t.endswith(":") and (k == 0 or left_texts[k - 1].endswith(":")))]
+    # numbered paragraphs on the right: two in sequence ("3.1 Power. ...", "3.2 Cooling. ..."), one that
+    # follows a numbered paragraph on the left ("3.4 Modes. ..." | "3.5 Power. ..."), or one that starts
+    # on the same line as something on the left. A titled number alone on a line of its own is a
+    # cross-reference a value carries on with ("as specified in" / "4.5.3 Random vibration. Levels ...").
+    titled = [(RE_PARA_NUM.match(t).group("num"), y) for t, y in zip(right_texts, right_y) if _is_titled_number(t)]
     left_titled = [RE_PARA_NUM.match(t).group("num") for t in left_texts if _is_titled_number(t)]
-    if any(plausible_next_number(a, b) for a, b in zip(titled, titled[1:])) or \
-            any(plausible_next_number(a, b) for a in left_titled for b in titled):
+    if (any(plausible_next_number(a, b) for (a, _), (b, _) in zip(titled, titled[1:]))
+            or any(plausible_next_number(a, b) for a in left_titled for b, _ in titled)
+            or any(abs(y - c) <= 0.5 * height for _, y in titled for c in all_left_y)):
         return False
-    # the list goes on in a second column: the right-hand markers carry on from the last left-hand one
+    # a list in a second column: the right-hand markers carry on from the last left-hand one (a-c | d-f),
+    # or form one list of their own, item for item beside the left-hand items (a-e | a-e). A sub-list
+    # inside the values ("(1) ...", "(2) ...") starts again under each item, beside no item of its own.
     def marker_of(t):
         m = RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t) or RE_MARKER_SHAPE.match(t)
         return m.group("marker") if m and _marker_parts(m.group("marker")) else ""
     left_markers = [mk for mk in map(marker_of, left_texts) if mk]
-    right_markers = [mk for mk in map(marker_of, right_texts) if mk]
-    if left_markers and right_markers:
+    right_marked = [(mk, y) for mk, y in zip(map(marker_of, right_texts), right_y) if mk]
+    if left_markers and right_marked:
+        right_markers = [mk for mk, _ in right_marked]
         roman = any(_marker_parts(mk)[1].lower() in _ROMANS[1:9] for mk in left_markers + right_markers)
-        if right_markers[0].lower() == _next_marker(left_markers[-1], roman).lower():
+        in_sequence = all(_next_marker(a, roman).lower() == b.lower() for a, b in zip(right_markers, right_markers[1:]))
+        beside_items = sum(1 for _, y in right_marked if any(abs(y - c) <= 0.5 * height for c in starts_y))
+        if right_markers[0].lower() == _next_marker(left_markers[-1], roman).lower() or \
+                (len(right_markers) >= 3 and in_sequence and beside_items >= 2 / 3 * len(right_markers)):
             return False
-    # the left rows where an item STARTS: a marker, or a label after a complete one. A label's second
-    # line ("temperature:" under "a. Storage") sits beside the value's second line, which runs on.
-    left_y = [centre(row) for row in rows]
-    starts_y = [y for k, (t, y) in enumerate(zip(left_texts, left_y))
-                if RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t) or RE_MARKER_SHAPE.match(t) or _marker_parts(t)
-                or (t.endswith(":") and (k == 0 or left_texts[k - 1].endswith(":")))]
-    # Prose wraps a line only when the next word does not fit on it. The values of a tab list stop
-    # where each value ends: "within 22 to 29 VDC," is followed by "less than 1 V ..." although "less"
-    # would have fitted - a sentence broken early, which a column of running text never does.
-    # A column of running text is also wider than a few short values: its lines hold 30 characters or
-    # more (about 33 on a typewritten two-column page), where "less than 1 V peak to peak," holds 27.
-    if max(len(t) for t in right_texts) < 30:
+    # The left-hand side holds nothing of its own - only markers and labels waiting for their values
+    # ("a.", "Voltage:", "Storage" / "temperature:"): no column of text looks like that, so the values
+    # beside it are not tested for prose (short values such as "within 22 to 29 VDC," would look like it).
+    rests = []
+    for t in left_texts:
+        m = RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t) or RE_MARKER_SHAPE.match(t)
+        rests.append("" if RE_BARE_MARKER.match(t) or (not m and _marker_parts(t)) else (m.group("rest") if m else t).strip())
+    if all(not r or (r.endswith(":") and RE_ITEM_LABEL.match(r) and word_count(r) <= 8 and not _modal_re().search(r))
+           for r in _join_wrapped_labels(rests)):
         return True
+    # Prose wraps a line only when the next word does not fit on it. The values of a tab list stop
+    # where each value ends: a sentence broken although the next word would have fitted is evidence
+    # against running text (a ragged typewriter margin gives some of those too, so it is weighed).
     right_edge = max(ln.box[2] for ln in right_lines)
+    right_w = right_edge - min(ln.box[0] for ln in right_lines)
     runs_on = early = shared = 0
     for k in range(1, len(right_rows)):
         if not any(abs(right_y[k] - y) <= 0.5 * height for y in starts_y):
@@ -2684,12 +2712,14 @@ def _is_tab_not_gutter(left: list, right: list) -> bool:
         shared += 1
         if _ends_sentence(right_texts[k - 1]) or not right_texts[k][:1].islower():
             continue
+        # (a typist's margin wanders by a few characters, so only a clearly short line counts as early)
         room = right_edge - max(ln.box[2] for ln in right_rows[k - 1])
-        first_word = _first_word_width(right_rows[k]) + 0.4 * height
-        runs_on += first_word > room
-        early += first_word + height <= room
+        if _first_word_width(right_rows[k]) + max(height, 0.25 * right_w) <= room:
+            early += 1
+        else:
+            runs_on += 1
     # prose flowing past the list: a column
-    return not (shared >= 2 and runs_on >= 0.5 * shared and not early)
+    return not (shared >= 2 and runs_on >= 0.5 * shared and runs_on > early)
 
 
 def _first_word_width(row: list) -> float:
@@ -2812,10 +2842,14 @@ def _is_titled_number(text: str) -> bool:
     title = re.match(r"(?P<title>[A-Z][A-Za-z0-9 ,/()&'-]{0,80}?)[.:]\s+[A-Z(\"]", m.group("rest"))
     if not title:
         return False
-    first = title.group("title").split()[0].rstrip(",")
+    words = title.group("title").split()
+    first = words[0].rstrip(",")
     # "5.0 V. Ripple shall ...", "1.5 V peak to peak. Measured ...", "2.5 G rms overall. Duration ..." are
-    # quantities: a unit (or a lone capital) straight after the number is not the start of a title
-    return not (RE_UNIT.fullmatch(first) or len(first) == 1 or _starts_with_unit(title.group("title")))
+    # quantities: a unit (or a lone capital) straight after the number is not the start of a title -
+    # unless a capitalised word follows it ("3.2.1 X Band.", "3.4.1 I Channel.", "3.2 W Band.")
+    unit_like = RE_UNIT.fullmatch(first) or len(first) == 1
+    titled_on = len(words) > 1 and words[1][:1].isupper()
+    return not ((unit_like and not titled_on) or (_starts_with_unit(title.group("title")) and not titled_on))
 
 
 # A sentence that leads into a list. It normally ends in ":", but the colon is often left out, or lost
@@ -2991,6 +3025,8 @@ def _wrapped_label_rows(rows: list, line_h: float):
         left = [ln for ln in sorted(row, key=lambda l: l.box[0]) if ln.box[0] < vx]
         if not left:
             return None                                  # a value line alone before any ':' - no label here
+        if max(ln.box[2] for ln in left) > vx + 0.3 * line_h:
+            return None                                  # it runs on into the value column: the value wrapping back
         text = " ".join(ln.text for ln in left).strip()
         if k and (RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text) or RE_BARE_MARKER.match(text)):
             return None                                  # a sub-item, not more of the label
@@ -3239,8 +3275,10 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                                or (_starts_with_delimited_id(row_text) and (sentence_ended or next_word_fits or wider_gap)))
             sibling_item = row_is_item and row_box[0] <= first_box[0] + 0.6 * stats.line_h
             # a line back left of a list item's first line ends it - also when the item's own marker was
-            # lost ("Vibration:  20 Hz ..." then "C.  Shock: ..." back at the markers' column)
-            outdented = in_list and row_box[0] < first_box[0] - 0.6 * stats.line_h
+            # lost ("Vibration:  20 Hz ..." then "C.  Shock: ..." back at the markers' column) - unless it
+            # simply carries on a wrapped sentence ("A. General: The contractor shall provide all labor," /
+            # "and equipment ..." back at the margin: a paragraph with its first line indented)
+            outdented = in_list and row_box[0] < first_box[0] - 0.6 * stats.line_h and not continues
             x_overlap = min(row_box[2], block_box[2]) - max(row_box[0], block_box[0])
             narrow = max(1, min(row_box[2] - row_box[0], block_box[2] - block_box[0]))
             prev_h, row_h = prev_box[3] - prev_box[1], row_box[3] - row_box[1]
@@ -3332,6 +3370,20 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
         after_item = (before is not None and before.page == out[k].page and before.kind == "list_item"
                       and abs(out[k].box[0] - before.box[0]) <= 0.6 * stats.line_h
                       and not RE_NUMBERED_ITEM.match(out[k].text).group("rest").isupper())
+        # ... also when the item above ended in a paragraph of its own, in its text column ("2. Track mode." /
+        # "     It shall hold 64 tracks." / "3. Ground mapping mode."): its number is the one just before
+        # (or two before - a list of tests may count 1, 3, 5)
+        for back in range(k - 1, -1, -1):
+            blk = out[back]
+            if blk.page != out[k].page or after_item:
+                break
+            if blk.kind == "paragraph" and blk.box[0] > out[k].box[0] + 0.6 * stats.line_h:
+                continue                                # more of the item above
+            prev = RE_NUMBERED_ITEM.match(blk.text or "") if blk.kind == "list_item" else None
+            after_item = bool(prev and abs(blk.box[0] - out[k].box[0]) <= 0.6 * stats.line_h and back < k - 1
+                              and 0 < numbers[0] - int(prev.group("marker").rstrip(".")) <= 2
+                              and not RE_NUMBERED_ITEM.match(out[k].text).group("rest").isupper())
+            break
         # "1. Note text ...", "2. Note text ..." - but not "3. REQUIREMENTS" / "4. VERIFICATION" (empty section)
         consecutive = (len(run) >= 2 and all(y == x + 1 for x, y in zip(numbers, numbers[1:]))
                        and not all(RE_NUMBERED_ITEM.match(out[x].text).group("rest").isupper() for x in run))
@@ -3344,9 +3396,14 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
         next_num = RE_PARA_NUM.match(after.text or "") if after is not None else None
         last_rest = RE_NUMBERED_ITEM.match(out[run[-1]].text).group("rest").strip()
         opens_section = bool(next_num and re.fullmatch(rf"{numbers[-1]}\.0?1", clean_para_number(next_num.group("num")))
-                             and (not last_rest.endswith(".") or last_rest.isupper()))
-        if after_stem or consecutive or after_item:
+                             and word_count(last_rest) <= 8 and not _modal_re().search(last_rest))
+        # right under a lead-in ("... the following modes:") consecutive numbers are its list, wherever they sit
+        lead_before = before is not None and before.page == out[k].page and _introduces_list(before.text)
+        if after_stem or after_item or (consecutive and lead_before):     # a list
             for x in (run[:-1] if opens_section else run):
+                out[x].kind, out[x].meta = "list_item", {"marker": numbered_heading(out[x]).group("marker")}
+        elif consecutive and not opens_section:        # "1. Note text ...", "2. ..." (but "5. Packaging." /
+            for x in run:                              # "6. Notes." / "6.1 ..." are empty sections)
                 out[x].kind, out[x].meta = "list_item", {"marker": numbered_heading(out[x]).group("marker")}
         k = run[-1] + 1
 
@@ -3599,6 +3656,13 @@ def block_token_rows(block: Block, ctx: TextContext) -> list:
 def block_tokens(block: Block, ctx: TextContext) -> list:
     """All tokens of a text block in reading order (see block_token_rows)."""
     return [tok for row in block_token_rows(block, ctx) for tok in row]
+
+
+def _text_rows(block: Block) -> list:
+    """(x0, text) of each visual row of a block."""
+    if not block.lines:
+        return [(block.box[0], block.text)]
+    return [(min(ln.box[0] for ln in row), " ".join(ln.text for ln in row).strip()) for row in _block_rows(block)]
 
 
 def _on_new_line(tokens: list) -> list:
@@ -4729,8 +4793,9 @@ class RequirementExtractor:
             return True                                              # right under the item
         if gap > 2 * row_gap + 1.6 * text_h:
             return False                                             # more than one blank line
-        # after one blank line: an unfinished sentence carries on; a finished one only in the value column
-        return not _ends_sentence(so_far) or at_value
+        # after one blank line: a sentence that was not finished carries on (in lower case - an item without
+        # a full stop, "2. Track mode", is not unfinished); a finished one only in the value column
+        return (not _ends_sentence(so_far) and (t[:1].islower() or t[:1].isdigit())) or at_value
 
     def _inner_paragraphs(self, text: str, body_start: int, previous: str = "") -> list:
         """[(cut, ref, title, body offset)] for numbered paragraphs that begin INSIDE one block.
@@ -4817,6 +4882,18 @@ class RequirementExtractor:
         # a stem inside the block ("... shall provide:" with the first items on the next rows of the same block)
         inline_items = []
         stem_unit = None
+        # the paragraphs that follow, for a lead-in without a colon (see _plain_items)
+        following = []
+        for nb in blocks[i + 1:]:
+            if nb.kind != "paragraph" or self._starts_section(nb.text) or _starts_with_delimited_id(nb.text):
+                break
+            following.append(nb)
+        def plain_run_after(first_rows: list) -> int:
+            """How many of the following paragraphs, with first_rows before them, are a list of plain items."""
+            for n in range(len(following), -1, -1):
+                if self._plain_items(first_rows + [r for blk in following[:n] for r in _text_rows(blk)], b.box[0], dpi):
+                    return n
+            return -1
         for u in units:
             if not _introduces_list(text[u[0]:u[1]]) or u[1] >= len(text.rstrip()) - 1:
                 continue
@@ -4828,7 +4905,8 @@ class RequirementExtractor:
                 # run of short lines indented level with each other ("Search mode" / "Track mode")
                 first = tokens_text(row_entries[0][1])[0]
                 if not (RE_LIST_MARKER.match(first) or RE_NUMBERED_ITEM.match(first) or RE_MARKER_SHAPE.match(first)
-                        or _is_item_label(first) or self._plain_items(row_entries, b.box[0], dpi)):
+                        or _is_item_label(first)
+                        or plain_run_after([(x0, tokens_text(tk)[0]) for x0, tk, _ in row_entries]) >= 0):
                     row_entries = []
             if row_entries:
                 stem_unit, inline_items = u, row_entries
@@ -4842,16 +4920,10 @@ class RequirementExtractor:
             children = list(inline_items)
             skipped = []
             # without a colon, unmarked items are taken only as a run of short lines indented level with
-            # each other ("Own ship position and heading." / "Target range and bearing."): one sentence
-            # after the lead-in is not a list
-            run = []
-            for nb in blocks[i + 1:]:
-                if nb.kind != "paragraph" or self._starts_section(nb.text) or _starts_with_delimited_id(nb.text):
-                    break
-                run.append((nb.box[0], None, nb))
-            plain_run = len(run) if not colon_stem and not inline_items else 0
-            while plain_run and not self._plain_items(run[:plain_run], b.box[0], dpi):
-                plain_run -= 1
+            # each other ("Own ship position and heading." / "Target range and bearing."), which may begin on
+            # the lead-in's own block: one sentence after the lead-in is not a list
+            inline_rows = [(x0, tokens_text(tk)[0]) for x0, tk, _ in inline_items]
+            plain_run = max(0, plain_run_after(inline_rows)) if not colon_stem else 0
             j = i + 1
             while j < len(blocks):
                 nb = blocks[j]
@@ -4907,7 +4979,7 @@ class RequirementExtractor:
                 nxt = blocks[i + 1] if i + 1 < len(blocks) else None
                 missed = (nxt is not None and nxt.kind in ("paragraph", "list_item") and nxt.page == b.page
                           and nxt.box[0] > b.box[0] + 0.15 * dpi and not self._starts_section(nxt.text)
-                          and word_count(nxt.text) <= 12 and not _modal_re().search(nxt.text))
+                          and all(word_count(t) <= 12 for _, t in _text_rows(nxt)) and not _modal_re().search(nxt.text))
                 promised = (["Ends with ':' but no list items were found below"] if colon_stem else
                             ["Leads into a list ('the following ...') but no list items were taken from the "
                              "indented text below it - check"] if missed else [])
@@ -4929,15 +5001,16 @@ class RequirementExtractor:
         return 1
 
     @staticmethod
-    def _plain_items(entries: list, left: float, dpi: float) -> bool:
-        """Do these (x0, tokens, block) entries read as a list without markers - two or more short
-        lines (up to 12 words), indented from the lead-in's margin `left` and level with each other?"""
-        if len(entries) < 2:
+    def _plain_items(rows: list, left: float, dpi: float) -> bool:
+        """Do these (x0, text) lines read as a list without markers - two or more short lines (up to 12
+        words) that each start with a capital or a number, state no requirement of their own, and are
+        indented from the lead-in's margin `left` and level with each other?"""
+        if len(rows) < 2:
             return False
-        texts = [tokens_text(tk)[0] if tk is not None else blk.text for _, tk, blk in entries]
-        xs = [x0 for x0, _, _ in entries]
-        return (all(0 < word_count(t) <= 12 for t in texts) and max(xs) - min(xs) <= 0.1 * dpi
-                and min(xs) > left + 0.1 * dpi)
+        xs = [x0 for x0, _ in rows]
+        return (all(0 < word_count(t) <= 12 and (t[:1].isupper() or t[:1].isdigit()) and not _modal_re().search(t)
+                    for _, t in rows)
+                and max(xs) - min(xs) <= 0.1 * dpi and min(xs) > left + 0.1 * dpi)
 
     def _row_entries(self, b: Block, ctx, text: str, spans: list, start_char: int, whole_rows: bool = False) -> list:
         """List items written on the rows after an inline stem inside the same block. With whole_rows,
@@ -5026,7 +5099,7 @@ class RequirementExtractor:
         return out
 
     @staticmethod
-    def _split_lost_items(children: list, ctx, tol: float) -> list:
+    def _split_lost_items(children: list, ctx, tol: float, joined: dict = None) -> list:
         """An item whose marker was lost in a single-spaced list starts exactly where a wrapped line would,
         so it arrives inside the item above:
 
@@ -5037,37 +5110,62 @@ class RequirementExtractor:
         When the markers either side skip exactly one ('a.' then 'c.'), the item before the gap is split
         where ONE line in its text column starts a new sentence after a finished one; the sequence then
         gives the piece its letter (and says so). Without exactly one such line nothing is split, and the
-        item is flagged instead (see _sequence_markers)."""
+        item is flagged instead (see _sequence_markers). A block that was joined on to the item after a
+        finished sentence (see _continues_item), starting in its text column, is such a line too."""
         def marker(k):
             t = tokens_text(children[k][1])[0]
             m = RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t)
             return m.group("marker") if m and _marker_parts(m.group("marker")) else ""
 
+        markers = [marker(k) for k in range(len(children))]
         out = []
         for k, (x0, c_tokens, child) in enumerate(children):
             out.append(children[k])
-            here, after = marker(k), marker(k + 1) if k + 1 < len(children) else ""
+            here, after = markers[k], markers[k + 1] if k + 1 < len(children) else ""
             if not (here and after and child.lines and abs(children[k + 1][0] - x0) <= tol):
                 continue
-            roman = any((_marker_parts(mk) or ("", "", ""))[1].lower() in _ROMANS[1:9] for mk in (here, after))
-            if _next_marker(_next_marker(here, roman), roman).lower() != after.lower():
+            if not RequirementExtractor._lone_gap(markers, [c[0] for c in children], k, tol):
                 continue
             rows = _block_rows(child)
             token_rows = block_token_rows(child, ctx)
             own = [t[0] for row in token_rows for t in row]
-            if len(rows) < 2 or [t[0] for t in c_tokens[:len(own)]] != own:
-                continue                                 # (only the item's own block is split)
+            if not rows or [t[0] for t in c_tokens[:len(own)]] != own:
+                continue                                 # (only the item's own text is split)
             label_x, value_xs = _item_columns(rows[0])
-            cuts = [r for r in range(1, len(rows)) if token_rows[r] and token_rows[r - 1] and label_x is not None
-                    and abs(min(ln.box[0] for ln in rows[r]) - label_x) <= tol
-                    and not any(abs(min(ln.box[0] for ln in rows[r]) - v) <= tol for v in value_xs)
+            in_text_column = lambda x: (label_x is not None and abs(x - label_x) <= tol
+                                        and not any(abs(x - v) <= tol for v in value_xs))
+            cuts = [sum(len(row) for row in token_rows[:r]) for r in range(1, len(rows))
+                    if token_rows[r] and token_rows[r - 1] and in_text_column(min(ln.box[0] for ln in rows[r]))
                     and _ends_sentence(token_rows[r - 1][-1][0]) and token_rows[r][0][0][:1].isupper()]
+            first_joined = ((joined or {}).get(child.uid) or [None])[0]
+            if (first_joined is not None and len(c_tokens) > len(own) and own and _ends_sentence(own[-1])
+                    and c_tokens[len(own)][0][:1].isupper() and in_text_column(first_joined.box[0])):
+                cuts.append(len(own))                    # "Map. Ground mapping ..." joined on after "... 20 targets."
             if len(cuts) != 1:
                 continue
-            n = sum(len(row) for row in token_rows[:cuts[0]])
+            n = cuts[0]
             out[-1] = (x0, c_tokens[:n], child)
             out.append((x0, _on_new_line(c_tokens[n:]), child))
         return out
+
+    @staticmethod
+    def _lone_gap(markers: list, xs: list, k: int, tol: float) -> bool:
+        """Do the markers of item k and the item after it skip exactly one ('a.' then 'c.'), in a list whose
+        other steps at that level all count up by one? A list that counts in twos (tests 1, 3, 5) has no
+        lost item, and 'a.', 'c.', 'c.', 'd.' is a misread 'b.' (see _sequence_markers), not a lost one."""
+        level = [j for j in range(len(markers)) if markers[j] and abs(xs[j] - xs[k]) <= tol]
+        seq = [markers[j] for j in level]
+        roman = any((_marker_parts(mk) or ("", "", ""))[1].lower() in _ROMANS[1:9] for mk in seq)
+        step = lambda a, n: _next_marker(a, roman) if n == 1 else _next_marker(_next_marker(a, roman), roman)
+        if k not in level or level.index(k) + 1 >= len(level) or level[level.index(k) + 1] != k + 1:
+            return False
+        pos = level.index(k)
+        if step(seq[pos], 2).lower() != seq[pos + 1].lower():
+            return False
+        if pos + 2 < len(seq) and seq[pos + 2].lower() == seq[pos + 1].lower():
+            return False                                   # 'c.', 'c.': the first is a misread 'b.'
+        others = [(a, b) for q, (a, b) in enumerate(zip(seq, seq[1:])) if q != pos]
+        return all(step(a, 1).lower() == b.lower() for a, b in others)
 
     @staticmethod
     def _nest_by_style(children: list, columns: list, tol: float) -> list:
@@ -5146,10 +5244,12 @@ class RequirementExtractor:
 
         cores = [(_marker_parts(f[1]) or ("", "", ""))[1].lower() for f in found]
         roman = any(c in _ROMANS[1:9] for c in cores) or (bool(cores) and cores[0] == "i")
-        # a list lettered in capitals ("A.  Flow rate:", "B.  Pressure:") - its capitals are not misreads
-        letters = [(_marker_parts(f[1]) or ("", "", ""))[1] for f in found]
-        letters = [c for c in letters if len(c) == 1 and c.isalpha()]
-        capitals = len(letters) >= 2 and all(c.isupper() for c in letters)
+        def capitals(x0: float) -> bool:
+            """Is the list level at x0 lettered in capitals ("A.  Flow rate:", "B.  Pressure:")? Then its capitals
+            are not misreads. (A sub-list below it may use small letters: each level is judged on its own.)"""
+            letters = [(_marker_parts(f[1]) or ("", "", ""))[1] for f in found if abs(f[0] - x0) <= tol]
+            letters = [c for c in letters if len(c) == 1 and c.isalpha()]
+            return len(letters) >= 2 and all(c.isupper() for c in letters)
         def notice(text: str) -> bool:
             return (text or "").strip().split(":", 1)[0].strip().upper() in _NOT_LABELS and ":" in (text or "")
 
@@ -5175,7 +5275,7 @@ class RequirementExtractor:
                 expected = found[j][1] if j is not None else ""
                 if j is not None and not found[j][3]:
                     parts = _marker_parts(expected)
-                    expected = (expected if capitals else expected.lower()) \
+                    expected = (expected if capitals(x0) else expected.lower()) \
                         if parts and len(parts[1]) == 1 and parts[1].isalpha() else ""
                 for _ in range(back):
                     expected = _previous_marker(expected, roman)
@@ -5214,10 +5314,11 @@ class RequirementExtractor:
             out.append((marker, body, note, None))
         # 'a.' followed straight by 'c.' at the same level: 'b.' may have lost its marker and been read as
         # more of 'a.' - the list is left as printed, but the item before the gap is flagged
+        markers_now = [f[1] for f in found]           # (the markers as corrected above)
         for k, (x0, marker, _body, _valid) in enumerate(found):
             nxt = sibling(k, 1)
             if (marker and nxt == k + 1 and found[nxt][1] and not out[k][2] and out[k][3] is None
-                    and _next_marker(_next_marker(marker, roman), roman).lower() == found[nxt][1].lower()):
+                    and RequirementExtractor._lone_gap(markers_now, [f[0] for f in found], k, tol)):
                 out[k] = (out[k][0], out[k][1], f"The list goes from '{marker}' to '{found[nxt][1]}' - check whether "
                           f"'{_next_marker(marker, roman)}' lost its marker and was read as part of this item", None)
         return out
@@ -5232,7 +5333,7 @@ class RequirementExtractor:
         rows = []           # (block, marker_path, tokens)
         columns = self._nest_by_style(children, self._marker_columns(children, tol), tol)
         children = [(columns[k], c_tokens, child) for k, (_x0, c_tokens, child) in enumerate(children)]
-        children = self._split_lost_items(children, vocab, tol)
+        children = self._split_lost_items(children, vocab, tol, self.joined_blocks)
         # a block the sequence says is more of an item above it (its would-be letter belongs to a later
         # item) is joined to that item - the one at its own level - before the rows are built
         merged, sequenced, where = [], [], {}

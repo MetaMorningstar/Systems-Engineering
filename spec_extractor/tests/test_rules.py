@@ -2544,6 +2544,167 @@ def test_an_item_that_lost_its_marker_in_a_single_spaced_list_is_split_off_by_th
     assert [m for m, *_ in out] == ["a.", "b.", "d."] and "goes from 'b.' to 'd.'" in out[1][2], out
 
 
+# ---- a third adversarial review of the fixes above ----
+def _row_page(rows: list, y0: int = 300) -> list:
+    """rows: text at the margin, [(indent_px, text), ...] pieces on one row, or None for a blank line."""
+    lines, y = [], y0
+    for row in rows:
+        if row is not None:
+            for x, t in ([(0, row)] if isinstance(row, str) else row):
+                lines.append(make_line(t, LEFT + x, y))
+        y += PITCH
+    return lines
+
+
+def test_a_label_list_stays_a_list_when_a_caption_or_table_sentence_follows_it():
+    """Labels on tab stops under a lead-in, then a blank line and the NEXT table's caption, or a sentence that
+    begins 'Table 4 ...': still one list row per label, not a table."""
+    items_ = [("", "Input voltage:", ["22 to 29 VDC."]), ("", "Ripple:", ["1 V peak to peak maximum."]),
+              ("", "Power:", ["150 W maximum."]), ("", "Transients:", ["as in MIL-STD-704F."])]
+    assert not se._is_caption_text("Table 4 gives the limits for each mode.")
+    assert se._is_caption_text("TABLE II. Connector J1 pin assignments.")
+    for after in ("TABLE II. Connector J1 pin assignments.", "Table 4 gives the limits for each mode."):
+        _doc, items = run({1: _tab_list(items_, stem="3.2.6 Input power. The unit shall meet the following:", after=after)},
+                          settings(detect_tables=True, borderless_tables=True))
+        rows = [r.text for r in requirements(items)]
+        assert not [it for it in items if it.item_type == "Table" and "|" in it.text], (after, [(it.item_type, it.text) for it in items])
+        assert rows[:2] == ["The unit shall meet the following: Input voltage: 22 to 29 VDC.",
+                            "The unit shall meet the following: Ripple: 1 V peak to peak maximum."], (after, rows)
+
+
+def test_a_short_list_beside_a_column_of_prose_is_not_read_across():
+    """Two columns: a short list on the left, prose on the right - narrow (27 characters), ragged, with one
+    numbered paragraph, or a second list of its own. Each column is read on its own."""
+    docs = ["a. MIL-STD-461G", "b. MIL-STD-704F", "c. MIL-STD-810H", "d. MIL-STD-1275E", "e. MIL-STD-1553B"]
+    narrow = ["The unit shall operate from", "the 28 VDC aircraft bus and", "shall draw no more than 150",
+              "W in any mode of operation.", "The unit shall start within", "two seconds of the"]
+    ragged = ["The unit shall operate from", "the 28 VDC aircraft bus and shall", "draw no more than 150 W in",
+              "any mode of operation. The unit", "shall start within two seconds of", "the application of power."]
+    titled = ["3.4 Cooling. The unit shall be", "cooled by forced air. Humidity", "shall not degrade cooling in any",
+              "mode. The inlet air shall be at", "25 C at the unit inlet."]
+    second = ["a. The radar shall search.", "b. The radar shall track.", "c. The radar shall map.",
+              "d. The radar shall show weather.", "e. The radar shall answer."]
+    for right, xr in ((narrow, 480), (ragged, 560), (titled, 560), (second, 700)):
+        lines = [make_line(t, LEFT + 40, 300 + k * PITCH) for k, t in enumerate(docs)]
+        lines += [make_line(t, LEFT + xr, 300 + k * PITCH) for k, t in enumerate(right)]
+        _doc, items = run({1: lines})
+        mixed = [r.text for r in requirements(items) if "MIL-STD" in r.text and "unit shall" in r.text + "radar shall"
+                 and ("shall" in r.text)]
+        assert not mixed, (right[0], [r.text for r in requirements(items)])
+
+
+def test_a_lettered_paragraph_with_its_first_line_indented_is_read_whole():
+    """'A. General: The contractor shall provide all labor, materials' with its next line back at the margin:
+    the sentence wraps, it does not end the item."""
+    _doc, items = run({1: _row_page(["3.1 Installation.", [(75, "A. General: The contractor shall provide all labor, materials")],
+                                     "and equipment needed to install the system at each site.", None,
+                                     [(75, "B. Cabling: The contractor shall route all cables through")],
+                                     "the existing cable trays and shall label each cable at both ends."])})
+    texts_ = [r.text for r in requirements(items)]
+    assert any(t.endswith("materials and equipment needed to install the system at each site.") for t in texts_), texts_
+    assert any(t.endswith("through the existing cable trays and shall label each cable at both ends.") for t in texts_), texts_
+
+
+def test_a_value_that_wraps_back_under_its_label_is_not_read_as_the_label():
+    """'a.  Vibration   20 Hz to 2000 Hz random, applied in' / 'each of three axes as follows:' under the label,
+    then (1) and (2): the value stays in order and the sub-items stay under a."""
+    _doc, items = run({1: _row_page(["3.2.4 Environmental conditions. The equipment shall meet each of the following:",
+                                     [(80, "a."), (220, "Vibration"), (560, "20 Hz to 2000 Hz random, applied in")],
+                                     [(220, "each of three axes as follows:")], [(300, "(1) Level: 0.04 g2/Hz.")],
+                                     [(300, "(2) Duration: 3 hours per axis.")],
+                                     [(80, "b."), (220, "Shock"), (560, "40 g, 11 ms half-sine pulse.")]])})
+    rows = _refs_and_texts(items)
+    assert rows[:2] == [("3.2.4 a.1", "a. Vibration 20 Hz to 2000 Hz random, applied in each of three axes as follows: "
+                                      "(1) Level: 0.04 g2/Hz."),
+                        ("3.2.4 a.2", "a. Vibration 20 Hz to 2000 Hz random, applied in each of three axes as follows: "
+                                      "(2) Duration: 3 hours per axis.")], rows
+
+
+def test_capital_letters_are_judged_per_list_level():
+    """'A. Operating conditions:' with 'a. Temperature ...', 'b. Humidity ...' below it: the capitals are the
+    list's own letters, not misreads - a sub-list in small letters does not change that."""
+    c = CHAR_W
+    _doc, items = run({1: _row_page(["3.2.4 Environment. The unit shall meet the following conditions:",
+                                     [(5 * c, "A. Operating conditions:")], [(9 * c, "a. Temperature: -40 C to +71 C.")],
+                                     [(9 * c, "b. Humidity: 95 percent.")], [(5 * c, "B. Storage conditions:")],
+                                     [(9 * c, "a. Temperature: -55 C to +85 C.")]])})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.2.4 A.a", "3.2.4 A.b", "3.2.4 B.a"], [(r.doc_ref, r.text) for r in rows]
+    assert not any(r.review_reasons for r in rows), [r.review_reasons for r in rows]
+
+
+def test_a_numbered_heading_with_a_full_stop_still_opens_its_section():
+    """'4. Verification.' followed by '4.1 General. ...' is a heading even after a list; '5. Packaging.' /
+    '6. Notes.' / '6.1 Intended use. ...' are empty sections, not a list."""
+    doc, items = run({1: make_lines(["3.9 Modes. The radar shall provide the following modes:", "a. Search mode.",
+                                     "b. Track mode.", "4. Verification.",
+                                     "4.1 General. The contractor shall verify each requirement."])})
+    assert [r.doc_ref for r in requirements(items)] == ["3.9 a", "3.9 b", "4.1"], [(r.doc_ref, r.text) for r in requirements(items)]
+    assert requirements(items)[-1].section.startswith("4 Verification"), requirements(items)[-1].section
+    doc, items = run({1: make_lines(["4.3 Records. The contractor shall keep the test records.", None, "5. Packaging.",
+                                     "6. Notes.", "6.1 Intended use. The unit is intended for use in aircraft."])})
+    assert [b.kind for b in doc.blocks if b.text[:3] in ("5. ", "6. ")] == ["heading", "heading"], \
+        [(b.kind, b.text) for b in doc.blocks]
+
+
+def test_a_requirement_after_a_colon_less_list_keeps_its_own_row():
+    """'... the following information.' with short plain items, then 'The display shall be readable in direct
+    sunlight.' at the same indent: a requirement of its own, not one more item. The first item may share the
+    lead-in's block (single-spaced)."""
+    stem = "3.2.6 Displays. The display shall show the following information."
+    _doc, items = run({1: make_lines([stem, None, (75, "Own ship position and heading."), None,
+                                      (75, "Target range and bearing."), None,
+                                      (75, "The display shall be readable in direct sunlight.")])})
+    rows = [r.text for r in requirements(items)]
+    assert not any(t.endswith("information. The display shall be readable in direct sunlight.") for t in rows), rows
+    assert any(t.endswith("The display shall be readable in direct sunlight.") for t in rows), rows
+    _doc, items = run({1: make_lines([stem, (75, "Own ship position and heading."), (75, "Target range and bearing."),
+                                      (75, "Time of day."), (75, "Waypoint number."), None,
+                                      "3.2.7 Mass. The display shall weigh less than 5 kg."])})
+    taken = [r.text.split("information. ", 1)[1] for r in requirements(items) if r.doc_ref == "3.2.6"]
+    assert taken == ["Own ship position and heading.", "Target range and bearing.", "Time of day.", "Waypoint number."], \
+        [(r.doc_ref, r.text) for r in requirements(items)]
+
+
+def test_a_list_that_counts_in_twos_or_repeats_a_misread_letter_is_not_split():
+    """Tests numbered 1., 3., 5. skip on purpose: no item is invented and nothing is flagged. 'a.', 'c.', 'c.', 'd.'
+    is a misread 'b.' - corrected, not split."""
+    f = se.RequirementExtractor._sequence_markers
+    tokens = lambda text: [(w, 1.0, "") for w in text.split()]
+    kids = lambda texts: [(100, tokens(t), se.Block("list_item", 1, (0, 0, 1, 1))) for t in texts]
+    out = f(kids(["1. Visual examination.", "3. Insulation resistance.", "5. Dielectric withstanding voltage."]), 10)
+    assert [m for m, *_ in out] == ["1.", "3.", "5."] and not any(note for _, _, note, _ in out), out
+    _doc, items = run({1: make_lines(["3.2.4 Modes. The radar shall provide the following modes:",
+                                      (75, "a.   Search mode, with a scan of 120 degrees."), (150, "The scan rate shall be 60 degrees per second."),
+                                      (75, "c.   Track mode."), (75, "c.   Ground mapping mode."), (75, "d.   Test mode.")])})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.2.4 a", "3.2.4 b", "3.2.4 c", "3.2.4 d"], [(r.doc_ref, r.text) for r in rows]
+    assert rows[0].text.endswith("The scan rate shall be 60 degrees per second."), rows[0].text
+
+
+def test_the_next_numbered_item_after_a_split_off_sentence_stays_in_the_list():
+    """'2. Track mode, ...' whose second sentence starts on its own line, then '3. Ground mapping mode.': item 3 is
+    the next item (its number follows 2), not a section heading that would swallow the rest of the page."""
+    c = CHAR_W
+    _doc, items = run({1: _row_page(["3.2.4 Modes. The radar shall provide the following modes:", [(5 * c, "1. Search mode.")],
+                                     [(5 * c, "2. Track mode, with up to 20 targets in track.")],
+                                     [(8 * c, "Tracks shall be updated once per second.")], [(5 * c, "3. Ground mapping mode.")],
+                                     None, "3.2.5 Weight. The radar shall weigh less than 45 kg."])})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["3.2.4 1", "3.2.4 2", "3.2.4 3", "3.2.5"], [(r.doc_ref, r.text) for r in rows]
+    assert rows[-1].section == "", rows[-1].section
+    # a list of tests that counts in twos: '5.' after '3.' (and its second sentence) is still the next item
+    _doc, items = run({1: _row_page(["4.3.2 Retest. The following tests shall be repeated after vibration:",
+                                     [(5 * c, "1. Visual examination.")],
+                                     [(5 * c, "3. Insulation resistance, measured at 500 VDC.")],
+                                     [(8 * c, "Readings shall be recorded on the data sheet.")],
+                                     [(5 * c, "5. Dielectric withstanding voltage.")], None,
+                                     "4.3.3 Records. The contractor shall keep all test records."])})
+    rows = requirements(items)
+    assert [r.doc_ref for r in rows] == ["4.3.2 1", "4.3.2 3", "4.3.2 5", "4.3.3"], [(r.doc_ref, r.text) for r in rows]
+    assert not any(r.review_reasons for r in rows), [r.review_reasons for r in rows]
+
+
 def _line_at(text: str, box: tuple) -> se.Line:
     """An OCR line at a box measured on a real scan, its words spread over the box's width."""
     x0, y0, x1, y1 = box
