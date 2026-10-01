@@ -1,0 +1,10 @@
+# Word templates put in this folder (your organisation's .dotx/.docx, or one made with
+# make_word_template.bat) stay on this computer: they are not committed to git, because a
+# template can carry logos, classification markings, author names and server paths.
+# If your repository is internal and should keep the template, delete these lines.
+*.docx
+*.dotx
+*.docm
+*.dotm
+*.doc
+*.dot
