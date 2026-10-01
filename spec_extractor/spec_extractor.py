@@ -968,15 +968,24 @@ class OrientationDetector:
                 # (verified: content turned 90 deg clockwise -> label "90"), so the
                 # correction is the remaining angle to a full turn.
                 rotation = (360 - int(label)) % 360
-                if rotation:
+                if rotation or self._sparse(gray):
                     # Rotated pages are rare and the classifier can confuse opposite directions on
-                    # sparse pages (title pages): confirm against the opposite turn with OCR.
+                    # sparse pages (title pages, a page with a few lines at its top and foot): confirm
+                    # against the opposite turn with OCR - on a sparse page also when it says upright.
                     rotation = self._ocr_vote(gray, ocr, (rotation, (rotation + 180) % 360))
                 return rotation
             except Exception:
                 pass
         # Fallback without the classifier: find the reading direction, then let OCR decide.
         return self._ocr_vote(gray, ocr, (90, 270) if self._text_runs_vertically(gray, ocr) else (0, 180))
+
+    @staticmethod
+    def _sparse(gray: "np.ndarray") -> bool:
+        """A page with little text - a title page, the last lines of a section: under a fifth of its rows of
+        pixels hold any ink (a page of text has a third or more)."""
+        scale = min(1.0, 600 / max(gray.shape))
+        small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        return float((small < 128).any(axis=1).mean()) < 0.2
 
     @staticmethod
     def _text_runs_vertically(gray: "np.ndarray", ocr: "RapidOcrEngine") -> bool:
@@ -991,17 +1000,22 @@ class OrientationDetector:
 
     @staticmethod
     def _ocr_vote(gray: "np.ndarray", ocr: "RapidOcrEngine", candidates: tuple) -> int:
-        """Read a band of the page in each candidate direction; upright text reads confidently."""
+        """Read a band of the page in each candidate direction; upright text reads confidently. The band is the
+        part of the page that holds the most text (a page whose text sits at its top and foot has none in the
+        middle), and when neither direction reads better the page is left upright - turned pages are rare."""
         scale = min(1.0, 1400 / max(gray.shape))
         small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         best, best_score = candidates[0], -1.0
         for rot in candidates:
             img = rotate_right_angle(small, rot)
             h = img.shape[0]
-            band = img[int(0.2 * h):int(0.65 * h), :]
+            win = max(1, int(0.45 * h))
+            ink = np.concatenate([[0], np.cumsum((img < 128).sum(axis=1))])
+            top = int(np.argmax(ink[win:] - ink[:-win])) if h > win else 0
+            band = img[top:top + win, :]
             lines = ocr.read(band, min_conf=0.3)
             score = sum(ln.conf * len(ln.text) for ln in lines if ln.conf >= 0.6)
-            if score > best_score:
+            if score > best_score or (score == best_score and rot == 0):
                 best, best_score = rot, score
         return best
 
@@ -1502,6 +1516,12 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
         tbox = (int(et.bbox.x1), int(et.bbox.y1), int(et.bbox.x2), int(et.bbox.y2))
         pad = 0.02 * dpi
         inside = {i for i, ln in enumerate(lines) if box_center_inside(ln.box, tbox, pad) and i not in claimed}
+        # a caption close under the last row ("TABLE I. Interface characteristics.") can be read into that row's
+        # cells ("100 Mohm at 500 VDC TABLE I. ..."): it is given back before the cells are filled
+        under = _caption_under_table(inside, lines)
+        if under is not None:
+            inside.discard(under)
+            tbox = (tbox[0], min(lines[i].box[1] for i in inside), tbox[2], max(lines[i].box[3] for i in inside))
         inside_order = sorted(inside)
         grid, conf, merges, n_unique, n_filled, words_in_cells, words_grid, row_lines = _fill_cells(
             cell_boxes, [lines[i] for i in inside_order])
@@ -1509,7 +1529,7 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
         # A caption that img2table swallowed as the first/last row is given back. It may fill one merged
         # cell or be split over a few cells ("TABLE II." | "Interface signals"), so the row's joined text
         # is tested. A "list of tables" (many rows starting "Table n") is left alone.
-        caption_lines = []
+        caption_lines = [under] if under is not None else []
         for edge in (0, -1):
             if len(grid) < 3:
                 break
@@ -1572,6 +1592,21 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
     if settings.borderless_tables:
         results += detect_aligned_tables(lines, dpi, claimed)
     return results
+
+
+def _caption_under_table(inside: set, lines: list):
+    """The index of the line that is the table's caption printed UNDER it ("TABLE I. Interface characteristics."):
+    the last line of the area, the only one there that reads as a caption, below at least two rows of the table.
+    None when there is no such line - or several caption-like lines (a list of tables)."""
+    caps = [i for i in inside if RE_CAPTION.match(lines[i].text.strip()) and _is_caption_text(lines[i].text)]
+    if len(caps) != 1 or len(inside) < 3:
+        return None
+    box = lines[caps[0]].box
+    h = max(1, box[3] - box[1])
+    others = [lines[j].box for j in inside if j != caps[0]]
+    if any(b[3] > box[1] + 0.5 * h for b in others):
+        return None                                   # a line level with it or below it: not under the table
+    return caps[0]
 
 
 def _et_box(et) -> Box:
@@ -2150,6 +2185,9 @@ def detect_aligned_tables(lines: list, dpi: float, claimed: set) -> list:
                 run.append(m)                 # another row of the table
                 m += 1
                 continue
+            row_text = " ".join(lines[i].text for i in rows[m]["ids"]).strip()
+            if RE_CAPTION.match(row_text) and _is_caption_text(row_text):
+                break                         # "TABLE I. Interface characteristics." close under it: its caption
             # A line with no cells of its own is a cell still wrapping, but only while it sits
             # tight against the line above the way wrapped lines do; set off by more than that it
             # is the caption of the next table, or the text below this one. However MANY wrapped
@@ -2832,6 +2870,27 @@ def _ends_sentence(text: str) -> bool:
     return bool(RE_TERMINAL.search(text))
 
 
+# Small letters that have the same shape as their capitals: the scan may read the capital of a title as one of
+# these ("3.2.7 output. The power supply ..."), as it reads the list marker 'C.' for 'c.'
+_SAME_SHAPE_LETTERS = set("cosvwxz")
+_NOT_TITLE_STARTS = {"of", "or", "on", "so", "see", "section", "sub", "subparagraph", "subsection", "clause",
+                     "chapter", "sheet", "series", "volume", "version", "shall", "will", "was", "with", "without",
+                     "within", "whichever", "over", "outside", "for", "to", "and"}
+
+
+def _lowercased_title(rest: str) -> bool:
+    """'output. The power supply ...' after a paragraph number - a run-in title of one to six words and a full
+    stop or colon, then a sentence, whose first letter the scan read in lower case. Only for letters whose
+    small and capital forms have the same shape (c, o, s, v, w, x, z), and not for a word that starts a
+    phrase ('3.2.4 of MIL-STD-810') or a unit ('3.2.4 s. The ...')."""
+    t = re.match(r"(?P<title>[a-z][A-Za-z-]*(?: [A-Za-z][A-Za-z-]*){0,5})[.:]\s+[A-Z(\"]", rest or "")
+    if not t or rest[:1] not in _SAME_SHAPE_LETTERS:
+        return False
+    first = t.group("title").split()[0]
+    return (first.lower() not in _NOT_TITLE_STARTS and not RE_UNIT.fullmatch(first)
+            and not _modal_re().search(t.group("title")))
+
+
 def _is_titled_number(text: str) -> bool:
     """'3.1 Power. The unit shall ...' / '3.2.4.1 Mode switching. The radar ...' - a numbered paragraph
     with a run-in title followed by a sentence. A value that starts with a number ('2.5 G sustained
@@ -2928,7 +2987,9 @@ def _starts_new_item(text: str) -> bool:
     if RE_LIST_MARKER.match(t) or RE_CAPTION.match(t):
         return True
     m = RE_PARA_NUM.match(t)
-    if m and "." in m.group("num") and m.group("rest")[:1].isupper() and not _starts_with_unit(m.group("rest")):
+    if m and "." in m.group("num") and not _starts_with_unit(m.group("rest")) and (
+            m.group("rest")[:1].isupper()
+            or (m.group("num").count(".") >= 2 and _lowercased_title(m.group("rest")))):   # "3.2.5 weight. The ..."
         return True
     m = RE_NUMBERED_ITEM.match(t)
     if m and m.group("rest")[:1].isupper():
@@ -2968,6 +3029,13 @@ _NOT_LABELS = {"NOTE", "NOTES", "CAUTION", "CAUTIONS", "WARNING", "WARNINGS", "R
                "EXCEPTION", "EXCEPTIONS", "REMARK", "REMARKS", "NB", "COMMENT", "COMMENTS"}
 
 
+def _lowered_label(text: str) -> bool:
+    """'current:  The unit shall ...' - an item's label whose capital the scan read as the small letter of the same
+    shape (c, o, s, v, w, x, z; see _lowercased_title)."""
+    t = (text or "").strip()
+    return t[:1] in _SAME_SHAPE_LETTERS and _is_item_label(t[:1].upper() + t[1:])
+
+
 def _is_item_label(text: str) -> bool:
     """'Acceleration:  5 g ...' / 'Input voltage:' - a list item's label. A notice ('NOTE:', 'WARNING:')
     is not an item of the list above it, and 'SRS-101:' is a requirement ID, not a label."""
@@ -2989,7 +3057,7 @@ def _starts_list_item(text: str, row: list) -> bool:
     shape = RE_MARKER_SHAPE.match(text)
     if shape and re.fullmatch(r"[A-Z][.)]", shape.group("marker")) and _is_item_label(shape.group("rest")):
         return True
-    return bool(_is_item_label(text) and len(row) > 1)
+    return bool((_is_item_label(text) or _lowered_label(text)) and len(row) > 1)
 
 
 def _opens_sub_list(text: str) -> bool:
@@ -3104,6 +3172,10 @@ def _page_stats(rows: list) -> _PageStats:
         if overlap_x > 0 and 0 <= gap < 2 * line_h:
             gaps.append(gap)
     line_gap = float(np.percentile(gaps, 30)) if gaps else 0.35 * line_h
+    if len(gaps) < 3:
+        # two gaps cannot tell a double-spaced page from a short one whose lines are all separated by blank lines
+        # (the top of a page that carries a list on): single spacing is taken, so a blank line still ends a block
+        line_gap = min(line_gap, 0.35 * line_h)
     para_gap = float(np.clip(line_gap + 0.5 * line_h, 0.6 * line_h, 1.5 * line_h))
     return _PageStats(line_h, line_gap, para_gap)
 
@@ -3246,7 +3318,12 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                 same_spacing = gap <= 1.3 * (prev_box[1] - before_box[3]) + 0.1 * stats.line_h
             else:
                 same_spacing = False
-            continues = (wrapped and gap < 3 * stats.line_h and not _starts_new_item(row_text) and not RE_LIST_MARKER.match(row_text)
+            # A line that ends in the middle of a phrase ("... twenty targets in track at") cannot end the
+            # sentence there: a next line in lower case carries it on, also when the typist broke the line
+            # early and the next word would have fitted
+            mid_phrase = not sentence_ended and bool(_ENDS_MID_PHRASE.search(prev_text)) and row_text[:1].islower()
+            continues = ((wrapped or mid_phrase) and gap < 3 * stats.line_h and not _starts_new_item(row_text)
+                         and not RE_LIST_MARKER.match(row_text)
                          and (row_text[:1].islower() or row_text[:1].isdigit() or same_spacing))
             wider_gap = gap > stats.line_gap + 0.25 * stats.line_h and not wrapped
             # A new bullet / list marker at the same indent as the block's first line is a sibling item, even
@@ -3264,14 +3341,17 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             in_list = _starts_list_item(first_text, current[0])
             item_by_indent = (in_list and sentence_ended and not continues
                               and abs(row_box[0] - first_box[0]) <= 0.6 * stats.line_h
-                              and (row_text[:1].isupper() or row_text[:1].isdigit()))
+                              and (row_text[:1].isupper() or row_text[:1].isdigit() or _lowered_label(row_text)))
             # "C. MIL-STD-810H" level with "b. MIL-STD-704F": the next letter of the list, misread, starts
             # the next item even though items without final punctuation never "end a sentence"
             first_marker = (RE_LIST_MARKER.match(first_text) or RE_NUMBERED_ITEM.match(first_text)) if in_list else None
             row_shape = RE_MARKER_SHAPE.match(row_text)
             next_in_sequence = bool(first_marker and row_shape and _next_marker(first_marker.group("marker")).lower()
                                     == row_shape.group("marker").lower() and abs(row_box[0] - first_box[0]) <= 0.6 * stats.line_h)
-            row_is_item = bool(RE_LIST_MARKER.match(row_text) or strong_id or item_by_indent or next_in_sequence
+            # "C.   Shock:   40 g ..." - a marker, then a label: the row of a list item, also when the scan read the
+            # marker as a capital and the block above is not a list item (a value carried on from the page before)
+            label_row = bool(row_shape and len(row_shape.group("marker")) <= 3 and _is_item_label(row_shape.group("rest")))
+            row_is_item = bool(RE_LIST_MARKER.match(row_text) or strong_id or item_by_indent or next_in_sequence or label_row
                                or (_starts_with_delimited_id(row_text) and (sentence_ended or next_word_fits or wider_gap)))
             sibling_item = row_is_item and row_box[0] <= first_box[0] + 0.6 * stats.line_h
             # a line back left of a list item's first line ends it - also when the item's own marker was
@@ -3304,13 +3384,17 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             # "Shock:  40 g ..." in the label column after a finished item: the next item, its marker lost
             lost_marker = (at_label and sentence_ended and not opens_sub_list and _is_item_label(row_text)
                            and bool(RE_ITEM_LABEL.match(first_text.split(None, 1)[-1])))
+            new_requirement = row_text[:1].isupper() and bool(_modal_re().search(row_text))
             hanging = (in_list and not _is_heading_text(first_text) and not lost_marker and not opens_sub_list
                        and (at_label or at_value)
                        and not RE_LIST_MARKER.match(row_text) and not RE_NUMBERED_ITEM.match(row_text)
                        and not _is_titled_number(row_text)          # "3.2.4.1 Mode switching. The ..." is a paragraph
                        and -0.3 * stats.line_h <= gap < 2.5 * stats.line_h
-                       # after a blank line, a finished item is only carried on in its VALUE column
-                       and not (gap > stats.para_gap and sentence_ended and not at_value))
+                       # after a blank line, a finished item is only carried on in its VALUE column - and so is an
+                       # item without a full stop ("b. Track mode") when the line starts a requirement of its own
+                       # ("The operator shall select ...")
+                       and not (not at_value and ((gap > stats.para_gap and sentence_ended)
+                                                  or ((gap > stats.para_gap or wider_gap) and new_requirement))))
             new_block = (
                 gap < -0.3 * stats.line_h                                        # jumped back up (new column)
                 or (leaf_idx != current_leaf and x_overlap < 0.3 * narrow)          # different column
@@ -3328,8 +3412,10 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                 or (max(prev_h, row_h) > 1.45 * max(1, min(prev_h, row_h)))         # font size change
                 or lost_marker                                                      # next item, marker lost
                 or numbered_next                                                    # 3.5 -> 3.5.1
-                # a new sentence after a blank line under a finished item, outside its value column
-                or (in_list and sentence_ended and wider_gap and not at_value and row_text[:1].isupper())
+                # a new sentence after a blank line under a finished item, outside its value column - or a
+                # requirement of its own under an item without a full stop ("b. Track mode" / "The operator shall")
+                or (in_list and wider_gap and not at_value
+                    and ((sentence_ended and row_text[:1].isupper()) or new_requirement))
             )
             if new_block and hanging and max(prev_h, row_h) <= 1.45 * max(1, min(prev_h, row_h)):
                 new_block = False
@@ -3397,9 +3483,12 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
         last_rest = RE_NUMBERED_ITEM.match(out[run[-1]].text).group("rest").strip()
         opens_section = bool(next_num and re.fullmatch(rf"{numbers[-1]}\.0?1", clean_para_number(next_num.group("num")))
                              and word_count(last_rest) <= 8 and not _modal_re().search(last_rest))
-        # right under a lead-in ("... the following modes:") consecutive numbers are its list, wherever they sit
+        # right under a lead-in ("... the following modes:") consecutive numbers are its list, wherever they sit -
+        # after a colon also when they are all capitals ("... shall apply:" / "1. MIL-STD-461G" / "2. MIL-STD-704F")
         lead_before = before is not None and before.page == out[k].page and _introduces_list(before.text)
-        if after_stem or after_item or (consecutive and lead_before):     # a list
+        from_one = numbers[0] == 1 and all(y == x + 1 for x, y in zip(numbers, numbers[1:]))
+        colon_list = lead_before and before.text.rstrip().endswith(":") and from_one
+        if after_stem or after_item or (consecutive and lead_before) or colon_list:     # a list
             for x in (run[:-1] if opens_section else run):
                 out[x].kind, out[x].meta = "list_item", {"marker": numbered_heading(out[x]).group("marker")}
         elif consecutive and not opens_section:        # "1. Note text ...", "2. ..." (but "5. Packaging." /
@@ -4714,6 +4803,7 @@ class RequirementExtractor:
         and '[SRS-101] The GCS shall ...' -> ('SRS-101', '', body, offset).
         'MK-54 torpedo ...' and '3.3 V shall ...' are left alone (a designator and a quantity)."""
         ref, title, body = "", "", text
+        lowered = False                  # the title's capital was read as a small letter ("3.2.7 output. The ...")
         prefixes = getattr(self, "id_prefixes", Counter())
         m = RE_LEADING_ID.match(body)
         if m and (("-" in m.group("id") or "_" in m.group("id")) and
@@ -4721,11 +4811,14 @@ class RequirementExtractor:
             ref, body = m.group("id"), m.group("rest")
         else:
             m = RE_PARA_NUM.match(body)
-            if (m and ("." in m.group("num") or m.group("dot")) and m.group("rest")[:1].isupper()
-                    and not _starts_with_unit(m.group("rest"))):
-                ref, body = clean_para_number(m.group("num")), m.group("rest")
+            if m and ("." in m.group("num") or m.group("dot")) and not _starts_with_unit(m.group("rest")):
+                lowered = m.group("rest")[:1].islower() and m.group("num").count(".") >= 2 \
+                    and _lowercased_title(m.group("rest"))
+                if m.group("rest")[:1].isupper() or lowered:
+                    ref, body = clean_para_number(m.group("num")), m.group("rest")
         if ref:
-            t = re.match(r"^(?P<title>[A-Z][^.:;!?\[\]]{0,80}?)[.:]{1,3}['`·,]?(?:\s+|(?=[A-Z]))(?P<body>[A-Z\[(\"].*)$", body, re.S)
+            t = re.match(r"^(?P<title>[A-Z][^.:;!?\[\]]{0,80}?)[.:]{1,3}['`·,]?(?:\s+|(?=[A-Z]))(?P<body>[A-Z\[(\"].*)$",
+                         body[:1].upper() + body[1:] if lowered else body, re.S)
             if (t and word_count(t.group("title")) <= 8 and not _modal_re().search(t.group("title"))
                     and not re.search(r"\s(?:The|A|An|This|These|Each|All|Any)\s", t.group("title"))):
                 title, body = t.group("title").strip(), t.group("body")
@@ -4786,8 +4879,10 @@ class RequirementExtractor:
         text_h = statistics.median([max(ln.box[3] for ln in r) - min(ln.box[1] for ln in r) for r in rows])
         tops = [min(ln.box[1] for ln in r) for r in rows]
         bottoms = [max(ln.box[3] for ln in r) for r in rows]
-        gaps = [b - a for a, b in zip(bottoms, tops[1:]) if b > a]
-        row_gap = statistics.median(gaps) if gaps else 0.6 * text_h
+        # the item's own line spacing: lines whose boxes touch or overlap (tall OCR boxes) are single-spaced, and so
+        # is taken an item of one line - otherwise a blank line under it would count as "right under"
+        gaps = [b - a for a, b in zip(bottoms, tops[1:])]
+        row_gap = max(0.0, statistics.median(gaps)) if gaps else 0.25 * text_h
         gap = nb.box[1] - above.box[3]
         if gap <= row_gap + 0.5 * text_h:
             return True                                              # right under the item
@@ -5113,8 +5208,9 @@ class RequirementExtractor:
         item is flagged instead (see _sequence_markers). A block that was joined on to the item after a
         finished sentence (see _continues_item), starting in its text column, is such a line too."""
         def marker(k):
+            # (a capital the scan made of the next letter - "C." for "c." - still counts: see _lone_gap)
             t = tokens_text(children[k][1])[0]
-            m = RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t)
+            m = RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t) or RE_MARKER_SHAPE.match(t)
             return m.group("marker") if m and _marker_parts(m.group("marker")) else ""
 
         markers = [marker(k) for k in range(len(children))]
@@ -5177,7 +5273,9 @@ class RequirementExtractor:
             c.  Shock:   40 g ...
 
         After an item that ends with ':' the marker style changes and a new sequence starts ((1), a., i.),
-        and the parent's style comes back after it (or the list ends): those items are its sub-items."""
+        and the parent's style comes back after it (or the list ends): those items are its sub-items. The
+        parent's next letter read as a capital ('C.' after 'b.', a common misread) is the parent's style
+        coming back, unless the sub-list itself is lettered in capitals (A., B., C.)."""
         def marker(k):
             t = tokens_text(children[k][1])[0]
             m = RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t) or RE_MARKER_SHAPE.match(t)
@@ -5187,17 +5285,25 @@ class RequirementExtractor:
             opening, core, closing = _marker_parts(mk)
             return opening, closing, "n" if core.isdigit() else "r" if len(core) > 1 else "U" if core.isupper() else "l"
 
+        def parents_style(mk, parent, run):
+            if style(mk) == style(parent):
+                return True
+            core = _marker_parts(mk)[1]
+            capital_run = bool(run) and style(markers[run[0]])[2] == "U"
+            return (len(core) == 1 and core.isupper() and style(parent)[2] == "l" and not capital_run
+                    and mk.lower() == _next_marker(parent).lower())
+
         markers = [marker(k) for k in range(len(children))]
         out, k = list(columns), 0
         while k < len(children):
             if markers[k] and tokens_text(children[k][1])[0].rstrip().endswith(":"):
                 run, j = [], k + 1
                 while (j < len(children) and markers[j] and abs(columns[j] - columns[k]) <= tol
-                       and style(markers[j]) != style(markers[k])):
+                       and not parents_style(markers[j], markers[k], run)):
                     run.append(j)
                     j += 1
                 resumes = j == len(children) or (markers[j] and abs(columns[j] - columns[k]) <= tol
-                                                  and style(markers[j]) == style(markers[k]))
+                                                  and parents_style(markers[j], markers[k], run))
                 if run and not _previous_marker(markers[run[0]]) and resumes:
                     for r in run:
                         out[r] = columns[k] + 3 * tol

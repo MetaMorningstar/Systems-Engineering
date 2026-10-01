@@ -180,6 +180,20 @@ def test_quantity_is_not_a_paragraph_number():
     assert row.text == "3.3 V shall be supplied to the logic card." and row.doc_ref == "", (row.text, row.doc_ref)
 
 
+def test_a_title_whose_capital_was_read_in_lower_case_keeps_its_number():
+    """'3.2.7 output. The ...': the scan read the capital 'O' of the title as 'o' (letters such as c, o, s, v, w
+    have the same shape in both cases). The paragraph keeps its number and its title (case TAB-44); a phrase
+    after the number ('3.2.4 of MIL-STD-810') is not a title."""
+    _, items = run({1: make_lines(["3.2.7 output. The power supply output shall be 28 VDC."])})
+    row = find(items, "28 VDC")
+    assert (row.doc_ref, row.title, row.text) == ("3.2.7", "Output", "The power supply output shall be 28 VDC."), \
+        (row.doc_ref, row.title, row.text)
+    for text in ("2.5 output. The unit shall be tested.", "3.2.4 of MIL-STD-810. The unit shall be tested.",
+                 "3.2.4 ripple. The unit shall be tested."):
+        _, items = run({1: make_lines([text])})
+        assert find(items, "tested").doc_ref == "", text
+
+
 def test_designators_are_not_requirement_ids():
     _, items = run({1: make_lines(["MK-54 torpedo tubes shall be inspected before loading.", None,
                                    "The harness shall mate with connector (J3) and breaker (CB12)."])})
@@ -537,6 +551,39 @@ def test_caption_row_inside_table_is_given_back_and_merges_shift():
         values = [[c.value for c in row][:3] for row in sheet.iter_rows(min_row=5, max_row=8)]
         assert merged == ["C6:C7"], merged
         assert values[3] == ["Power", "140 W", "Nominal rating"], values
+
+
+def test_a_caption_under_the_last_row_is_given_back_not_read_into_it():
+    """'TABLE I. Interface characteristics.' printed close under a table's last row, where the reader stretched
+    that row down over it: it is the table's caption, not more text of the row's cell (case TBL-14)."""
+    xs, ys = [300, 700, 1300, 1600], [400, 460, 520, 580, 700]           # the last row reaches over the caption
+    rows = {r: [(xs[c], ys[r], xs[c + 1], ys[r + 1]) for c in range(3)] for r in range(4)}
+    lines = _grid_lines({(0, 0): "Voltage:", (0, 1): "28 VDC nominal", (0, 2): "Test", (1, 0): "Current:",
+                         (1, 1): "5 A maximum", (1, 2): "Test", (2, 0): "Impedance:", (2, 1): "50 ohm", (2, 2): "Analysis",
+                         (3, 0): "Isolation:", (3, 1): "100 Mohm at 500 VDC", (3, 2): "Test"}, xs, ys)
+    lines.append(make_line("TABLE I. Interface characteristics.", xs[1] - 80, ys[3] + 70, height=28))
+    restore = _fake_img2table(rows, (xs[0], ys[0], xs[3], ys[4]))
+    try:
+        table, _tbox, _inside, caption_lines = se.detect_tables(blank_page().ocr_image, lines, DPI,
+                                                                settings(detect_tables=True))[0]
+    finally:
+        restore()
+    assert table.grid[-1] == ["Isolation:", "100 Mohm at 500 VDC", "Test"], table.grid
+    assert [lines[i].text for i in caption_lines] == ["TABLE I. Interface characteristics."], caption_lines
+
+
+def test_a_caption_close_under_an_aligned_table_is_not_a_wrapped_line_of_its_last_row():
+    """A borderless table found from its aligned text, with 'TABLE I. Interface characteristics.' tight under its
+    last row: the caption ends the table - it is not the last row's text wrapping on (case TBL-14)."""
+    rows = [("Voltage:", "28 VDC nominal", "Test"), ("Current:", "5 A maximum", "Test"),
+            ("Impedance:", "50 ohm", "Analysis"), ("Isolation:", "100 Mohm at 500 VDC", "Test")]
+    lines = [make_line(t, LEFT + x, 400 + k * 50) for k, row in enumerate(rows) for x, t in zip((40, 480, 1100), row)]
+    lines.append(make_line("TABLE I. Interface characteristics.", LEFT + 400, 400 + 3 * 50 + 50))
+    found = se.detect_aligned_tables(lines, DPI, set())
+    assert len(found) == 1, found
+    table, _tbox, inside, _caps = found[0]
+    assert table.grid[-1] == ["Isolation:", "100 Mohm at 500 VDC", "Test"], table.grid
+    assert len(lines) - 1 not in inside
 
 
 def test_caption_split_over_cells_is_given_back():
@@ -1159,6 +1206,24 @@ def test_evenly_sized_rows_are_never_collapsed():
              for r in range(4)]
     assert se._collapse_header_band(grid, conf, boxes, [[[] for _ in range(4)] for _ in grid], []) == []
     assert len(grid) == 4 and grid[0][0] == "Notes", grid
+
+
+def test_a_page_with_little_text_has_its_orientation_checked_by_reading_it():
+    """The orientation classifier can take a page with a few lines at its top and foot for an upside-down one, and
+    the other way round (case PAGE-05). Such a page counts as sparse, so its orientation is checked by reading it
+    both ways; when neither reading is better the page stays upright."""
+    sparse = np.full((2420, 1870), 255, np.uint8)
+    for y in (220, 1960, 2010, 2060):
+        sparse[y:y + 30, 220:1500] = 0
+    full = np.full((2420, 1870), 255, np.uint8)
+    for y in range(220, 2200, 42):
+        full[y:y + 30, 220:1650] = 0
+    assert se.OrientationDetector._sparse(sparse) and not se.OrientationDetector._sparse(full)
+
+    class ReadsNothing:
+        def read(self, image, min_conf=0.3):
+            return []
+    assert se.OrientationDetector._ocr_vote(sparse, ReadsNothing(), (180, 0)) == 0
 
 
 def test_unrotate_box_maps_sideways_text_back_to_the_page():
@@ -2314,13 +2379,24 @@ def test_a_sub_list_in_the_value_column_stays_under_its_own_item():
 
 def test_a_sub_list_printed_without_its_own_indent_is_nested_by_its_markers():
     """'b. Vibration:' then '(1) Random: ...', '(2) Sine: ...' at the same indent, then 'c. Shock:': the marker
-    style changes after a line ending ':' and comes back, so (1) and (2) belong to b."""
-    items_ = [TAB_ITEMS[0], ("b.", "Vibration:", []), ("(1)", "Random:", ["20 Hz to 2000 Hz, 0.04 g2/Hz."]),
-              ("(2)", "Sine:", ["5 Hz to 500 Hz, 2 g peak."]), TAB_ITEMS[2]]
-    _doc, items = run({1: _tab_list(items_)})
+    style changes after a line ending ':' and comes back, so (1) and (2) belong to b. The parent's next letter
+    read as a capital ('C.' for 'c.', a common misread) still ends the sub-list (case TAB-30); a sub-list that
+    is itself lettered in capitals keeps its own 'C.'."""
+    sub = [("b.", "Vibration:", []), ("(1)", "Random:", ["20 Hz to 2000 Hz, 0.04 g2/Hz."]),
+           ("(2)", "Sine:", ["5 Hz to 500 Hz, 2 g peak."])]
+    _doc, items = run({1: _tab_list([TAB_ITEMS[0]] + sub + [TAB_ITEMS[2]])})
     rows = _refs_and_texts(items)
     assert [ref for ref, _ in rows][:4] == ["3.2.4 a", "3.2.4 b.1", "3.2.4 b.2", "3.2.4 c"], rows
     assert rows[1][1] == "b. Vibration: (1) Random: 20 Hz to 2000 Hz, 0.04 g2/Hz.", rows
+    _doc, items = run({1: _tab_list([TAB_ITEMS[0]] + sub + [("C.",) + TAB_ITEMS[2][1:], TAB_ITEMS[3]])})
+    rows = _refs_and_texts(items)
+    assert [ref for ref, _ in rows][:5] == ["3.2.4 a", "3.2.4 b.1", "3.2.4 b.2", "3.2.4 c", "3.2.4 d"], rows
+    assert rows[3][1].startswith("c. Shock: 40 g"), rows
+    capitals = [("A.", "Random:", ["20 Hz to 2000 Hz."]), ("B.", "Sine:", ["5 Hz to 500 Hz."]),
+                ("C.", "Shock:", ["40 g, 11 ms."])]
+    _doc, items = run({1: _tab_list([TAB_ITEMS[0], ("b.", "Vibration:", [])] + capitals + [("c.",) + TAB_ITEMS[3][1:]])})
+    rows = _refs_and_texts(items)
+    assert [ref for ref, _ in rows][:5] == ["3.2.4 a", "3.2.4 b.A", "3.2.4 b.B", "3.2.4 b.C", "3.2.4 c"], rows
 
 
 def test_a_label_that_wraps_is_read_before_its_value_even_when_the_value_is_shorter():
@@ -2385,6 +2461,12 @@ def test_a_numbered_list_is_not_taken_for_section_headings_by_the_paragraph_afte
     assert [b.kind for b in doc.blocks if b.text.startswith(("3. ", "4. "))] == ["list_item", "heading"], \
         [(b.kind, b.text) for b in doc.blocks]
     assert [r.doc_ref for r in requirements(items)] == ["3.9 1", "3.9 2", "3.9 3", "4.1"]
+    # all capitals at the margin, straight under a lead-in that ends with ':' (case NUM-10)
+    _doc, items = run({1: make_lines(["2.1 Government documents. The following documents shall apply:",
+                                      "1. MIL-STD-461G", "2. MIL-STD-704F", None,
+                                      "2.2 Order of precedence. The text of this specification shall take precedence."])})
+    assert _refs_and_texts(items) == [("2.1 1", "1. MIL-STD-461G"), ("2.1 2", "2. MIL-STD-704F"),
+                                      ("2.2", "The text of this specification shall take precedence.")], _refs_and_texts(items)
 
 
 def test_a_cross_reference_with_a_title_carries_a_value_onto_the_next_page():
@@ -2603,6 +2685,114 @@ def test_a_lettered_paragraph_with_its_first_line_indented_is_read_whole():
     texts_ = [r.text for r in requirements(items)]
     assert any(t.endswith("materials and equipment needed to install the system at each site.") for t in texts_), texts_
     assert any(t.endswith("through the existing cable trays and shall label each cable at both ends.") for t in texts_), texts_
+
+
+def test_an_item_broken_early_with_its_next_line_back_at_the_margin_is_read_whole():
+    """'b. Track mode, holding up to twenty targets in' / 'track at the same time.' back at the margin, although
+    the next word would have fitted on the line above (a typist's early break): a line that ends in the middle of
+    a phrase ('in', 'at', 'the') carries on, and the list goes on to c. (case LST-16)."""
+    _doc, items = run({1: _row_page(["3.2.3 Controls. The display shall have a brightness control and a",
+                                     "contrast control on its front panel. Each control shall be",
+                                     "illuminated for night use and shall be operable with gloved hands",
+                                     "in all environmental conditions specified herein.", None,
+                                     "3.2.4 Modes. The radar shall provide the following modes:",
+                                     [(75, "a. Search mode, with a scan of 120 degrees in azimuth and")],
+                                     "60 degrees in elevation at all ranges.",
+                                     [(75, "b. Track mode, holding up to twenty targets in")],
+                                     "track at the same time.",
+                                     [(75, "c. Ground mapping mode.")], None,
+                                     "3.2.5 Weight. The radar shall weigh less than 45 kg."])})
+    rows = _refs_and_texts(items)
+    assert rows[2:5] == [("3.2.4 a", "a. Search mode, with a scan of 120 degrees in azimuth and 60 degrees in "
+                                     "elevation at all ranges."),
+                         ("3.2.4 b", "b. Track mode, holding up to twenty targets in track at the same time."),
+                         ("3.2.4 c", "c. Ground mapping mode.")], rows
+
+
+def test_a_lost_marker_is_split_off_before_a_marker_read_as_a_capital():
+    """'a.   Search mode.' / '     Track mode.' / 'C.   Ground mapping mode.' single-spaced: the scan lost 'b.' and
+    read 'c.' as 'C.'. The markers still skip exactly one letter, so 'Track mode.' is split off as b (case LST-10)."""
+    _doc, items = run({1: _row_page(["3.2.4 Modes. The radar shall provide the following modes:",
+                                     [(75, "a.   Search mode.")], [(150, "Track mode.")],
+                                     [(75, "C.   Ground mapping mode.")], None,
+                                     "3.2.5 Weight. The radar shall weigh less than 45 kg."])})
+    rows = requirements(items)
+    stem = "The radar shall provide the following modes:"
+    assert [(r.doc_ref, r.text) for r in rows[:3]] == [
+        ("3.2.4 a", f"{stem} a. Search mode."), ("3.2.4 b", f"{stem} b. Track mode."),
+        ("3.2.4 c", f"{stem} c. Ground mapping mode.")], [(r.doc_ref, r.text) for r in rows]
+    assert any("missing" in n for n in rows[1].review_reasons), rows[1].review_reasons
+
+
+def _recorded_lines(rows: list) -> list:
+    """OCR lines recorded from a real scan: (text, (x0, y0, x1, y1)) in the OCR's pixels (220 dpi), with the
+    words spread over the line as in a typewriter font."""
+    out = []
+    for text, (x0, y0, x1, y1) in rows:
+        cw, words, pos = (x1 - x0) / len(text), [], 0
+        for token in text.split(" "):
+            if token:
+                words.append(se.Word(token, 0.98, (round(x0 + pos * cw), y0, round(x0 + (pos + len(token)) * cw), y1)))
+            pos += len(token) + 1
+        out.append(se.Line(text, 0.98, (x0, y0, x1, y1), words))
+    return out
+
+
+def test_a_requirement_after_a_blank_line_does_not_hang_on_an_item_without_a_full_stop():
+    """'b. Track mode' (no full stop), a blank line, then 'The operator shall select ...' in the item's text
+    column: a requirement of its own, not more of item b. The lines are those the OCR read on case LST-25."""
+    _doc, items = run({1: _recorded_lines([
+        ("3.2.4 Modes. The radar shall provide the following modes:", (212, 214, 1375, 259)),
+        ("a. Search mode", (313, 257, 610, 300)), ("b. Track mode", (315, 300, 590, 340)),
+        ("The operator shall select the mode from the front panel.", (375, 382, 1513, 426)),
+        ("3.2.5 Weight. The radar shall weigh less than 45 kg.", (212, 462, 1273, 514))])})
+    assert _refs_and_texts(items) == [("3.2.4 a", "a. Search mode"), ("3.2.4 b", "b. Track mode"),
+                                      ("3.2.4", "The operator shall select the mode from the front panel."),
+                                      ("3.2.5", "The radar shall weigh less than 45 kg.")], _refs_and_texts(items)
+
+
+def test_a_page_of_three_lines_separated_by_blank_lines_is_not_one_block():
+    """The top of a page that carries a list on: a value line, a blank line, 'C.  Shock:  40 g ...' (the marker
+    read as a capital), a blank line, '3.2.5 weight. The ...' (the title's capital read as a small letter). Two
+    gaps cannot say how the page is spaced; they are taken as blank lines, so the three stay apart (case PAGE-01:
+    they were one block, and item c and 3.2.5 were lost in the value of the item above)."""
+    doc, _items = run({1: _recorded_lines([
+        ("3 hours per axis, 7.7 g rms overall.", (779, 215, 1512, 259)), ("C.", (298, 328, 341, 358)),
+        ("Shock:", (409, 320, 543, 361)), ("40 g, 11 ms half-sine pulse.", (778, 318, 1354, 366)),
+        ("3.2.5 weight. The equipment shall not exceed 45 kilograms.", (213, 401, 1395, 448))])})
+    texts = [b.text for b in doc.blocks]
+    assert len(texts) == 3 and texts[2].startswith("3.2.5"), texts
+    assert se._starts_new_item("3.2.5 weight. The equipment shall not exceed 45 kilograms.")
+    assert not se._starts_new_item("3.2.5 of MIL-STD-704F. The unit shall be tested.")
+
+
+def test_a_list_row_whose_marker_was_read_as_a_capital_starts_a_new_block():
+    """The top of a page that carries a tab list on: its first line is the value of the item above, then
+    'C.  Shock:  40 g ...' - a marker and a label, although the scan read 'c.' as 'C.' - then 3.2.5. The item row
+    is not more of the value above it (case PAGE-01: item c was lost in item b)."""
+    doc, _items = run({1: _recorded_lines([
+        ("3 hours per axis, 7.7 g rms overall.", (778, 214, 1512, 260)), ("C.", (299, 287, 342, 316)),
+        ("Shock:", (409, 278, 543, 320)), ("40 g, 11 ms half-sine pulse.", (778, 277, 1353, 325)),
+        ("3.2.5 Weight. The equipment shall not exceed 45 kilograms.", (212, 359, 1396, 408))])})
+    assert [b.text for b in doc.blocks] == ["3 hours per axis, 7.7 g rms overall.", "C. Shock: 40 g, 11 ms half-sine pulse.",
+                                            "3.2.5 Weight. The equipment shall not exceed 45 kilograms."], \
+        [b.text for b in doc.blocks]
+
+
+def test_a_label_whose_capital_was_read_as_a_small_letter_still_starts_an_item():
+    """Labels on tab stops under a lead-in: 'Voltage:', then 'current:' (the scan read 'C' as 'c'), 'Weight:',
+    'Cooling:'. Each is an item of its own (case TBL-12: 'current:' was joined to the item above)."""
+    _doc, items = run({1: _recorded_lines([
+        ("3.2.1 Interface. The interface shall have the following properties:", (214, 215, 1574, 259)),
+        ("Voltage:", (273, 287, 442, 332)), ("The unit shall operate from 28 VDC.", (698, 284, 1414, 331)),
+        ("current:", (274, 339, 441, 383)), ("The unit shall draw less than 5 A.", (699, 342, 1393, 382)),
+        ("Weight:", (273, 397, 424, 439)), ("The unit shall weigh less than 5 kg.", (696, 393, 1432, 441)),
+        ("Cooling:", (272, 448, 442, 497)), ("The unit shall be cooled by forced air.", (698, 449, 1490, 492)),
+        ("3.2.5 Weight. The equipment shall not exceed 45 kilograms.", (213, 532, 1395, 578))])})
+    assert [t for _, t in _refs_and_texts(items)][:4] == [
+        "Voltage: The unit shall operate from 28 VDC.", "current: The unit shall draw less than 5 A.",
+        "Weight: The unit shall weigh less than 5 kg.", "Cooling: The unit shall be cooled by forced air."], \
+        _refs_and_texts(items)
 
 
 def test_a_value_that_wraps_back_under_its_label_is_not_read_as_the_label():
@@ -2828,6 +3018,29 @@ def test_unreadable_image_page_does_not_stop_the_file():
 # =====================================================================================================================
 # Tested configuration: supported Python versions and the pinned package versions (constraints.txt)
 # =====================================================================================================================
+def test_the_case_library_is_well_formed_and_its_catalog_is_up_to_date():
+    """tests/cases: every case has its own ID shaped like 'TAB-01', a page, and the rows (or tables) the tool must
+    produce; and CASEBOOK.pdf was written from the current cases and rule tests. After adding or changing a case,
+    or a test in this file, run: python tests/cases/build_cases.py"""
+    sys.path.insert(0, str(HERE / "cases"))
+    import casekit
+    import pypdfium2
+    cases = casekit.load_cases()                     # (checks IDs, pages and expectations as it loads them)
+    assert len(cases) >= 100, len(cases)
+    for c in cases:
+        assert c.title and c.situation and c.risk and c.source, c.id
+        assert all(r.doc_ref is not None and r.content for r in c.expect), c.id
+    catalog = HERE / "cases" / "CASEBOOK.pdf"
+    assert catalog.exists(), "tests/cases/CASEBOOK.pdf is missing - run: python tests/cases/build_cases.py"
+    pdf = pypdfium2.PdfDocument(str(catalog))
+    try:
+        keywords = pdf.get_metadata_dict().get("Keywords", "")
+    finally:
+        pdf.close()
+    assert keywords == f"casebook-fingerprint:{casekit.catalog_fingerprint()}", \
+        "tests/cases/CASEBOOK.pdf is out of date - run: python tests/cases/build_cases.py"
+
+
 def test_python_version_check():
     ok = dict(is_64bit=True, free_threaded=False)
     for version in [(3, 10, 21), (3, 11, 16), (3, 12, 3), (3, 13, 15), (3, 14, 6), (3, 14, 99)]:
