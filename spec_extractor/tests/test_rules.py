@@ -3372,6 +3372,16 @@ def test_a_template_that_could_reach_outside_or_run_code_is_refused_with_what_to
                 out.writestr(item, blob)
             out.writestr("word/vbaProject.bin", b"\0" * 64)
         refused(hidden, "macros")
+        activex = folder / "activex.docx"                           # ActiveX controls: Save As does not remove them
+        with zipfile.ZipFile(macro) as z, zipfile.ZipFile(activex, "w") as out:
+            for item in z.namelist():
+                blob = z.read(item)
+                if item == "[Content_Types].xml":
+                    blob = blob.replace(b"</Types>", b'<Override PartName="/word/activeX/activeX1.xml" ContentType='
+                                                     b'"application/vnd.ms-office.activeX+xml"/></Types>')
+                out.writestr(item, blob)
+            out.writestr("word/activeX/activeX1.xml", b"<ax/>")
+        refused(activex, "ActiveX", "Design Mode")
         dtd = folder / "dtd.docx"
         with zipfile.ZipFile(_word_template(folder, "plain.docx")) as z, zipfile.ZipFile(dtd, "w") as out:
             for item in z.namelist():
@@ -3638,9 +3648,11 @@ def test_the_template_is_looked_for_next_to_the_style_file():
 
 
 def test_a_mistake_in_the_style_file_stops_the_run_before_any_page_is_read():
+    """The run stops before any document is read, and the message is in the log file as well as on the screen."""
     with tempfile.TemporaryDirectory() as tmp:
         bad = Path(tmp) / "bad.ini"
         bad.write_text("[body]\nsize = ten\n", encoding="utf-8")
+        (Path(tmp) / "scan.pdf").write_bytes(b"%PDF-1.4 (never read)")
         reader = se.SpecExtractor.process_file
 
         def must_not_run(*_args, **_kwargs):
@@ -3656,8 +3668,12 @@ def test_a_mistake_in_the_style_file_stops_the_run_before_any_page_is_read():
                 assert se.main([str(Path(tmp) / "scan.pdf"), "--word-style", str(Path(tmp) / "missing.ini"),
                                 "-o", tmp]) == 2
             assert "Line 2: [body]  size = ten" in printed.getvalue() and "does not exist" in printed.getvalue()
+            log = (Path(tmp) / "spec_extractor_log.txt").read_text(encoding="utf-8")
+            assert "Line 2: [body]  size = ten" in log and "does not exist" in log, log
         finally:
             se.SpecExtractor.process_file = reader
+            for handler in logging.getLogger().handlers:
+                handler.close()
             logging.getLogger().handlers.clear()
             logging.basicConfig(level=logging.ERROR)
 

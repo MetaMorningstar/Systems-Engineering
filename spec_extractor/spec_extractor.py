@@ -55,7 +55,7 @@ USEFUL OPTIONS  (run  python spec_extractor.py --help  for the full list)
   --word-style FILE         another style file for the Word report's look
   --debug-images            also save the cleaned page images
 
-THE LOOK OF THE WORD REPORT  (README.md: "How the Word report looks")
+THE LOOK OF THE WORD REPORT  (README.md: "The look of the Word report")
   * Fonts, sizes, spacing, page layout: word_style\\report_style.ini (Notepad).
   * Your organisation's own Word template: put the .dotx (or .docx) in the
     word_style folder and write its name in that file:
@@ -273,7 +273,7 @@ LOG = logging.getLogger("spec_extractor")
 # and states the result in the log, the Excel "Run Info" sheet and the Word report. A difference does not
 # stop the run, but the documented accuracy was not measured for it, so it is reported prominently.
 CONSTRAINTS_FILE = Path(__file__).resolve().with_name("constraints.txt")
-# How the Word report looks (fonts, sizes, spacing, page layout, your own Word template): see section 11
+# The look of the Word report (fonts, sizes, spacing, page layout, your own Word template): see section 11
 DEFAULT_WORD_STYLE_FILE = Path(__file__).resolve().with_name("word_style") / "report_style.ini"
 RESULT_PACKAGES = ("rapidocr", "onnxruntime", "opencv-python", "opencv-contrib-python", "img2table", "numpy",
                    "pillow", "pypdfium2", "pyclipper", "shapely", "rapid-orientation", "pyspellchecker",
@@ -6739,10 +6739,12 @@ def _read_word_template(path: Path) -> WordTemplate:
     suffix = path.suffix.lower()
     if suffix in (".docm", ".dotm"):
         raise ReportLookError(f"'{name}' can hold macros, so it is not used. In Word, open it and choose File > Save "
-                              "As > 'Word Template (*.dotx)', then write the new name in the style file.")
+                              "As > 'Word Template (*.dotx)' (answer Yes if Word asks about saving without macros), "
+                              "save it in the word_style folder, then write the new name in the style file.")
     if suffix in (".doc", ".dot", ".rtf", ".odt", ".ott"):
         raise ReportLookError(f"'{name}' is not in Word's current format. In Word, open it and choose File > Save As "
-                              "> 'Word Template (*.dotx)', then write the new name in the style file.")
+                              "> 'Word Template (*.dotx)', save it in the word_style folder, then write the new name "
+                              "in the style file.")
     if suffix not in (".docx", ".dotx"):
         raise ReportLookError(f"'{name}' is not a Word template: use a .dotx or .docx file.")
     try:
@@ -6762,11 +6764,16 @@ def _read_word_template(path: Path) -> WordTemplate:
     if not main or not package.has(main):
         raise ReportLookError(f"{what} has no document in it; it is not a Word .docx/.dotx file.")
     main_type = package.content_type(main)
-    if _MAIN_PART_TYPES.get(main_type) in (".docm", ".dotm") or any(
-            "macroenabled" in t.lower() or "vbaproject" in t.lower() or "activex" in t.lower()
-            for t in package.types.values()):
-        raise ReportLookError(f"{what} contains macros or ActiveX controls, so it is not used. In Word, choose File > "
-                              "Save As > 'Word Template (*.dotx)' (which removes them) and use the new file.")
+    types = [t.lower() for t in package.types.values()]
+    if _MAIN_PART_TYPES.get(main_type) in (".docm", ".dotm") or any("macroenabled" in t or "vbaproject" in t
+                                                                     for t in types):
+        raise ReportLookError(f"{what} contains macros, so it is not used. In Word, choose File > Save As > 'Word "
+                              "Template (*.dotx)' (answer Yes if Word asks about saving without macros), save it in "
+                              "the word_style folder and write the new name in the style file.")
+    if any("activex" in t for t in types):
+        raise ReportLookError(f"{what} contains ActiveX controls (boxes or buttons added from Word's Developer tab), so "
+                              "it is not used. Saving it again does not remove them: in Word, on the Developer tab "
+                              "click Design Mode, select each control, press Delete, and save the template again.")
     if main_type not in _MAIN_PART_TYPES:
         raise ReportLookError(f"{what} is not a Word document or template (it says it holds '{main_type or '?'}'). "
                               "If it was saved as 'Strict Open XML', save it again as 'Word Template (*.dotx)'.")
@@ -8435,14 +8442,6 @@ def main(argv: Optional[list] = None) -> int:
         LOG.error("--pages: %s", exc)
         return _pause_if_dialog(used_dialog, 2)
     configure_keywords(settings.keywords)
-    look = None
-    if settings.make_word_report:          # a mistake in the style file or template is reported now, not after the OCR
-        try:
-            look = report_look(settings)
-        except ReportLookError as exc:
-            LOG.error("%s", exc)
-            return _pause_if_dialog(used_dialog, 2)
-        settings.word_look = look          # (the look checked now is the one every report of this run uses)
     files = collect_input_files(inputs, settings.recursive)
     if not files:
         LOG.error("No PDF/TIFF/image files found in: %s", ", ".join(map(str, inputs)))
@@ -8453,7 +8452,13 @@ def main(argv: Optional[list] = None) -> int:
     _setup_logging(out_dir, args.verbose)
     LOG.info("%s - %d file(s) - engine: %s - output: %s", version_line(), len(files), settings.engine, out_dir)
     report_configuration(docling_used=settings.engine == "docling")
-    if look is not None:
+    if settings.make_word_report:          # a mistake in the style file or template is reported now, not after the OCR
+        try:                               # (and in the log file as well as on the screen)
+            look = report_look(settings)
+        except ReportLookError as exc:
+            LOG.error("%s", exc)
+            return _pause_if_dialog(used_dialog, 2)
+        settings.word_look = look          # (the look checked now is the one every report of this run uses)
         LOG.info("Word report look: %s", look.summary)
         for note in look.template.notes if look.template else []:
             LOG.info("  from the template, %s", note)

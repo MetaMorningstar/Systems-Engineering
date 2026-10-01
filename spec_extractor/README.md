@@ -64,7 +64,7 @@ Requirements are recognised in all the usual layouts:
 3. Double-click **`setup_windows.bat`**. This is a one-time step of a few minutes that creates a private `.venv` environment with **exactly the package versions the tool was tested with** (`constraints.txt`). It picks a tested Python by itself, and says what to install if there is none.
 4. Double-click **`run_extractor.bat`** and pick PDF/TIFF files. If you press *Cancel*, you get a folder picker instead. You can also **drag and drop** files or folders onto `run_extractor.bat` (Windows cannot pass a name containing `&` this way: rename the file, or use the picker). The folder may be on a network share.
 5. Open the `extraction_output` folder next to your documents.
-6. Optional: to give the Word report your organisation's look, put your Word template in the `word_style` folder and name it in `word_style\report_style.ini`. See [Using your organisation's Word template, step by step](#using-your-organisations-word-template-step-by-step).
+6. Optional: to give the Word report your organisation's look, put your Word template in the `word_style` folder and write its name in the style file `word_style\report_style.ini`. See [Using your organisation's Word template, step by step](#using-your-organisations-word-template-step-by-step).
 
 From a terminal (any OS):
 
@@ -131,7 +131,7 @@ The Word report (`<name>_verification.docx`) can be made to look like your organ
 
 * **Use your organisation's Word template.** The template's fonts, heading styles, colours, page size, margins, header and footer (logo, classification marking, page numbers) are then used for every report. See the steps just below.
 * **Restyle the report in Word itself**, with `make_word_template.bat`. See [Restyling the report in Word](#restyling-the-report-in-word).
-* **Change single values**, such as a font, a heading size, the spacing or the paper size, in the settings file `word_style\report_style.ini`. See [Changing single values](#changing-single-values-fonts-sizes-spacing-page-layout).
+* **Change single values**, such as a font, a heading size, the spacing or the paper size, in the *style file* `word_style\report_style.ini`. This is a text file of settings that you open in Notepad. See [Changing single values](#changing-single-values-fonts-sizes-spacing-page-layout).
 
 None of this changes what the tool reads or what goes into the Excel file; only the look of the Word report changes. Trying a change is quick. The slow reading of a scan is kept in the `_cache` folder, so running a document again only writes its reports again, which takes seconds.
 
@@ -140,8 +140,14 @@ None of this changes what the tool reads or what goes into the Excel file; only 
 **1. Get the template file.**
 
 * A Word template from your organisation (a `.dotx` file) can be used as it is.
-* A Word document that already looks right (a `.docx` file) can be used too. Only its look is used, never its text.
-* A `.dotm` or `.docm` file (these can hold macros), or an old `.dot` or `.doc` file, is not used. Open it in Word, choose **File > Save As**, set *Save as type* to **Word Template (\*.dotx)** and save. Word then suggests its *Custom Office Templates* folder: save it in the `word_style` folder of step 2 instead, or copy it there afterwards.
+* A Word document that already looks right (a `.docx` file) can be used too. Its styles, page layout, headers and footers are used, but not the text on its pages.
+  * The text in its headers and footers does go into every report, including what their fields show, such as a document number, a title or an author's name. So choose a document whose header and footer hold nothing that belongs to that one document, or delete such text from them first.
+  * Never use a finished verification report, or any other document with sensitive content: the file stays in the `word_style` folder, and goes wherever that folder is copied. To restyle the report itself, use `make_word_template.bat` (see [Restyling the report in Word](#restyling-the-report-in-word)).
+* A `.dotm` or `.docm` file (these can hold macros), or an old `.dot` or `.doc` file, is not used. To make a usable copy:
+  1. Open it in Word and choose **File > Save As**.
+  2. Set *Save as type* to **Word Template (\*.dotx)**.
+  3. If Word asks whether to save it without macros, choose **Yes**.
+  4. Word suggests its *Custom Office Templates* folder. Choose the `word_style` folder of step 2 instead, or copy the file there afterwards.
 
 **2. Copy the template into the `word_style` folder.** This folder is inside the tool's folder, next to `spec_extractor.py`:
 
@@ -151,15 +157,15 @@ spec_extractor\
     make_word_template.bat
     spec_extractor.py
     word_style\
-        report_style.ini          <- the settings file (step 3)
+        report_style.ini          <- the style file (step 3)
         Company Report.dotx       <- put your template here
 ```
 
-**3. Write the template's name in the settings file.**
+**3. Write the template's name in the style file.**
 
-1. Open `word_style\report_style.ini` in Notepad: right-click it, then choose *Open with* > *Notepad*.
-2. Near the top, under `[document]`, find the line `template =`.
-3. After it, write the template's file name exactly as it is spelt, including its ending (`.dotx` or `.docx`).
+1. Open `word_style\report_style.ini` in Notepad: right-click it, then choose *Open with* > *Notepad*. This is the *style file*; the tool's messages call it that.
+2. Near the top, under `[document]`, find the line that is just `template =`, with nothing in front of it. The line a little above it, `;     template = Company Report.dotx`, is only an example: a line that starts with a semicolon (`;`) is a comment, which the tool ignores.
+3. Change that line: after `template =`, write the template's file name exactly as it is spelt, including its ending (`.dotx` or `.docx`). Do not add a second `template =` line; a setting written twice stops the run.
 4. Save the file with **File > Save**.
 
 ```ini
@@ -171,15 +177,19 @@ template = Company Report.dotx
 * If Windows hides file endings, File Explorer's *Type* column shows *Microsoft Word Template* for a `.dotx` file and *Microsoft Word Document* for a `.docx` file.
 * A template kept in another folder can be given with its full path, for example `template = C:\Templates\Company Report.dotx`.
 
-**4. Run the tool as usual.** Double-click `run_extractor.bat`, or run `python spec_extractor.py ...`. Among the first lines of the run is the look that is used, followed by what was left out of the template:
+**4. Run the tool as usual.** Double-click `run_extractor.bat`, or run `python spec_extractor.py ...`. Among the first lines of the run is the look that is used, followed by what was left out of the template or changed in it:
 
 ```text
 Word report look: template Company Report.dotx (sha256 3f9a1c7e2b40), report_style.ini (nothing changed)
   from the template, its link to an attached template was left out (file:///\\fileserver\templates\Corporate.dotm)
+  from the template, field(s) DOCPROPERTY in the footer became the text they showed
   from the template, its own text was left out (only its styles, page layout, headers and footers are used)
 ```
 
-The same lines are written to `spec_extractor_log.txt`. If the template cannot be used, or the settings file has a mistake, the run stops at this point, before any document is read. The message says what to do (see [When the template is refused](#when-the-template-is-refused-or-the-report-does-not-look-right)).
+* These lines are information only; the run goes on.
+* The code after `sha256` identifies the template file. Yours will be different. It changes whenever the template is saved again, so it also shows that a new version was used.
+* The same lines are written to `spec_extractor_log.txt` in the output folder.
+* If the template cannot be used, or the style file has a mistake, the run stops at this point, before any document is read. The message, shown in the window and written to `spec_extractor_log.txt`, says what to do. See [When the template is refused](#when-the-template-is-refused-or-the-report-does-not-look-right).
 
 **5. Check the report.** Open `<name>_verification.docx`. It now has the template's fonts and heading styles, its page size and margins, and its header and footer. The summary at the top of the report and the *Run Info* sheet of the Excel file name the template that was used.
 
@@ -198,7 +208,7 @@ Every report is a new Word document. Only the following are copied into it from 
 The following are never copied:
 
 * the template's own text;
-* its document properties (author, company, comments);
+* its document properties (author, company, comments). However, the text its header and footer show is copied, including what their fields showed, such as an author's name or a document number;
 * its link to an attached template, which is often on a network share;
 * macros, embedded objects, and anything else in the file.
 
@@ -214,7 +224,7 @@ All of this is because the reports may hold sensitive content, and a Word file c
 
 **Which style is used for each part of the report.** The report uses Word's usual style names, so a template that defines them gives the report its look straight away:
 
-| Part of the report | Word style | Section of the settings file |
+| Part of the report | Word style | Section of the style file |
 |---|---|---|
 | Report title | Title | `[title]` |
 | "Page 12", and "Page 12 - text read by the tool" | Heading 1, Heading 2 | `[heading 1]`, `[heading 2]` |
@@ -228,12 +238,14 @@ All of this is because the reports may hold sensitive content, and a Word file c
 | Running headers and footers read from the scan | Scanned Header Footer | `[scanned header footer]` |
 | The tool's own notes | Report Note | `[notes]` |
 
-A style the template does not have is added, with the look it has in the tool's own report but in the template's fonts:
+A style the template does not have is added, with the look it has in the tool's own report:
 
-* Word's standard styles, such as Heading 3 or Caption, take the template's theme fonts and colours.
-* The report's own styles (Requirement Text, Requirement Tag, Requirement Keyword, Table Heading, Table Text, Scanned Header Footer, Report Note) are based on the template's Normal style.
+* **Title and the headings** (often Heading 3 and Heading 4, because Word stores only the styles a file uses) take the template's *theme* fonts and colours. In Word, these are under *Design > Fonts* and *Design > Colors*. Many company templates set their font in each style instead. Then these headings come out in another font, often Calibri. To fix this, write your font under `[document]` in the style file (for example `font = Arial`), or set up those headings in the template.
+* **Caption** is black, italic and centred, in the body font. **List Paragraph** is like the body text, indented.
+* **The report's own paragraph styles** (Requirement Text, Table Text, Scanned Header Footer and Report Note) are based on the template's Normal style. Table Heading is based on Table Text.
+* **Requirement Tag and Requirement Keyword** change only the words they mark, which keep the font of their paragraph.
 
-To use a style of your template for a part instead, name it in the settings file. For example, if your requirements are normally set in a style called *Req Text*:
+To use a style of your template for a part instead, name it in the style file. For example, if your requirements are normally set in a style called *Req Text*:
 
 ```ini
 [requirements]
@@ -244,21 +256,24 @@ Write the name as Word's *Styles* pane shows it. For Word's built-in styles, use
 
 #### Restyling the report in Word
 
-1. Double-click **`make_word_template.bat`**. It writes `word_style\report_template.docx` and opens it in Word. The file holds every style the report uses, with a sample of each part of the report.
+1. Double-click **`make_word_template.bat`**. It writes `word_style\report_template.docx` and opens it in Word. The file holds every style the report uses, with a sample of each part of the report. If that file already exists, the new one is called `report_template (2).docx`, and so on. The window shows the name and the line to write in step 4.
 2. Change the styles there: on the *Home* tab open the *Styles* pane (Alt+Ctrl+Shift+S), right-click a style and choose *Modify*. For a logo, a classification marking or page numbers, double-click the top or bottom of the page and edit the header or footer. Page size and margins are on the *Layout* tab.
 3. Save the file, keeping the `.docx` format.
-4. In `word_style\report_style.ini`, write `template = report_template.docx` under `[document]`, and save.
+4. In `word_style\report_style.ini`, under `[document]`, change the `template =` line (the one with nothing in front of it) to `template = report_template.docx`, and save. If the window showed another name, such as `report_template (2).docx`, write that name instead. Do not add a second `template =` line.
 
-An existing file is never overwritten: the next one is called `report_template (2).docx`. If a template is already named in the settings file, the new file starts from that template. So this is also a quick way to see, and fine-tune, how your organisation's template looks in the report.
+An existing file is never overwritten. If a template is already named in the style file, the new file starts from that template. So this is also a quick way to see, and fine-tune, how your organisation's template looks in the report.
 
 #### Changing single values: fonts, sizes, spacing, page layout
 
-`word_style\report_style.ini` has a section for each part of the report, and every setting is explained inside the file.
+The style file `word_style\report_style.ini` already has a section for each part of the report, with a line for each setting, and every setting is explained inside the file.
+
+* To change a value, write it after the `=` of the line that is already there, and save.
+* Do not paste a second copy of a section or of a line. Each may appear only once, or the run stops.
 
 * A value left **empty** keeps the template's look. Without a template, it keeps the tool's own look, which the file shows in brackets.
 * A value you fill in always wins, even over the template. So fill in only what you want to change.
 
-For example:
+For example, after filling in these lines, the file contains:
 
 ```ini
 [document]
@@ -286,9 +301,12 @@ fill = D9D9D9
 
 How to write the values:
 
-* **Sizes and spacing** are in points, as in Word (`10.5`).
+* **Font sizes, and space before and after,** are in points, as in Word (`10.5`).
+* **Line spacing** is `single`, `double` or a number of lines (`1.15`, `1.5`). For a fixed height, add `pt` (`12 pt`), or write `at least 12 pt`.
 * **Indents and margins** need a unit: `cm`, `mm` or `in`.
-* **Colours** are the 6-character code from Word's *Font Color > More Colors > Custom* (`1F4E9A`), or a name such as `dark blue`.
+* **Text colours** are the 6-character code from Word's *Font Color > More Colors > Custom* (`1F4E9A`), or a name such as `dark blue`.
+* **Shading** (`fill`, `cell_fill`) takes only the 6-character code (`D9D9D9`); `fill = none` gives no shading.
+* **Highlights** take the name of one of Word's highlighter colours, such as `yellow`. The style file lists them.
 * **Switches** are `yes` or `no`.
 
 Two settings set the convention for requirement text:
@@ -298,22 +316,24 @@ Two settings set the convention for requirement text:
 
 `[table header row]` sets the shading of table heading rows, and repeats the heading row at the top of each page a long table runs onto. The review marks (highlighted words, shaded table cells) can be recoloured under `[review marks]`, but not switched off, because they are the point of the report.
 
-A mistake in the file stops the run **before any document is read**, with the line number and what to write instead. Examples are a misspelt setting, a size of "ten", or a style the template does not have. `--word-style FILE` uses another settings file, for example one per customer or program. Its template name is looked for next to that file.
+A mistake in the file stops the run **before any document is read**, with the line number and what to write instead. Examples are a misspelt setting, a size of "ten", or a style the template does not have. `--word-style FILE` uses another style file, for example one per customer or program. Its template name is looked for next to that file.
 
 #### When the template is refused, or the report does not look right
 
 | The message or problem | What to do |
 |---|---|
-| *... can hold macros, so it is not used* (a `.dotm` or `.docm` file), or *... contains macros or ActiveX controls* | In Word: **File > Save As**, *Save as type* **Word Template (\*.dotx)**. Write the new name in the settings file |
-| *... is not in Word's current format* (a `.dot` or `.doc` file) | The same: save it as **Word Template (\*.dotx)** |
-| *... is protected with a password* | Save an unprotected copy as **Word Template (\*.dotx)** and use that |
-| *The header of the template holds a picture that is not stored in the template* | The logo is linked to a file or a web address. In Word, open the header, delete the picture and insert it again with **Insert > Pictures > This Device**, without choosing *Link to File* |
-| *The header of the template holds an embedded object or control*, or *... something other than text and pictures* | Remove that object from the header or footer, or replace it with a picture of it |
+| *... can hold macros, so it is not used* (a `.dotm` or `.docm` file), or *... contains macros* | In Word: **File > Save As**, *Save as type* **Word Template (\*.dotx)**. If Word asks whether to save it without macros, choose **Yes**. Save it in the `word_style` folder (Word suggests another folder), then write the new name after `template =` in the style file |
+| *... contains ActiveX controls* | These are boxes or buttons added from Word's *Developer* tab, and saving again does not remove them. On the *Developer* tab click *Design Mode*, select each control, press Delete, and save the template again |
+| *... is not in Word's current format* (a `.dot` or `.doc` file) | The same: save it as **Word Template (\*.dotx)** in the `word_style` folder, and write the new name in the style file |
+| *... is protected with a password* | Save an unprotected copy as **Word Template (\*.dotx)** in the `word_style` folder, and use that |
+| *The header (or footer, first-page header ...) of the template holds a picture that is not stored in the template* | The picture is linked to a file or a web address. In Word, double-click the header or footer the message names. Delete the picture and insert it again with **Insert > Pictures > This Device**, without choosing *Link to File* |
+| *The header (or footer ...) of the template holds an embedded object or control*, or *... something other than text and pictures* | Remove that object from the header or footer, or replace it with a picture of it |
 | *The Word template named in report_style.ini was not found* | Check the spelling and the ending (`.dotx` or `.docx`). The message shows where the tool looked and lists the Word files in that folder |
 | *A style named in report_style.ini does not exist* | Write the style's name as Word's *Styles* pane shows it. The message lists similar names in the template |
 | *The page of the report would leave only ... in for the text* | The margins are wider than the paper allows. Make them smaller in the template or under `[page]` |
-| *The template ... could not be read* or *could not be used* | The file is damaged or unusual. Open it in Word, save it again as **Word Template (\*.dotx)** and use the new file |
-| The report does not look like the template | Check that the *Word report look* line of the run names your template. A value filled in in `report_style.ini` wins over the template: empty it |
+| *The template ... could not be read*, *could not be used*, *is damaged*, *is not a Word .docx/.dotx file* or *has no document in it* | The file is damaged, or is not really a Word file (for example a web page or an RTF file whose name ends in `.docx`). Open it in Word, save it again as **Word Template (\*.dotx)** in the `word_style` folder, and use the new file |
+| The report does not look like the template | Check that the *Word report look* line of the run names your template, and that the name is on the `template =` line itself, not on the example line above it that starts with `;`. A value filled in in the style file wins over the template: empty it |
+| The third-level headings and below are in another font (often Calibri) | The template sets its font in each style rather than in its theme, and has no Heading 3 or Heading 4 of its own. Write the font under `[document]` in the style file (`font = Arial`), or add those headings to the template |
 | The fonts look different on another computer | That computer does not have the template's font. Word then uses a similar one; install the font, or choose another in the template |
 
 **Keeping the template.** Templates put in the `word_style` folder are not committed to git (`word_style\.gitignore`), because a template can carry logos, classification markings, author names and server paths. If your repository is internal and should keep the template, delete those lines from `word_style\.gitignore`. Keep the `word_style` folder, with your template and `report_style.ini`, when you install a new version of the tool.
