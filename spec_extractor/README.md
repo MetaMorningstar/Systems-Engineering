@@ -1,11 +1,11 @@
 # Spec Extractor
 
-> ## Version 1.3.0
+> ## Version 1.4.0
 >
 > Every run prints this version together with a **build** fingerprint of the code that is actually running:
 >
 > ```
-> spec_extractor 1.3.0 (build a1b2c3d commit 4e5f6a7)
+> spec_extractor 1.4.0 (build a1b2c3d commit 4e5f6a7)
 > ```
 >
 > (the two short codes are examples - yours will differ)

@@ -52,7 +52,18 @@ USEFUL OPTIONS  (run  python spec_extractor.py --help  for the full list)
   --engine docling          optional: IBM Docling AI layout + table models
                             (needs extra install + one-time model download)
   --no-word                 skip the Word verification report
+  --word-style FILE         another style file for the Word report's look
   --debug-images            also save the cleaned page images
+
+THE LOOK OF THE WORD REPORT  (README.md: "How the Word report looks")
+  * Fonts, sizes, spacing, page layout: word_style\\report_style.ini (Notepad).
+  * Your organisation's own Word template: put the .dotx (or .docx) in the
+    word_style folder and write its name in that file:
+        [document]
+        template = Company Report.dotx
+    Only its styles, page layout, headers and footers are used.
+  * make_word_template.bat writes a Word file with every style of the report
+    and a sample of each, to restyle in Word and use as the template.
 
 HOW TO CHECK THE RESULTS (recommended routine)
   * Open <name>_verification.docx. Each page shows the scan, then the text the
@@ -133,7 +144,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 
 @functools.lru_cache(maxsize=1)
@@ -163,7 +174,7 @@ def build_id() -> str:
 
 
 def version_line() -> str:
-    """'spec_extractor 1.3.0 (build a1b2c3d)' - the one string every report shows."""
+    """'spec_extractor 1.4.0 (build a1b2c3d)' - the one string every report shows."""
     return f"spec_extractor {__version__} (build {build_id()})"
 
 # The Python versions this release passed both test levels on (64-bit, standard build).
