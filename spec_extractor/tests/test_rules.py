@@ -3543,6 +3543,11 @@ def test_a_style_file_saved_by_notepad_is_read():
                                             ("review marks", "check_highlight"): "bright green"}
         path.write_bytes("[document]\nfont = Fran\xe7ais Sans\n".encode("cp1252"))
         assert se.read_style_file(path) == {("document", "font"): "Fran\xe7ais Sans"}
+        path.write_bytes("[body]\r\nsize = 11\r\n".encode("utf-16"))           # Notepad's "Unicode"
+        assert se.read_style_file(path) == {("body", "size"): 11.0}
+        path.write_text('[page]\npaper = A4; the paper we use\n[body]\nfont = Arial  # our font\n[document]\n'
+                        'font = ""\n', encoding="utf-8")                    # comments straight after a value
+        assert se.read_style_file(path) == {("page", "paper"): "a4", ("body", "font"): "Arial"}
 
 
 def test_style_file_layout_mistakes_are_explained():
@@ -3557,6 +3562,23 @@ def test_style_file_layout_mistakes_are_explained():
         assert "web or network address" in _style_file_error(folder, "[document]\ntemplate = https://example.com/t.dotx\n")
         assert "'Body Text' but give it a different size" in _style_file_error(
             folder, "[body]\nword_style = Body Text\nsize = 10\n[list items]\nword_style = Body Text\nsize = 9\n")
+        message = _style_file_error(folder, "[body]\nsize = 11\nspace_after 6\n")
+        assert "Line 3: space_after 6" in message and "not a setting: write name = value" in message, message
+        assert "needs both brackets" in _style_file_error(folder, "[body\nsize = 11\n")
+        message = _style_file_error(folder, "[body] ; ordinary text\nsize = ten\n[heading 1]\nsize = 12\n[Body]\n")
+        assert "Line 2: [body]  size = ten" in message and "Line 5: [Body]" in message, message
+        assert "1 to 200 points" in _style_file_error(folder, "[title]\nsize = 250\n")
+        assert "cannot be read" in _style_file_error(folder, "[review marks]\nlikely_wrong_highlight = black\n"
+                                                             "likely_wrong_color = black\n")
+        s = se.Settings()                          # the same style named by its id ('Heading1' is 'Heading 1')
+        s.word_style_file = folder / "ids.ini"
+        s.word_style_file.write_text("[heading 1]\nsize = 14\n[heading 2]\nword_style = Heading1\nsize = 12\n",
+                                     encoding="utf-8")
+        try:
+            se.report_look(s)
+            raise AssertionError("two parts sharing a style by its id were accepted")
+        except se.ReportLookError as exc:
+            assert "both use the style 'Heading 1'" in str(exc) and "Line 5: [heading 2]  size" in str(exc), exc
 
 
 def test_a_style_that_does_not_exist_or_is_of_the_wrong_kind_is_reported_before_any_page_is_read():
@@ -3732,6 +3754,217 @@ def test_a_report_that_would_point_outside_the_computer_is_never_saved():
                 out.writestr(item, blob)
         problems = se.outside_references((folder / "vml.docx").read_bytes())
         assert any("linked to" in p for p in problems), problems
+
+
+def _header_xml(d, inner: str) -> None:
+    """Replace the template's default header with the given paragraph content (raw WordprocessingML)."""
+    from docx.oxml import parse_xml
+    header = d.sections[0].header
+    header.is_linked_to_previous = False
+    header.part._element = parse_xml(f'<w:hdr xmlns:w="{W_NS[1:-1]}" xmlns:r="{R_NS[1:-1]}" '
+                                     f'xmlns:v="urn:schemas-microsoft-com:vml"><w:p>{inner}</w:p></w:hdr>')
+
+
+def test_a_field_code_outside_any_field_never_reaches_the_report():
+    """A field instruction with no field around it ('INCLUDEPICTURE http://...' in a plain run) does nothing in Word,
+    but it is removed all the same, and the last check before saving would catch one."""
+    def stray(d):
+        _header_xml(d, '<w:r><w:instrText xml:space="preserve"> INCLUDEPICTURE "http://198.51.100.7/x.png" '
+                       '</w:instrText></w:r><w:r><w:t>Company header</w:t></w:r>')
+    with tempfile.TemporaryDirectory() as tmp:
+        template = _word_template(Path(tmp), extra=stray)
+        d, path = _write_report(Path(tmp), f"[document]\ntemplate = {template.name}\n")
+        assert "198.51.100.7" not in _package_text(path) and d.sections[0].header.paragraphs[0].text == "Company header"
+        doc, _styles = se._report_document(se.ReportLook())
+        doc.add_paragraph()._p.append(se._safe_xml(f'<w:r xmlns:w="{W_NS[1:-1]}"><w:instrText> DDEAUTO cmd '
+                                                   '</w:instrText></w:r>'.encode(), "test"))
+        assert any("DDEAUTO" in p for p in se.outside_references(_saved(doc)))
+
+
+def test_tracked_changes_in_a_template_are_accepted_not_copied():
+    """A marking changed from SECRET to UNCLASSIFIED with Track Changes on, and never accepted, must not put the
+    struck-out SECRET (and the reviser's name) into every report; a page layout changed the same way gives the
+    report the NEW layout, not the old one kept by the change."""
+    def revised(d):
+        _header_xml(d, '<w:del w:id="1" w:author="J. Smith" w:date="2026-01-05T10:00:00Z"><w:r><w:delText>SECRET'
+                       '</w:delText></w:r></w:del><w:ins w:id="2" w:author="J. Smith" w:date="2026-01-05T10:00:00Z">'
+                       '<w:r><w:t>UNCLASSIFIED</w:t></w:r></w:ins>')
+        from docx.oxml import parse_xml
+        sect = d.sections[0]._sectPr
+        sect.append(parse_xml(f'<w:sectPrChange xmlns:w="{W_NS[1:-1]}" w:id="3" w:author="J. Smith"><w:sectPr>'
+                              '<w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1417" w:right="1417" w:bottom="1417" '
+                              'w:left="1417" w:header="709" w:footer="709" w:gutter="0"/></w:sectPr></w:sectPrChange>'))
+    with tempfile.TemporaryDirectory() as tmp:
+        template = _word_template(Path(tmp), extra=revised)
+        notes = se.read_word_template(template).notes
+        assert "tracked changes in the header were accepted" in notes and not any("sections" in n for n in notes), notes
+        d, path = _write_report(Path(tmp), f"[document]\ntemplate = {template.name}\n")
+        package = _package_text(path)
+        assert "SECRET" not in package and "J. Smith" not in package and "sectPrChange" not in package
+        assert d.sections[0].header.paragraphs[0].text == "UNCLASSIFIED"
+        assert round(d.sections[0].page_width.cm, 1) == 29.7                      # the current layout (landscape)
+
+
+def test_styles_added_to_a_template_from_a_non_english_word_follow_its_own_normal_style():
+    """German Word stores Normal under the id 'Standard'. The styles the report adds (List Paragraph, Caption ...)
+    must be based on that style - not on a second, empty 'Normal' - and a style id the template already uses
+    ('TableText') must not be used twice."""
+    import docx
+    from docx.enum.style import WD_STYLE_TYPE
+
+    def german(d):
+        root = d.styles.element
+        renamed = {"Normal": "Standard", "DefaultParagraphFont": "Absatz-Standardschriftart",
+                   "TableNormal": "NormaleTabelle"}
+        for el in root.findall(f"{W_NS}style"):
+            for tag in ("basedOn", "next", "link"):
+                ref = el.find(f"{W_NS}{tag}")
+                if ref is not None and ref.get(f"{W_NS}val") in renamed:
+                    ref.set(f"{W_NS}val", renamed[ref.get(f"{W_NS}val")])
+            if el.get(f"{W_NS}styleId") in renamed:
+                el.set(f"{W_NS}styleId", renamed[el.get(f"{W_NS}styleId")])
+        own = d.styles.add_style("TableText", WD_STYLE_TYPE.PARAGRAPH)      # a company style, id 'TableText'
+        own.font.size = docx.shared.Pt(7)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        template = _word_template(Path(tmp), extra=german)
+        d, _path = _write_report(Path(tmp), f"[document]\ntemplate = {template.name}\n[table text]\nsize = 9\n")
+        names = [s.name for s in d.styles]
+        assert names.count("Normal") == 1 and names.count("Default Paragraph Font") == 1, names
+        ids = [s.style_id for s in d.styles]
+        assert len(ids) == len(set(ids)), [i for i in ids if ids.count(i) > 1]
+        for added in ("List Paragraph", "Caption"):
+            assert _style_value(d, added, "font") == "Arial", added
+        assert d.styles["Heading 3"].base_style.style_id == "Standard"         # (its font is the theme's)
+        assert _style_value(d, "Table Text", "size") == 9.0
+        cell_style = d.tables[0].cell(1, 0).paragraphs[0].style
+        assert cell_style.name == "Table Text" and _style_value(d, "TableText", "size") == 7.0
+
+
+def test_tags_and_keywords_keep_their_look_inside_italic_or_bold_paragraphs():
+    """Bold and italic are 'toggles' in Word: a bold tag style inside a bold paragraph would print NOT bold, and the
+    tag's 'not italic' could not undo an italic caption. The tags and keywords carry their style's bold and italic
+    themselves."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d, _path = _write_report(Path(tmp), "[requirements]\nbold = yes\nmark_keywords = yes\n")
+        tag_id, keyword_id = d.styles["Requirement Tag"].style_id, d.styles["Requirement Keyword"].style_id
+        for run in d.element.body.iter(f"{W_NS}r"):
+            style = run.find(f"{W_NS}rPr/{W_NS}rStyle")
+            if style is not None and style.get(f"{W_NS}val") in (tag_id, keyword_id):
+                assert run.find(f"{W_NS}rPr/{W_NS}b") is not None, "".join(t.text for t in run.iter(f"{W_NS}t"))
+                if style.get(f"{W_NS}val") == tag_id:
+                    italic = run.find(f"{W_NS}rPr/{W_NS}i")
+                    assert italic is not None and italic.get(f"{W_NS}val") in ("0", "false")
+
+
+def test_an_empty_table_alignment_leaves_it_to_the_template_and_tables_fit_beside_a_gutter():
+    from docx.oxml import parse_xml
+
+    def left_tables_and_gutter(d):
+        style = d.styles["Normal Table"].element
+        style.find(f"{W_NS}tblPr").append(parse_xml(f'<w:jc xmlns:w="{W_NS[1:-1]}" w:val="left"/>'))
+        d.sections[0].gutter = docx_cm(1)
+
+    def docx_cm(n):
+        from docx.shared import Cm
+        return Cm(n)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        template = _word_template(Path(tmp), extra=left_tables_and_gutter)
+        d, _path = _write_report(Path(tmp), f"[document]\ntemplate = {template.name}\n")
+        assert d.tables[0]._tbl.find(f"{W_NS}tblPr/{W_NS}jc") is None
+        section = d.sections[0]
+        text_width = section.page_width - section.left_margin - section.right_margin - section.gutter
+        grid = sum(int(c.get(f"{W_NS}w")) for c in d.tables[0]._tbl.find(f"{W_NS}tblGrid"))
+        assert grid * 635 <= text_width + 635 * len(d.tables[0].columns), (grid * 635, text_width)
+        d, _path = _write_report(Path(tmp), f"[document]\ntemplate = {template.name}\n[tables]\nalignment = right\n",
+                                 name="right.docx")
+        assert d.tables[0]._tbl.find(f"{W_NS}tblPr/{W_NS}jc").get(f"{W_NS}val") == "right"
+
+
+def test_margins_too_wide_for_the_paper_stop_the_run_at_start_up():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = se.Settings()
+        s.word_style_file = Path(tmp) / "wide.ini"
+        s.word_style_file.write_text("[page]\npaper = A5\nmargin_left = 3 in\nmargin_right = 3 in\n", encoding="utf-8")
+        try:
+            se.report_look(s)
+            raise AssertionError("margins wider than the paper were accepted")
+        except se.ReportLookError as exc:
+            assert "margins are too wide" in str(exc) and "Line 3: [page]  margin_left" in str(exc), exc
+
+
+def test_the_look_checked_at_start_up_is_used_for_the_whole_run():
+    """Editing the style file while a batch runs must not make the remaining reports fail: main() keeps the look it
+    checked at start-up in Settings.word_look."""
+    with tempfile.TemporaryDirectory() as tmp:
+        s = se.Settings()
+        s.word_style_file = Path(tmp) / "look.ini"
+        s.word_style_file.write_text("[heading 1]\nsize = 16\n", encoding="utf-8")
+        s.word_look = se.report_look(s)
+        s.word_style_file.write_text("[heading 1]\nsize = sixteen\n", encoding="utf-8")
+        assert se.report_look(s) is s.word_look
+        doc, items, _s = _report_sample()
+        import docx
+        d = docx.Document(se.write_word_report(Path(tmp) / "r.docx", doc, items, s))
+        assert _style_value(d, "Heading 1", "size") == 16.0
+
+
+def test_page_images_leave_room_for_the_heading_and_tall_header_pictures():
+    """The page image leaves room for the 'Page N' heading and a line of notes (as before), and a tall logo in the
+    header - DrawingML or the older VML, in the default or the even-page header - takes room from it."""
+    def vml_logo(d):
+        _header_xml(d, '<w:r><w:pict><v:shape style="width:144pt;height:144pt"><v:imagedata/></v:shape></w:pict></w:r>')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        plain, _ = se._report_document(se.ReportLook())
+        width, height = se._usable_page(plain)
+        assert (round(width, 2), round(height, 2)) == (7.1, 9.8)
+        template = _word_template(folder, extra=vml_logo)
+        look = se.ReportLook(template=se.read_word_template(template))
+        d, _styles = se._report_document(look)
+        section = d.sections[0]
+        text_height = (section.page_height - section.top_margin - section.bottom_margin) / 914400
+        assert se._usable_page(d)[1] <= text_height - 1.5, (se._usable_page(d), text_height)
+        doc, items, s = _report_sample()
+        _png(folder / "page1.png", 1870, 2420)
+        doc.cache_dir, doc.pages[0].image_file = str(folder), "page1.png"
+        d, _path = _write_report(folder, None, sample=(doc, items, s))
+        assert d.inline_shapes[0].height <= int((9.8 - 1.2) * 914400) + 9144
+
+
+def test_the_starter_template_keeps_the_heading_row_shading_when_used_as_the_template():
+    import docx
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        starter = se.write_starter_template(folder, se.report_look(se.Settings()))
+        grid = docx.Document(starter).styles["Table Grid"].element
+        first_row = [el for el in grid.findall(f"{W_NS}tblStylePr") if el.get(f"{W_NS}type") == "firstRow"]
+        assert first_row and first_row[0].find(f".//{W_NS}shd").get(f"{W_NS}fill") == "D9E2F3"
+        d, _path = _write_report(folder, f"[document]\ntemplate = {starter.name}\n")
+        look = d.tables[0]._tbl.find(f"{W_NS}tblPr/{W_NS}tblLook")
+        assert look.get(f"{W_NS}firstRow") == "1" and d.styles["Table Grid"].element.find(f"{W_NS}tblStylePr") is not None
+
+
+def test_a_damaged_template_gives_a_message_not_a_crash():
+    from docx.oxml import parse_xml
+
+    def odd_columns(d):
+        d.sections[0]._sectPr.append(parse_xml(f'<w:cols xmlns:w="{W_NS[1:-1]}" w:num="two"/>'))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        template = _word_template(Path(tmp), extra=odd_columns)
+        assert any("columns were left out" in n for n in se.read_word_template(template).notes)
+        import zipfile
+        broken = Path(tmp) / "broken.docx"
+        with zipfile.ZipFile(template) as z, zipfile.ZipFile(broken, "w") as out:
+            for item in z.namelist():
+                blob = z.read(item)
+                if item == "word/_rels/document.xml.rels":
+                    blob = blob.replace(b'Target="styles.xml"', b'Target="missing.xml"')
+                out.writestr(item, blob)
+        se.read_word_template(broken)                                    # (no styles: Word's standard ones)
 
 
 def _saved(d) -> bytes:

@@ -457,6 +457,7 @@ class Settings:
     # How the Word report LOOKS - fonts, sizes, spacing, page layout and your own Word template - is set in
     # word_style/report_style.ini (explained inside that file), not here. None = the tool's own look, no file.
     word_style_file: Optional[Path] = DEFAULT_WORD_STYLE_FILE
+    word_look: Optional["ReportLook"] = field(default=None, repr=False, compare=False)  # (set at start-up)
     combined_workbook: bool = True      # ALL_DOCUMENTS_<date>.xlsx when >1 document
     save_debug_images: bool = False
 
@@ -5881,9 +5882,11 @@ def _save_workbook(wb, path: Path) -> Path:
 # =============================================================================
 
 # ---- 11a. The parts of the report --------------------------------------------------------------------------------
-# Every part is written in a Word STYLE, never with formatting typed onto the text, so a template (or Word itself,
-# afterwards) decides the look. Only the review marks - the highlighted words and shaded table cells that are the
-# point of the report - are put directly on the words, so no template can hide them.
+# Every part is written in a Word STYLE, not with formatting typed onto the text, so a template (or Word itself,
+# afterwards) decides the look. The exceptions: the review marks - the highlighted words and shaded table cells that
+# are the point of the report - are put directly on the words, so no template can hide them; a few labels ("Source:",
+# "Text inside figure:"); the bold and italic of tags and keywords (see _styled_run); picture paragraphs; and the
+# table width, alignment and (without a template) heading-row shading.
 PARAGRAPH_KEYS = ("word_style", "font", "size", "bold", "italic", "color", "alignment", "space_before",
                   "space_after", "line_spacing", "indent_left", "first_line_indent")
 CHARACTER_KEYS = ("word_style", "font", "size", "bold", "italic", "color")
@@ -5997,13 +6000,17 @@ def _style_value(section: str, key: str, raw: str):
         return raw.strip().strip('"').strip("'").strip(), ""
     if key == "size":
         n = _number(re.sub(r"\s*(?:pt|points?)$", "", v))
-        if n is None or not 1 <= n <= 200:
+        if n is None:
             return None, f"'{raw}' is not a font size. Write a number of points, for example:  {_EXAMPLES['size']}"
+        if not 1 <= n <= 200:
+            return None, f"'{raw}' is outside the font sizes this tool accepts: 1 to 200 points"
         return round(n * 2) / 2, ""                 # Word stores sizes in half points
     if key in ("space_before", "space_after"):
         n = _number(re.sub(r"\s*(?:pt|points?)$", "", v))
-        if n is None or not 0 <= n <= 200:
+        if n is None:
             return None, f"'{raw}' is not a spacing. Write a number of points, for example:  {_EXAMPLES[key]}"
+        if not 0 <= n <= 200:
+            return None, f"'{raw}' is outside the spacings this tool accepts: 0 to 200 points"
         return n, ""
     if key in ("bold", "italic", "mark_keywords", "repeat_on_each_page"):
         if v in _YES or v in _NO:
@@ -6092,20 +6099,27 @@ def _norm_name(name: str) -> str:
     return " ".join(name.replace("_", " ").lower().split())
 
 
-def _line_of(lines: list, section: str, key: Optional[str] = None) -> int:
-    """Line number of a [section] (or of a key inside it) in the style file, for the messages."""
-    current = None
+def _line_of(lines: list, section: str, key: Optional[str] = None, occurrence: int = 1) -> int:
+    """Line number of a [section] (or of a key inside it) in the style file, for the messages (0 = not found).
+    `occurrence` 2 finds the second time a section appears."""
+    current, seen = None, 0
+    key_re = re.compile(r"\s*" + r"[\s_]+".join(map(re.escape, (key or "").split("_"))) + r"\s*[=:]", re.I)
     for number, line in enumerate(lines, 1):
-        m = re.fullmatch(r"\s*\[([^\]]*)\]\s*", line)
+        m = re.match(r"\s*\[([^\]]*)\]\s*(?:[;#].*)?$", line)
         if m:
             current = _norm_name(m.group(1))
-            if key is None and current == section:
-                return number
+            if current == section:
+                seen += 1
+                if key is None and seen == occurrence:
+                    return number
             continue
-        if key and current == section and re.match(r"\s*" + r"[ _]".join(map(re.escape, key.split("_"))) + r"\s*[=:]",
-                                                   line, re.I):
+        if key and current == section and key_re.match(line):
             return number
     return 0
+
+
+def _at_line(number: int) -> str:
+    return f"Line {number}: " if number else ""
 
 
 def _style_file_message(path: Path, problems: list) -> str:
@@ -6125,6 +6139,11 @@ def _style_file_text(path: Path) -> str:
         raw = Path(path).read_bytes()
     except OSError as exc:
         raise ReportLookError(f"The Word style file {path} cannot be read ({exc.strerror or exc}).") from None
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")                 # Notepad's "Unicode" (and PowerShell's Out-File)
+    if b"\x00" in raw:
+        raise ReportLookError(f"The Word style file {path} is not a text file Notepad saved as UTF-8 or ANSI. Open it "
+                              "in Notepad, choose File > Save As, set Encoding to UTF-8 and save it again.")
     try:
         return raw.decode("utf-8-sig")              # (Notepad's UTF-8 starts with a byte-order mark)
     except UnicodeDecodeError:
@@ -6137,14 +6156,7 @@ def read_style_file(path: Path) -> dict:
     import configparser
     import difflib
     path = Path(path)
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise ReportLookError(f"The Word style file {path} cannot be read ({exc.strerror or exc}).") from None
-    try:
-        text = raw.decode("utf-8-sig")              # (Notepad's UTF-8 starts with a byte-order mark)
-    except UnicodeDecodeError:
-        text = raw.decode("cp1252", errors="replace")   # Notepad's "ANSI"
+    text = _style_file_text(path)
     lines = text.splitlines()
     # no %-interpolation ("115%" must not be an error) and only ';' starts a comment inside a line, so that a
     # colour written as #1F4E9A is not taken for a comment
@@ -6155,14 +6167,22 @@ def read_style_file(path: Path) -> dict:
     try:
         parser.read_string(text, source=str(path))
     except configparser.MissingSectionHeaderError as exc:
-        raise ReportLookError(_style_file_message(path, [(exc.lineno, "", "The settings must come after a section "
-                              "name in square brackets, such as [body]. Was the first [section] line deleted?")])) from None
+        bracket = exc.line.strip().startswith("[")
+        raise ReportLookError(_style_file_message(path, [(exc.lineno, exc.line.strip()[:60],
+                              "A section name needs both brackets, such as [body]." if bracket else
+                              "The settings must come after a section name in square brackets, such as [body]. Was "
+                              "the first [section] line deleted?")])) from None
     except configparser.DuplicateOptionError as exc:
         raise ReportLookError(_style_file_message(path, [(exc.lineno, f"[{_norm_name(exc.section)}]",
                               f"'{exc.option}' is set twice in this section. Keep one of the two lines.")])) from None
     except configparser.DuplicateSectionError as exc:
         raise ReportLookError(_style_file_message(path, [(exc.lineno, "", f"The section [{exc.section}] appears "
                               f"twice. Put all its settings under one [{exc.section}] line.")])) from None
+    except configparser.ParsingError as exc:
+        raise ReportLookError(_style_file_message(path, [
+            (number, line.strip().strip("'").replace("\\n", "").strip(), "This line is not a setting: write "
+             "name = value, or start the line with ; to make it a comment. A section name needs both brackets, "
+             "such as [body].") for number, line in exc.errors])) from None
     except configparser.Error as exc:
         raise ReportLookError(_style_file_message(path, [(getattr(exc, "lineno", 0) or 0, "",
                                                           str(exc).splitlines()[0])])) from None
@@ -6177,8 +6197,8 @@ def read_style_file(path: Path) -> dict:
                              + " The sections are: " + ", ".join(f"[{s}]" for s in known)))
             continue
         if name in seen:
-            problems.append((_line_of(lines, name), f"[{section}]", f"The section [{name}] appears twice. Put all its "
-                             f"settings under one [{name}] line."))
+            problems.append((_line_of(lines, name, occurrence=2), f"[{section}]", f"The section [{name}] appears "
+                             f"twice. Put all its settings under one [{name}] line."))
             continue
         seen.add(name)
         allowed = _section_keys(name)
@@ -6203,7 +6223,9 @@ def read_style_file(path: Path) -> dict:
                 problems.append((line_no, where, f"'{key}' is not a setting of [{name}].{hint} The settings here "
                                  "are: " + ", ".join(allowed)))
                 continue
-            if not raw.strip():
+            if key != "template":                           # (a comment straight after a value: "A4;", "Arial #x")
+                raw = re.split(r";|\s#", raw, maxsplit=1)[0]
+            if not raw.strip().strip('"').strip("'").strip():
                 continue                                    # empty = keep the template's (or the tool's own) look
             if raw.strip().lower().startswith(("http:", "https:", "ftp:", "file:")):
                 problems.append((line_no, where, "A web or network address cannot be used here: put the file in the "
@@ -6215,9 +6237,35 @@ def read_style_file(path: Path) -> dict:
             else:
                 values[(name, key)] = value
     problems += _shared_style_conflicts(values, lines)
+    problems += _unreadable_marks(values, lines)
     if problems:
         raise ReportLookError(_style_file_message(path, problems))
     return values
+
+
+_HIGHLIGHT_RGB = {"yellow": "FFFF00", "bright green": "00FF00", "turquoise": "00FFFF", "pink": "FF00FF",
+                  "blue": "0000FF", "red": "FF0000", "dark blue": "000080", "teal": "008080", "green": "008000",
+                  "violet": "800080", "dark red": "800000", "dark yellow": "808000", "gray 25": "C0C0C0",
+                  "gray 50": "808080", "black": "000000"}
+
+
+def _unreadable_marks(values: dict, lines: list) -> list:
+    """The review marks cannot be switched off - so they may not be made unreadable either (black on black)."""
+    def get(key):
+        return values.get(("review marks", key), BUILT_IN_SWITCHES[("review marks", key)])
+    def luminance(hex_colour: str) -> float:                       # (as for the contrast of web text)
+        channels = [int(hex_colour[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    highlight, colour = _HIGHLIGHT_RGB[get("likely_wrong_highlight")], get("likely_wrong_color")
+    light, dark = sorted((luminance(highlight), luminance(colour)), reverse=True)
+    if (light + 0.05) / (dark + 0.05) >= 2.0:
+        return []
+    key = "likely_wrong_color" if ("review marks", "likely_wrong_color") in values else "likely_wrong_highlight"
+    return [(_line_of(lines, "review marks", key), f"[review marks]  {key}",
+             f"Words very likely misread would be {colour} on a {get('likely_wrong_highlight')} highlight, which "
+             "cannot be read. Choose a likely_wrong_color that stands out on that highlight (or another highlight).")]
 
 
 def _style_name_of(section: str, values: dict) -> str:
@@ -6252,7 +6300,8 @@ def _shared_style_conflicts(values: dict, lines: list) -> list:
 # file, a web page or another program's data, embedded objects, macros. So every report is a NEW document, and only
 # these are copied into it, each one checked: the styles, the theme (its fonts and colours), the list numbering, a
 # few page-layout settings, the page size and margins, and the page headers and footers with their pictures. A link
-# in a header becomes plain text; a field other than a page number or date becomes the text it showed. The
+# in a header becomes plain text, tracked changes in it are accepted, and a field other than a page number, page
+# count, date or heading reference becomes the text it showed. The
 # template's own text, its document properties, and everything else in the file are never used. Every finished
 # report is then checked once more before it is saved (outside_references, section 11d).
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -6271,9 +6320,10 @@ _PICTURE_TYPES = {"image/png": ".png", "image/jpeg": ".jpeg", "image/gif": ".gif
                   "image/tiff": ".tiff", "image/x-emf": ".emf", "image/emf": ".emf", "image/x-wmf": ".wmf",
                   "image/wmf": ".wmf"}
 # fields that only number or date the pages (or repeat a heading of the report): they keep working in a copied
-# header or footer. Any other field is replaced by the text it showed.
+# header or footer. Any other field (TITLE, DOCPROPERTY, INCLUDEPICTURE ...) is replaced by the text it showed, so
+# what the template's header says never changes.
 SAFE_FIELDS = {"PAGE", "NUMPAGES", "SECTIONPAGES", "SECTION", "DATE", "TIME", "PRINTDATE", "SAVEDATE",
-               "CREATEDATE", "STYLEREF", "TITLE"}
+               "CREATEDATE", "STYLEREF"}
 # the only page-layout settings copied from the template's settings (none of them can point anywhere)
 _LAYOUT_SETTINGS = {"view", "zoom", "mirrorMargins", "alignBordersAndEdges", "bordersDoNotSurroundHeader",
                     "bordersDoNotSurroundFooter", "gutterAtTop", "defaultTabStop", "autoHyphenation",
@@ -6455,6 +6505,8 @@ def _field_codes(root) -> list:
                 codes.append("".join(stack.pop()).split("\x00")[0])
         elif stack and "\x00" not in stack[-1]:
             stack[-1].append(el.text or "")
+        else:                                       # a field code outside any field: counted on its own
+            codes.append(el.text or "")
     codes += ["".join(s).split("\x00")[0] for s in stack]
     return codes
 
@@ -6478,7 +6530,7 @@ def _freeze_fields(root, keep: set) -> list:
             frozen.append(name or "?")
             _unwrap(fs)
     runs = list(root.iter(_q(_W, "r")))
-    fields, stack = [], []
+    fields, stack, stray = [], [], []
     for i, run in enumerate(runs):
         for el in run:
             if _local(el) == "fldChar":
@@ -6491,8 +6543,14 @@ def _freeze_fields(root, keep: set) -> list:
                     fields.append(dict(stack.pop(), end=i))
             elif _local(el) == "instrText" and stack and stack[-1]["separate"] is None:
                 stack[-1]["code"].append(el.text or "")
+            elif _local(el) == "instrText":                        # a field code outside any field: Word ignores
+                frozen.append(_field_name(el.text) or "?")          # it, but it goes all the same
+                stray.append((i, el))
     fields += [dict(f, end=len(runs) - 1) for f in stack]          # (a field that never ends: to the last run)
     whole, marks = set(), set()
+    for i, el in stray:
+        runs[i].remove(el)
+        marks.add(i)
     for f in fields:
         name = _field_name("".join(f["code"]))
         if name in keep:
@@ -6513,11 +6571,37 @@ def _freeze_fields(root, keep: set) -> list:
     return frozen
 
 
+_REVISION_DROPS = {"del", "moveFrom", "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd",
+                   "cellDel", "cellIns", "cellMerge", "rPrChange", "pPrChange", "sectPrChange", "tblPrChange",
+                   "tblPrExChange", "trPrChange", "tcPrChange", "tblGridChange", "numberingChange",
+                   "customXmlDelRangeStart", "customXmlDelRangeEnd", "customXmlInsRangeStart", "customXmlInsRangeEnd",
+                   "customXmlMoveFromRangeStart", "customXmlMoveFromRangeEnd", "customXmlMoveToRangeStart",
+                   "customXmlMoveToRangeEnd"}
+
+
+def _accept_revisions(root) -> int:
+    """Accept every tracked change, as Word's 'Accept All Changes' does: deleted text goes, inserted text stays, the
+    reviser's names and dates go. (Otherwise a marking changed from SECRET to UNCLASSIFIED but never accepted would
+    carry the struck-out SECRET into every report.) Returns the number of changes."""
+    changes = [el for el in root.iter() if isinstance(el.tag, str) and el.tag.startswith(f"{{{_W}}}")
+               and _local(el) in _REVISION_DROPS | {"ins", "moveTo"}]
+    for el in changes:
+        if el.getparent() is None:
+            continue
+        if _local(el) in ("ins", "moveTo"):
+            _unwrap(el)
+        else:
+            el.getparent().remove(el)
+    return len(changes)
+
+
 def _clean_story(root, package: "_Package", part_name: str, where: str, notes: list) -> tuple:
     """A header or footer of the template, made safe to copy: (xml, [(rId, extension, content type, data)]).
     Raises ReportLookError for something that cannot be made safe without losing what the header shows."""
     rels = package.rels(part_name)
     what = f"The {where} of the template"
+    if _accept_revisions(root):
+        notes.append(f"tracked changes in the {where} were accepted")
     # links become plain text (the text stays, the address goes)
     links = 0
     for link in list(root.iter(_q(_W, "hyperlink"))):
@@ -6584,7 +6668,16 @@ def _clean_story(root, package: "_Package", part_name: str, where: str, notes: l
 def read_word_template(path: Path) -> WordTemplate:
     """Read and check a Word template (.dotx or .docx), keeping only what the report may copy (see above).
     Raises ReportLookError, saying what to do in Word, for a file that cannot be used."""
-    path = Path(path)
+    try:
+        return _read_word_template(Path(path))
+    except ReportLookError:
+        raise
+    except Exception as exc:                  # a damaged or unusual file: a clear message, never a crash
+        raise ReportLookError(f"The template '{Path(path).name}' could not be read ({type(exc).__name__}: {exc}). "
+                              "Open it in Word, save it again as 'Word Template (*.dotx)' and use the new file.") from None
+
+
+def _read_word_template(path: Path) -> WordTemplate:
     name = path.name
     suffix = path.suffix.lower()
     if suffix in (".docm", ".dotm"):
@@ -6637,6 +6730,8 @@ def read_word_template(path: Path) -> WordTemplate:
         for el in styles.iter():                   # (styles never point anywhere; drop anything that tries to)
             for attr in [a for a in el.attrib if a.startswith(f"{{{_R}}}")]:
                 del el.attrib[attr]
+        if _accept_revisions(styles):
+            notes.append("tracked changes to its styles were accepted")
         t.styles = _xml_bytes(styles)
     else:
         notes.append("it has no styles of its own, so Word's standard styles are used")
@@ -6646,6 +6741,7 @@ def read_word_template(path: Path) -> WordTemplate:
         numbering = _safe_xml(package.read(numbering_part), what)
         for el in list(numbering.iter(_q(_W, "numPicBullet"), _q(_W, "lvlPicBulletId"))):
             el.getparent().remove(el)
+        _accept_revisions(numbering)
         if any(a.startswith(f"{{{_R}}}") for el in numbering.iter() for a in el.attrib):
             notes.append("its list numbering was left out (it refers to other parts of the file)")
         else:
@@ -6677,7 +6773,8 @@ def read_word_template(path: Path) -> WordTemplate:
     # before it ("Link to Previous")
     document = _safe_xml(package.read(main), what)
     body = document.find(_q(_W, "body"))
-    sections = list(body.iter(_q(_W, "sectPr"))) if body is not None else []
+    sections = [s for s in body.iter(_q(_W, "sectPr")) if _local(s.getparent()) in ("body", "pPr")] \
+        if body is not None else []                      # (not the old layout kept by a tracked change)
     references = {}
     for sect in sections:
         for ref in sect:
@@ -6688,7 +6785,7 @@ def read_word_template(path: Path) -> WordTemplate:
         for el in list(last):
             if _local(el) in ("headerReference", "footerReference", "printerSettings", "sectPrChange"):
                 last.remove(el)
-            elif _local(el) == "cols" and int(el.get(_q(_W, "num")) or 1) > 1:
+            elif _local(el) == "cols" and (el.get(_q(_W, "num")) or "1").strip() != "1":
                 last.remove(el)
                 notes.append("its text columns were left out (the report is set in one column)")
         for attr in [a for a in last.attrib if a.startswith(f"{{{_W}}}rsid")]:
@@ -6755,7 +6852,11 @@ def _file_signature(path: Optional[Path]) -> tuple:
 
 def report_look(settings: Settings) -> ReportLook:
     """The look of the Word report: the style file (Settings.word_style_file) and the template it names, read and
-    checked once and remembered while neither file changes. Raises ReportLookError with the reason."""
+    checked once and remembered while neither file changes. Raises ReportLookError with the reason.
+    A run checks the look at start-up and keeps it in Settings.word_look, so editing the style file during a long
+    batch changes nothing until the next run."""
+    if settings.word_look is not None:
+        return settings.word_look
     path = settings.word_style_file
     if path is not None and not Path(path).exists():
         if Path(path) == DEFAULT_WORD_STYLE_FILE:
@@ -6782,14 +6883,33 @@ def report_look(settings: Settings) -> ReportLook:
                 here = sorted(p.name for p in template_path.parent.glob("*.do[ct]x")) if template_path.parent.is_dir() else []
                 raise ReportLookError(
                     f"The Word template named in {path.name} was not found.\n"
-                    f"  Line {_line_of(look.lines, 'document', 'template')}: [document]  template = {template}\n"
+                    f"  {_at_line(_line_of(look.lines, 'document', 'template'))}[document]  template = {template}\n"
                     f"      Looked for {template_path}."
                     + (f" Word files in that folder: {', '.join(here)}" if here else ""))
             look.template = read_word_template(template_path)
     look.template_signature = _file_signature(look.template.path) if look.template else ()
     # build one document now, so that a style name that does not exist, or anything in the template that cannot be
     # used, is reported before any page is read - not after an hour of OCR
-    probe, _styles = _report_document(look)
+    try:
+        probe, _styles = _report_document(look)
+    except ReportLookError:
+        raise
+    except Exception as exc:                  # something in a template python-docx cannot use: a message, not a crash
+        if look.template is None:
+            raise
+        raise ReportLookError(f"The template '{look.template.path.name}' could not be used ({type(exc).__name__}: "
+                              f"{exc}). Open it in Word, save it again as 'Word Template (*.dotx)' and use the new "
+                              "file.") from None
+    width, height = _usable_page(probe)
+    if width < 1.5 or height < 1.5:
+        lines = [f"  {_at_line(_line_of(look.lines, 'page', k))}[page]  {k}" for k in OTHER_SECTIONS["page"]
+                 if ("page", k) in look.values]
+        raise ReportLookError(
+            f"The page of the report would leave only {max(width, 0):.1f} x {max(height, 0):.1f} in for the text: the "
+            "margins are too wide for the paper.\n"
+            + ("\n".join(lines) + "\n" if lines else "  (the margins come from the template)\n")
+            + "      Make the margins smaller, or the paper larger, in "
+            + (look.style_file.name if look.style_file else "the style file") + ".")
     buffer = io.BytesIO()
     probe.save(buffer)
     problems = outside_references(buffer.getvalue())
@@ -6826,56 +6946,88 @@ def _find_style_element(root, name: str):
     return next((el for el in root.findall(_q(_W, "style")) if _style_names(el) & wanted), None)
 
 
-def _copy_standard_style(d, name: str):
-    """Copy a standard style (with the styles it is based on or linked to) from python-docx's template into the
-    report; None when Word has no standard style of that name."""
-    source = _find_style_element(_standard_styles(), name)
+def _free_style_id(root, wanted: str, ignore=None) -> str:
+    """A style id no other style uses yet ('TableText', else 'TableText2' ...)."""
+    used = {el.get(_q(_W, "styleId")) for el in root.findall(_q(_W, "style")) if el is not ignore}
+    new, n = wanted, 1
+    while new in used:
+        n += 1
+        new = f"{wanted}{n}"
+    return new
+
+
+def _copy_standard_style(d, name: str, added: set):
+    """Copy a standard style from python-docx's template into the report; None when Word has no standard style of
+    that name. The styles it refers to (based on, linked to, next) are matched BY NAME in the report first - a
+    template from a non-English Word stores Normal under the id 'Standard' or 'Normale' - and the report's default
+    style of a kind stands in for python-docx's (a template's default paragraph style need not be called Normal).
+    Only a style the report has in no form is copied as well. The ids of the copies are recorded in `added`."""
+    standard = _standard_styles()
+    source = _find_style_element(standard, name)
     if source is None:
         return None
-    target_root = d.styles.element
-    todo = [source]
-    while todo:
-        el = todo.pop()
-        style_id = el.get(_q(_W, "styleId"))
-        if any(s.get(_q(_W, "styleId")) == style_id for s in target_root.findall(_q(_W, "style"))):
-            continue
-        new = copy.deepcopy(el)
+    root = d.styles.element
+    copied = {}                                          # python-docx's style id -> the report's style id
+
+    def in_report(src):
+        names = _style_names(src) - {(src.get(_q(_W, "styleId")) or "").casefold()}
+        found = next((el for el in root.findall(_q(_W, "style")) if (_style_names(el) & names)
+                      and el.get(_q(_W, "type")) == src.get(_q(_W, "type"))), None)
+        if found is None and src.get(_q(_W, "default")) == "1":
+            found = next((el for el in root.findall(_q(_W, "style")) if el.get(_q(_W, "default")) == "1"
+                          and el.get(_q(_W, "type")) == src.get(_q(_W, "type"))), None)
+        return found
+
+    def copy_style(src) -> str:
+        src_id = src.get(_q(_W, "styleId"))
+        if src_id in copied:
+            return copied[src_id]
+        found = in_report(src)
+        if found is not None:
+            copied[src_id] = found.get(_q(_W, "styleId"))
+            return copied[src_id]
+        new = copy.deepcopy(src)
         new.attrib.pop(_q(_W, "default"), None)
         for child in list(new):
             if _local(child) == "rsid":
                 new.remove(child)
         for num in new.findall(f".//{_q(_W, 'numPr')}"):            # (list styles point at python-docx's lists)
             num.getparent().remove(num)
-        target_root.append(new)
+        new.set(_q(_W, "styleId"), _free_style_id(root, src_id))
+        copied[src_id] = new.get(_q(_W, "styleId"))
+        added.add(copied[src_id])
+        root.append(new)
         for tag in ("basedOn", "link", "next"):
             ref = new.find(_q(_W, tag))
             if ref is None:
                 continue
-            ref_id = ref.get(_q(_W, "val"))
-            if any(s.get(_q(_W, "styleId")) == ref_id for s in target_root.findall(_q(_W, "style"))):
-                continue
-            dep = next((s for s in _standard_styles().findall(_q(_W, "style")) if s.get(_q(_W, "styleId")) == ref_id), None)
-            if dep is not None:
-                todo.append(dep)
-            else:
+            dep = next((s for s in standard.findall(_q(_W, "style")) if s.get(_q(_W, "styleId")) == ref.get(_q(_W, "val"))),
+                       None)
+            if dep is None:
                 new.remove(ref)
-    return _find_style_element(target_root, name)
+            else:
+                ref.set(_q(_W, "val"), copy_style(dep))
+        return copied[src_id]
+
+    style_id = copy_style(source)
+    return next(el for el in root.findall(_q(_W, "style")) if el.get(_q(_W, "styleId")) == style_id)
 
 
 _STYLE_TYPES = {"paragraph": WD_STYLE_TYPE.PARAGRAPH, "character": WD_STYLE_TYPE.CHARACTER,
                 "table": WD_STYLE_TYPE.TABLE}
 
 
-def _report_style(d, part: ReportPart, look: ReportLook, styles: dict):
-    """-> (style, added): the style a part uses, added to the document when it does not have it yet."""
+def _report_style(d, part: ReportPart, look: ReportLook, styles: dict, added: set):
+    """-> (style, added): the style a part uses, added to the document when it does not have it yet (the ids of
+    styles added to this document are in `added`)."""
     from docx.styles.style import StyleFactory
     name = _style_name_of(part.section, look.values)
     named = (part.section, "word_style") in look.values
     el = _find_style_element(d.styles.element, name)
-    added = False
+    if el is None and name.casefold() == "normal":      # (a template whose default paragraph style has another name)
+        el = d.styles.default(WD_STYLE_TYPE.PARAGRAPH).element if d.styles.default(WD_STYLE_TYPE.PARAGRAPH) else None
     if el is None:
-        el = _copy_standard_style(d, name)
-        added = el is not None
+        el = _copy_standard_style(d, name, added)
     if el is None and named:
         known = sorted({StyleFactory(s).name for s in d.styles.element.findall(_q(_W, "style"))
                         if (s.get(_q(_W, "type")) or "paragraph") == part.kind})
@@ -6884,13 +7036,15 @@ def _report_style(d, part: ReportPart, look: ReportLook, styles: dict):
         where = f"the template {look.template.path.name}" if look.template else "Word's standard styles"
         raise ReportLookError(
             f"A style named in {look.style_file.name if look.style_file else 'the style file'} does not exist.\n"
-            f"  Line {_line_of(look.lines, part.section, 'word_style')}: [{part.section}]  word_style = {name}\n"
+            f"  {_at_line(_line_of(look.lines, part.section, 'word_style'))}[{part.section}]  word_style = {name}\n"
             f"      {where} has no {part.kind} style called '{name}'."
             + (f" Similar: {', '.join(repr(s) for s in similar)}." if similar else "")
             + " Write the name as Word's Styles pane shows it (for built-in styles, the English name), or leave "
               "word_style empty.")
     if el is None:                                  # one of the report's own styles: add it
         style = d.styles.add_style(name, _STYLE_TYPES[part.kind])
+        style.element.set(_q(_W, "styleId"), _free_style_id(d.styles.element, style.style_id, ignore=style.element))
+        added.add(style.style_id)                   # (a template may already use the id, e.g. 'TableText')
         base = styles.get(part.based_on) if part.based_on else None
         if part.kind == "paragraph":
             style.base_style = base or d.styles.default(WD_STYLE_TYPE.PARAGRAPH)
@@ -6907,9 +7061,9 @@ def _report_style(d, part: ReportPart, look: ReportLook, styles: dict):
                 "a line, such as Strong)", "table": "a table style (such as Table Grid)"}[part.kind]
         raise ReportLookError(
             f"A style named in the style file is of the wrong kind.\n"
-            f"  Line {_line_of(look.lines, part.section, 'word_style')}: [{part.section}]  word_style = {name}\n"
+            f"  {_at_line(_line_of(look.lines, part.section, 'word_style'))}[{part.section}]  word_style = {name}\n"
             f"      '{name}' is a {kinds.get(style.type, '?')} style; [{part.section}] needs {need}.")
-    return style, added
+    return style, style.style_id in added
 
 
 def _set_font_name(rPr, name: str) -> None:
@@ -7050,6 +7204,7 @@ def _install_template(d, t: WordTemplate) -> None:
         theme_part = d.part.part_related_by(RT.THEME)
         theme_part._blob = _attach_pictures(theme_part, t.theme[0], t.theme[1], pictures)
     section = d.sections[0]
+    drawing_ids = 100000
     if t.section:
         new = parse_xml(t.section)
         sect = section._sectPr
@@ -7066,7 +7221,11 @@ def _install_template(d, t: WordTemplate) -> None:
             continue
         hf.is_linked_to_previous = False
         part = hf.part
-        part._element = parse_xml(_attach_pictures(part, xml, story_pictures, pictures))
+        story = _safe_xml(_attach_pictures(part, xml, story_pictures, pictures), "a header of the template")
+        for drawing in story.iter("{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}docPr"):
+            drawing_ids += 1                         # (picture ids must not repeat those of the report's own
+            drawing.set("id", str(drawing_ids))      # pictures, which python-docx numbers from 1)
+        part._element = parse_xml(_xml_bytes(story))
 
 
 def _setup_page(d, look: ReportLook) -> None:
@@ -7096,6 +7255,27 @@ def _setup_page(d, look: ReportLook) -> None:
                 setattr(section, key.replace("margin_", "") + "_margin", Emu(values[key]))
 
 
+def _same_style_conflicts(look: ReportLook, styles: dict) -> None:
+    """Like _shared_style_conflicts, for parts that turn out to use the same style although the style file names it
+    differently ('Heading1' is the id of 'Heading 1'; 'Normal' may be the template's 'Body')."""
+    by_id = defaultdict(list)
+    for part in REPORT_PARTS:
+        by_id[styles[part.section].style_id].append(part.section)
+    problems = []
+    for sections in by_id.values():
+        for i, first in enumerate(sections):
+            for second in sections[i + 1:]:
+                for key in PARAGRAPH_KEYS[1:]:
+                    a, b = look.values.get((first, key)), look.values.get((second, key))
+                    if a is not None and b is not None and a != b:
+                        problems.append((_line_of(look.lines, second, key), f"[{second}]  {key}",
+                                         f"[{first}] and [{second}] both use the style '{styles[first].name}' but give "
+                                         f"it a different {key}. Give [{second}] a style of its own (word_style), or "
+                                         f"set the {key} in one place."))
+    if problems:
+        raise ReportLookError(_style_file_message(look.style_file or Path("report_style.ini"), problems))
+
+
 def _report_document(look: ReportLook) -> tuple:
     """A new, empty report document with every style it uses, set up as the look says: (document, {part: style}).
     Order of precedence: the template (or python-docx's standard document), then the tool's own look - applied
@@ -7104,13 +7284,14 @@ def _report_document(look: ReportLook) -> tuple:
     d = docx.Document()
     if look.template is not None:
         _install_template(d, look.template)
-    styles = {}
+    styles, added_ids = {}, set()
     for part in REPORT_PARTS:
-        style, added = _report_style(d, part, look, styles)
+        style, added = _report_style(d, part, look, styles, added_ids)
         styles[part.section] = style
         own = _style_name_of(part.section, look.values).casefold() == part.style.casefold()
         if own and (look.template is None or added):
             _apply_look(style, dict(part.look), d.styles.element)
+    _same_style_conflicts(look, styles)
     font = look.values.get(("document", "font"))
     if font:
         defaults = d.styles.element.find(_q(_W, "docDefaults"))
@@ -7236,6 +7417,19 @@ def _mark_review(run, level: str, look: ReportLook) -> None:
         run.bold = True
 
 
+def _styled_run(paragraph, text: str, style):
+    """A run in a character style (a tag, a keyword) that looks as that style says in any paragraph. Bold and
+    italic are 'toggles' in Word: a bold character style inside a bold paragraph style would turn the words NOT
+    bold, and 'not italic' cannot undo an italic paragraph style. So the style's own bold and italic are also put on
+    the run itself."""
+    run = paragraph.add_run(text, style=style)
+    if style.font.bold is not None:
+        run.bold = style.font.bold
+    if style.font.italic is not None:
+        run.italic = style.font.italic
+    return run
+
+
 def _keyword_tokens(tokens: list, keyword_re) -> set:
     """Positions of the tokens that are (part of) a requirement keyword."""
     if keyword_re is None or not tokens:
@@ -7258,7 +7452,8 @@ def _add_confidence_runs(paragraph, tokens: list, settings: Settings, look: Repo
 
     def emit():
         if group:
-            run = paragraph.add_run(_docx_text(" ".join(group)) + " ", style=keyword_style if group_key[1] else None)
+            text = _docx_text(" ".join(group)) + " "
+            run = _styled_run(paragraph, text, keyword_style) if group_key[1] else paragraph.add_run(text)
             _mark_review(run, group_key[0], look)
 
     for i, token in enumerate(tokens):
@@ -7280,23 +7475,51 @@ def _cell_attention(t: "TableData", r: int, c: int, ctx: "TextContext", settings
     return any(token_attention(tok, settings) for tok in tokens)
 
 
+_WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_CSS_LENGTH = {"pt": 12700, "in": 914400, "cm": 360000, "mm": 36000, "px": 9525, "": 12700}
+
+
+def _story_height(story) -> int:
+    """Rough height (EMU) of a header or footer: a line per paragraph, or the tallest picture in it (DrawingML or
+    the older VML) when that is taller. Floating pictures take no room; a picture Word stores twice (new and
+    old format, mc:AlternateContent) counts once."""
+    total = 0
+    for p in story.iter(_q(_W, "p")):
+        tallest = 228600                                          # a line of text: about 0.25 in
+        for el in p.iter():
+            if not isinstance(el.tag, str) or any(a.tag == f"{{{_MC}}}Fallback" for a in el.iterancestors()):
+                continue
+            if el.tag == f"{{{_WP}}}extent" and _local(el.getparent()) == "inline":
+                tallest = max(tallest, int(el.get("cy") or 0))
+            elif el.tag.startswith(f"{{{_V}}}") and el.get("style") and "position:absolute" not in el.get("style"):
+                m = re.search(r"(?:^|;)\s*height:\s*([\d.]+)\s*(pt|in|cm|mm|px|)", el.get("style"))
+                if m:
+                    tallest = max(tallest, int(float(m.group(1)) * _CSS_LENGTH[m.group(2)]))
+        total += tallest
+    return total
+
+
 def _usable_page(d) -> tuple:
-    """Width and height (inches) a picture can take on a page of the report: the page less its margins, and less
-    any part of a header or footer that reaches into the text area (a tall logo pushes the text down)."""
+    """Width and height (inches) of the text area on a page of the report: the page less its margins and gutter,
+    and less any part of a header or footer that reaches into the text area (a tall logo pushes the text down)."""
     section = d.sections[0]
-    width = section.page_width - section.left_margin - section.right_margin - (section.gutter or 0)
-    height = section.page_height - abs(section.top_margin) - abs(section.bottom_margin)
-    for hf, distance, margin in ((section.header, section.header_distance, section.top_margin),
-                                 (section.footer, section.footer_distance, section.bottom_margin)):
-        if hf.is_linked_to_previous:
-            continue
-        tall = 0
-        for p in hf._element.iter(_q(_W, "p")):
-            pictures = [int(e.get("cy") or 0) for e in p.iter("{http://schemas.openxmlformats.org/drawingml/2006/"
-                                                                "wordprocessingDrawing}extent")
-                        if e.getparent() is not None and _local(e.getparent()) == "inline"]
-            tall += max([228600] + pictures)                    # a line of text (about 0.25 in), or the picture
-        height -= max(0, (distance or 0) + tall - abs(margin or 0))
+    settings = d.settings.element
+    gutter_at_top = settings.find(_q(_W, "gutterAtTop")) is not None
+    gutter = section.gutter or 0
+    width = section.page_width - section.left_margin - section.right_margin - (0 if gutter_at_top else gutter)
+    height = section.page_height - abs(section.top_margin) - abs(section.bottom_margin) - (gutter if gutter_at_top else 0)
+    even = settings.find(_q(_W, "evenAndOddHeaders")) is not None
+    for stories, distance, margin in (((section.header, section.even_page_header), section.header_distance,
+                                       section.top_margin),
+                                      ((section.footer, section.even_page_footer), section.footer_distance,
+                                       section.bottom_margin)):
+        reach = 0
+        for k, hf in enumerate(stories):
+            if (k == 1 and not even) or hf.is_linked_to_previous:
+                continue
+            reach = max(reach, (distance or 0) + _story_height(hf._element) - abs(margin or 0))
+        height -= max(0, reach)
     return width / 914400, height / 914400
 
 
@@ -7304,6 +7527,7 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
     look = report_look(settings)
     d, styles = _report_document(look)
     usable_w, usable_h = _usable_page(d)
+    table_alignment = look.values.get(("tables", "alignment")) or (None if look.template else "center")
     tag_start = look.get("requirements", "tag_position") == "start"
     keyword_re = None
     if look.get("requirements", "mark_keywords"):
@@ -7337,7 +7561,7 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
             text = "[" + ", ".join(ids) + "]"
             if not alone:                                   # (a tag on a line of its own has no spaces around it)
                 text = text + "  " if tag_start else "  " + text
-            p.add_run(text, style=styles["requirement tag"])
+            _styled_run(p, text, styles["requirement tag"])
 
     def picture(image: Path, width: float):
         p = d.add_paragraph()                               # a picture: centred, no indent, single spacing (a
@@ -7368,10 +7592,10 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
                    f"{settings.review_confidence:.2f};  ")
     _mark_review(legend.add_run("words marked like this"), "likely_wrong", look)
     legend.add_run(" = very low OCR confidence (likely misread);  ")
-    legend.add_run("[R-0001]", style=styles["requirement tag"])
+    _styled_run(legend, "[R-0001]", styles["requirement tag"])
     legend.add_run(" = the row ID in the Excel workbook that this text became;  ")
     if keyword_re is not None:
-        legend.add_run("shall", style=styles["requirement keywords"])
+        _styled_run(legend, "shall", styles["requirement keywords"])
         legend.add_run(" = a requirement keyword;  ")
     legend.add_run("[header] / [footer] = page header/footer text read from the scan.")
     paragraph("body", "Suggested check: compare each page image with the text below it. Every sentence with a "
@@ -7393,7 +7617,8 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
             paragraph("notes").add_run("This page could not be read - check the scan manually.").bold = True
         if settings.word_page_images and page.image_file and cache_dir and (cache_dir / page.image_file).exists():
             aspect = page.height / max(page.width, 1)
-            picture(cache_dir / page.image_file, max(1.0, min(usable_w, (usable_h - 0.6) / aspect)))
+            # (room is kept for the "Page N" heading and a line of notes above the picture)
+            picture(cache_dir / page.image_file, max(1.0, min(usable_w, (usable_h - 1.2) / aspect)))
             paragraph("heading 2", f"Page {page.number} - text read by the tool", page_break=True)
         for b in blocks_by_page.get(page.number, []):
             ids = tags.get(b.uid, [])
@@ -7412,10 +7637,11 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
                     paragraph("captions", b.meta["caption"])
                 if ids and tag_start:
                     tag(paragraph("body"), ids, "start", alone=True)
-                tbl = d.add_table(rows=t.n_rows, cols=t.n_cols)
-                tbl.style = styles["tables"]
-                tbl.alignment = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
-                                 "right": WD_TABLE_ALIGNMENT.RIGHT}[look.get("tables", "alignment")]
+                tbl = d._body.add_table(t.n_rows, t.n_cols, Emu(int(usable_w * 914400)))   # (the text width,
+                tbl.style = styles["tables"]                                                # less any gutter)
+                if table_alignment:                         # (empty with a template: its table style decides)
+                    tbl.alignment = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
+                                     "right": WD_TABLE_ALIGNMENT.RIGHT}[table_alignment]
                 table_look = tbl._tbl.tblPr.find(_q(_W, "tblLook"))
                 if table_look is not None:                  # a heading row; no first-column or banded-row look
                     table_look.attrib.pop(_q(_W, "val"), None)   # from a template's table style
@@ -7459,7 +7685,7 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
                 img_file = b.meta.get("image_file")
                 if img_file and cache_dir and (cache_dir / img_file).exists():
                     fw = max(1, b.box[2] - b.box[0]) / max(page.dpi, 1)
-                    picture(cache_dir / img_file, min(usable_w, max(1.5, fw)))
+                    picture(cache_dir / img_file, max(0.5, min(usable_w, max(1.5, fw))))
                 else:
                     paragraph("notes", "[figure]")
                 if b.lines:
@@ -7476,7 +7702,9 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
                 _add_confidence_runs(para, tokens, settings, look, keyword_re if requirement else None,
                                      styles["requirement keywords"])
                 if b.meta.get("continued_across_pages"):
-                    para.add_run(" [continues across pages]").italic = True
+                    label = para.add_run(" [continues across pages]")
+                    label.italic = True
+                    label.font.size = styles["notes"].font.size or Pt(8)
                 tag(para, ids, "end")
     return _save_word_file(d, path)
 
@@ -7521,6 +7749,7 @@ def write_starter_template(target: Path, look: ReportLook) -> Path:
         if path.exists():
             raise ReportLookError(f"{path} already exists and is not overwritten. Choose another name, or give a "
                                   "folder to get the next free name.")
+        path.parent.mkdir(parents=True, exist_ok=True)
     d, styles = _report_document(look)
     style_file = look.style_file.name if look.style_file else "report_style.ini"
 
@@ -7561,12 +7790,12 @@ def write_starter_template(target: Path, look: ReportLook) -> Path:
     label(by_section["requirements"])
     p = paragraph("requirements")
     if look.get("requirements", "tag_position") == "start":
-        p.add_run("[R-0001]  ", style=styles["requirement tag"])
+        _styled_run(p, "[R-0001]  ", styles["requirement tag"])
     p.add_run("3.2.1.1 Output voltage. The power supply ")
-    p.add_run("shall", style=styles["requirement keywords"])
+    _styled_run(p, "shall", styles["requirement keywords"])
     p.add_run(" deliver 28 V DC within 0.5 V.")
     if look.get("requirements", "tag_position") != "start":
-        p.add_run("  [R-0001]", style=styles["requirement tag"])
+        _styled_run(p, "  [R-0001]", styles["requirement tag"])
     for section in ("requirement tag", "requirement keywords"):
         label(by_section[section])
     label(by_section["captions"])
@@ -7574,20 +7803,27 @@ def write_starter_template(target: Path, look: ReportLook) -> Path:
     label(by_section["tables"])
     label(by_section["table header row"])
     label(by_section["table text"])
-    table = d.add_table(rows=3, cols=3)
+    table = d._body.add_table(3, 3, Emu(int(_usable_page(d)[0] * 914400)))
     table.style = styles["tables"]
-    table.alignment = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
-                       "right": WD_TABLE_ALIGNMENT.RIGHT}[look.get("tables", "alignment")]
+    alignment = look.values.get(("tables", "alignment")) or (None if look.template else "center")
+    if alignment:
+        table.alignment = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
+                           "right": WD_TABLE_ALIGNMENT.RIGHT}[alignment]
+    # The heading-row shading goes into the table style here (a report puts it on the cells), so that it can be
+    # changed in Word, and a report made with this file as its template shades its heading rows the same way.
     fill = look.values.get(("table header row", "fill")) or (BUILT_IN_HEADER_FILL if look.template is None else "none")
+    table_style = styles["tables"].element
+    if fill != "none" and not any(el.get(_q(_W, "type")) == "firstRow" for el in table_style.findall(_q(_W, "tblStylePr"))):
+        from docx.oxml import parse_xml
+        table_style.append(parse_xml(f'<w:tblStylePr xmlns:w="{_W}" w:type="firstRow"><w:tcPr><w:shd w:val="clear" '
+                                     f'w:color="auto" w:fill="{fill}"/></w:tcPr></w:tblStylePr>'))
     for r, row in enumerate((("Parameter", "Value", "Method"), ("Voltage", "28 V", "Test"),
                              ("Ripple", "0.5 V", "Analysis"))):
         for c, text in enumerate(row):
             cell = table.cell(r, c)
             cell.paragraphs[0].style = styles["table header row" if r == 0 else "table text"]
             cell.paragraphs[0].add_run(text)
-            if r == 0 and fill != "none":
-                _shade_cell(cell, fill)
-            elif r == 2 and c == 1:
+            if r == 2 and c == 1:
                 _shade_cell(cell, look.get("review marks", "cell_fill"))
     label(by_section["scanned header footer"])
     paragraph("scanned header footer", "[header] SPEC-1234 Rev. A")
@@ -8040,19 +8276,35 @@ def _write_starter_template_command(args) -> int:
     except ReportLookError as exc:
         LOG.error("%s", exc)
         return 2
+    except OSError as exc:
+        LOG.error("The Word template could not be written to %s (%s). Choose a folder you can write to.",
+                  args.write_word_template, exc.strerror or exc)
+        return 2
+    style_file = Path(settings.word_style_file or DEFAULT_WORD_STYLE_FILE)
     LOG.info("%s", version_line())
     LOG.info("Word template written: %s", path)
     LOG.info("Restyle it in Word (Home > Styles: right-click a style > Modify; double-click the top or bottom of a page "
              "for the header and footer), save it, then write its name in the style file:")
-    LOG.info("    %s:   template = %s", settings.word_style_file or DEFAULT_WORD_STYLE_FILE, path.name
-             if path.parent.resolve() == (settings.word_style_file or DEFAULT_WORD_STYLE_FILE).parent.resolve()
-             else path)
+    # (a name is looked for next to the style file, so anything else is given in full)
+    LOG.info("    %s:   template = %s", style_file, path.name if path.resolve().parent == style_file.resolve().parent
+             else path.resolve())
     if os.name == "nt" and os.environ.get("SPEC_EXTRACTOR_LAUNCHER"):     # (started from make_word_template.bat)
         try:
             os.startfile(str(path))                                      # open it in Word on this computer
         except OSError:
             pass
     return 0
+
+
+def _pause_if_dialog(used_dialog: bool, code: int) -> int:
+    """When the script was double-clicked (files chosen in the file window), keep its window open until Enter is
+    pressed, so the messages can be read. (The .bat launchers pause by themselves.)"""
+    if used_dialog and sys.stdin and sys.stdin.isatty() and not os.environ.get("SPEC_EXTRACTOR_LAUNCHER"):
+        try:
+            input("\nPress Enter to close this window...")
+        except EOFError:
+            pass
+    return code
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -8073,7 +8325,7 @@ def main(argv: Optional[list] = None) -> int:
         parse_page_selection(settings.page_selection, 10 ** 6)
     except ValueError as exc:
         LOG.error("--pages: %s", exc)
-        return 2
+        return _pause_if_dialog(used_dialog, 2)
     configure_keywords(settings.keywords)
     look = None
     if settings.make_word_report:          # a mistake in the style file or template is reported now, not after the OCR
@@ -8081,11 +8333,12 @@ def main(argv: Optional[list] = None) -> int:
             look = report_look(settings)
         except ReportLookError as exc:
             LOG.error("%s", exc)
-            return 2
+            return _pause_if_dialog(used_dialog, 2)
+        settings.word_look = look          # (the look checked now is the one every report of this run uses)
     files = collect_input_files(inputs, settings.recursive)
     if not files:
         LOG.error("No PDF/TIFF/image files found in: %s", ", ".join(map(str, inputs)))
-        return 1
+        return _pause_if_dialog(used_dialog, 1)
     first = Path(inputs[0]).expanduser()
     out_dir = settings.output_dir or ((first if first.is_dir() else first.parent) / "extraction_output")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -8133,12 +8386,7 @@ def main(argv: Optional[list] = None) -> int:
     LOG.info("Finished: %d document(s) processed, %d failed.", len(runs), len(failures))
     for name, err in failures:
         LOG.info("  failed: %s - %s", name, err)
-    if used_dialog and sys.stdin and sys.stdin.isatty() and not os.environ.get("SPEC_EXTRACTOR_LAUNCHER"):
-        try:
-            input("\nPress Enter to close this window...")
-        except EOFError:
-            pass
-    return 0 if not failures else 1
+    return _pause_if_dialog(used_dialog, 0 if not failures else 1)
 
 
 if __name__ == "__main__":
