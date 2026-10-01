@@ -1,11 +1,11 @@
 # Spec Extractor
 
-> ## Version 1.3.0
+> ## Version 1.4.0
 >
 > Every run prints this version together with a **build** fingerprint of the code that is actually running:
 >
 > ```
-> spec_extractor 1.3.0 (build a1b2c3d commit 4e5f6a7)
+> spec_extractor 1.4.0 (build a1b2c3d commit 4e5f6a7)
 > ```
 >
 > (the two short codes are examples - yours will differ)
@@ -27,7 +27,7 @@ For each input document, in the output folder:
 | File | What it is |
 |---|---|
 | `<name>_extracted.xlsx` | **Extracted Items** sheet: one row per requirement / table / caption. Columns include page, section, paragraph number or requirement ID, keyword, class (mandatory/goal/intent), **verification method** and **references** (see below the table), plus confidence and review flags. One extra sheet per table (`T001`, `T002`, …) holding the full cell grid. **Full Text** has every text block in reading order. **Page Quality** has per-page scan quality. **Run Info** has the settings, the column help and the *Tested configuration* check ([Python versions](#python-versions)). |
-| `<name>_verification.docx` | Page by page: the cleaned scan image, then the text the tool read (headings, paragraphs, lists, real Word tables, captions, figures). Words that need a look are **highlighted**, and blue tags such as **[R-0012]** show which Excel row a sentence became. |
+| `<name>_verification.docx` | Page by page: the cleaned scan image, then the text the tool read (headings, paragraphs, lists, real Word tables, captions, figures). Words that need a look are **highlighted**, and blue tags such as **[R-0012]** show which Excel row a sentence became. Its fonts, sizes and spacing can be changed, or taken from your own Word template: see [The look of the Word report](#the-look-of-the-word-report-your-own-template-fonts-sizes-and-spacing). |
 | `ALL_DOCUMENTS_<date>.xlsx` | All documents in one workbook (only when several files are processed). |
 | `spec_extractor_log.txt` | The run log. |
 | `_cache\` | Saved OCR results. Re-runs of unchanged files skip the slow OCR step. Safe to delete. |
@@ -64,6 +64,7 @@ Requirements are recognised in all the usual layouts:
 3. Double-click **`setup_windows.bat`**. This is a one-time step of a few minutes that creates a private `.venv` environment with **exactly the package versions the tool was tested with** (`constraints.txt`). It picks a tested Python by itself, and says what to install if there is none.
 4. Double-click **`run_extractor.bat`** and pick PDF/TIFF files. If you press *Cancel*, you get a folder picker instead. You can also **drag and drop** files or folders onto `run_extractor.bat` (Windows cannot pass a name containing `&` this way: rename the file, or use the picker). The folder may be on a network share.
 5. Open the `extraction_output` folder next to your documents.
+6. Optional: to give the Word report your organisation's look, put your Word template in the `word_style` folder and write its name in the style file `word_style\report_style.ini`. See [Using your organisation's Word template, step by step](#using-your-organisations-word-template-step-by-step).
 
 From a terminal (any OS):
 
@@ -94,7 +95,7 @@ Copy the whole folder, including the new `wheels` subfolder, to the offline comp
 | **3.10** | Supported, same accuracy. Uses older numpy and ONNX Runtime releases, pinned in `constraints.txt`. Python 3.10 reaches end of life in October 2026. |
 | 3.15 and newer, 32-bit Python, the free-threaded build (`python3.14t`) | Not supported: the OCR and table packages cannot be installed there, or were not tested there. `setup_windows.bat` skips them. |
 
-Release 1.2.0 was re-run on Python 3.10, 3.11, 3.12 and 3.13 with the exact package versions in `constraints.txt`; **Python 3.14 has not been re-run since release 1.0.1** (see section 9). Every run states whether it used this **tested configuration**: in the first lines of the run log, in the *Tested configuration* row of the Excel **Run Info** sheet (the installed versions are listed below it) and in the header of the Word report. If it says **NO**, the accuracy figures in section 6 do not apply to that run; see section 7.
+Release 1.4.0 was re-run on Python 3.10, 3.11, 3.12 and 3.13 with the exact package versions in `constraints.txt`; **Python 3.14 has not been re-run since release 1.0.1** (see section 9). Every run states whether it used this **tested configuration**: in the first lines of the run log, in the *Tested configuration* row of the Excel **Run Info** sheet (the installed versions are listed below it) and in the header of the Word report. If it says **NO**, the accuracy figures in section 6 do not apply to that run; see section 7.
 
 ---
 
@@ -116,11 +117,226 @@ Release 1.2.0 was re-run on Python 3.10, 3.11, 3.12 and 3.13 with the exact pack
 | `--no-inferred-rows` | Do not work out a table's missing row separators from the text. Tables whose columns are ruled but whose rows are not will then be missed |
 | `--no-sideways-headers` | Do not turn a table's header band upright to read column headers printed sideways |
 | `--no-word`, `--no-page-images`, `--no-combined` | Skip outputs, or make the Word report smaller |
+| `--word-style FILE` | Use another style file for the Word report's look (default: `word_style\report_style.ini`, see below) |
+| `--write-word-template FOLDER` | Write a Word file with every style of the report and a sample of each, to restyle in Word and use as the template, then stop. `make_word_template.bat` does this with one double-click |
 | `--no-cache` | Always redo the OCR |
 | `--engine docling` | Optional AI layout/table engine (section 8) |
 | `--debug-images` | Save the cleaned page images in `_cache` |
 
 Everything else, such as keyword classes, table header names and thresholds, is in the **`Settings`** class near the top of `spec_extractor.py`, with an explanation next to each value.
+
+### The look of the Word report: your own template, fonts, sizes and spacing
+
+The Word report (`<name>_verification.docx`) can be made to look like your organisation's other documents. There are three ways, and they can be combined:
+
+* **Use your organisation's Word template.** The template's fonts, heading styles, colours, page size, margins, header and footer (logo, classification marking, page numbers) are then used for every report. See the steps just below.
+* **Restyle the report in Word itself**, with `make_word_template.bat`. See [Restyling the report in Word](#restyling-the-report-in-word).
+* **Change single values**, such as a font, a heading size, the spacing or the paper size, in the *style file* `word_style\report_style.ini`. This is a text file of settings that you open in Notepad. See [Changing single values](#changing-single-values-fonts-sizes-spacing-page-layout).
+
+None of this changes what the tool reads or what goes into the Excel file; only the look of the Word report changes. Trying a change is quick. The slow reading of a scan is kept in the `_cache` folder, so running a document again only writes its reports again, which takes seconds.
+
+#### Using your organisation's Word template, step by step
+
+**1. Get the template file.**
+
+* A Word template from your organisation (a `.dotx` file) can be used as it is.
+* A Word document that already looks right (a `.docx` file) can be used too. Its styles, page layout, headers and footers are used, but not the text on its pages.
+  * The text in its headers and footers does go into every report, including what their fields show, such as a document number, a title or an author's name. So choose a document whose header and footer hold nothing that belongs to that one document, or delete such text from them first.
+  * Never use a finished verification report, or any other document with sensitive content: the file stays in the `word_style` folder, and goes wherever that folder is copied. To restyle the report itself, use `make_word_template.bat` (see [Restyling the report in Word](#restyling-the-report-in-word)).
+* A `.dotm` or `.docm` file (these can hold macros), or an old `.dot` or `.doc` file, is not used. To make a usable copy:
+  1. Open it in Word and choose **File > Save As**.
+  2. Set *Save as type* to **Word Template (\*.dotx)**.
+  3. If Word asks whether to save it without macros, choose **Yes**.
+  4. Word suggests its *Custom Office Templates* folder. Choose the `word_style` folder of step 2 instead, or copy the file there afterwards.
+
+**2. Copy the template into the `word_style` folder.** This folder is inside the tool's folder, next to `spec_extractor.py`:
+
+```text
+spec_extractor\
+    run_extractor.bat
+    make_word_template.bat
+    spec_extractor.py
+    word_style\
+        report_style.ini          <- the style file (step 3)
+        Company Report.dotx       <- put your template here
+```
+
+**3. Write the template's name in the style file.**
+
+1. Open `word_style\report_style.ini` in Notepad: right-click it, then choose *Open with* > *Notepad*. This is the *style file*; the tool's messages call it that.
+2. Near the top, under `[document]`, find the line that is just `template =`, with nothing in front of it. The line a little above it, `;     template = Company Report.dotx`, is only an example: a line that starts with a semicolon (`;`) is a comment, which the tool ignores.
+3. Change that line: after `template =`, write the template's file name exactly as it is spelt, including its ending (`.dotx` or `.docx`). Do not add a second `template =` line; a setting written twice stops the run.
+4. Save the file with **File > Save**.
+
+```ini
+[document]
+template = Company Report.dotx
+```
+
+* Spaces in the name are fine, and no quotes are needed.
+* If Windows hides file endings, File Explorer's *Type* column shows *Microsoft Word Template* for a `.dotx` file and *Microsoft Word Document* for a `.docx` file.
+* A template kept in another folder can be given with its full path, for example `template = C:\Templates\Company Report.dotx`.
+
+**4. Run the tool as usual.** Double-click `run_extractor.bat`, or run `python spec_extractor.py ...`. Among the first lines of the run is the look that is used, followed by what was left out of the template or changed in it:
+
+```text
+Word report look: template Company Report.dotx (sha256 3f9a1c7e2b40), report_style.ini (nothing changed)
+  from the template, its link to an attached template was left out (file:///\\fileserver\templates\Corporate.dotm)
+  from the template, field(s) DOCPROPERTY in the footer became the text they showed
+  from the template, its own text was left out (only its styles, page layout, headers and footers are used)
+```
+
+* These lines are information only; the run goes on.
+* The code after `sha256` identifies the template file. Yours will be different. It changes whenever the template is saved again, so it also shows that a new version was used.
+* The same lines are written to `spec_extractor_log.txt` in the output folder.
+* If the template cannot be used, or the style file has a mistake, the run stops at this point, before any document is read. The message, shown in the window and written to `spec_extractor_log.txt`, says what to do. See [When the template is refused](#when-the-template-is-refused-or-the-report-does-not-look-right).
+
+**5. Check the report.** Open `<name>_verification.docx`. It now has the template's fonts and heading styles, its page size and margins, and its header and footer. The summary at the top of the report and the *Run Info* sheet of the Excel file name the template that was used.
+
+* **To change the template later**, edit it in Word and save it under the same name; the next run uses the new version. To open a `.dotx` file for editing, right-click it and choose *Open*. Double-clicking a `.dotx` file starts a new document from it instead.
+* **To go back to the tool's own look**, delete the name after `template =`, leave the line as `template =`, and save.
+
+#### What the report takes from the template, and what it never takes
+
+Every report is a new Word document. Only the following are copied into it from the template, after they have been checked:
+
+* the **styles**, such as Normal, the headings, the captions and the table styles, with their fonts, sizes, colours and spacing;
+* the **theme** fonts and colours, and the list numbering;
+* the **page size, orientation and margins** (those of the template's last section), and a few page-layout settings: default tab stops, hyphenation, different odd and even pages;
+* the **headers and footers** with their pictures, including a different first page and different odd and even pages.
+
+The following are never copied:
+
+* the template's own text;
+* its document properties (author, company, comments). However, the text its header and footer show is copied, including what their fields showed, such as an author's name or a document number;
+* its link to an attached template, which is often on a network share;
+* macros, embedded objects, and anything else in the file.
+
+Some things in the headers and footers are changed as they are copied:
+
+* A link becomes plain text.
+* Tracked changes are accepted.
+* A field other than a page number, page count, date or heading reference becomes the text it showed, so the header reads just as it does in the template. Examples are `TITLE`, `DOCPROPERTY` and `INCLUDEPICTURE`.
+
+Automatic heading numbering ("1.1") is switched off in the report, because the scanned headings carry their own numbers.
+
+All of this is because the reports may hold sensitive content, and a Word file can reach outside the computer when it is opened. It can do so through an attached template on a network share, a picture linked to a web address, or a field that fetches a file. Before each report is saved, the tool checks once more that nothing in it points outside the computer.
+
+**Which style is used for each part of the report.** The report uses Word's usual style names, so a template that defines them gives the report its look straight away:
+
+| Part of the report | Word style | Section of the style file |
+|---|---|---|
+| Report title | Title | `[title]` |
+| "Page 12", and "Page 12 - text read by the tool" | Heading 1, Heading 2 | `[heading 1]`, `[heading 2]` |
+| Headings of the scanned document (levels 1, 2, 3 and below) | Heading 2, 3, 4 | `[heading 2]` to `[heading 4]` |
+| Ordinary paragraphs | Normal | `[body]` |
+| List entries | List Paragraph | `[list items]` |
+| Paragraphs that became a requirement | Requirement Text | `[requirements]` |
+| The `[R-0001]` tags, and the keywords (shall, must ...) | Requirement Tag, Requirement Keyword | `[requirement tag]`, `[requirement keywords]` |
+| Table and figure captions | Caption | `[captions]` |
+| Tables, their heading rows and their text | Table Grid, Table Heading, Table Text | `[tables]`, `[table header row]`, `[table text]` |
+| Running headers and footers read from the scan | Scanned Header Footer | `[scanned header footer]` |
+| The tool's own notes | Report Note | `[notes]` |
+
+A style the template does not have is added, with the look it has in the tool's own report:
+
+* **Title and the headings** (often Heading 3 and Heading 4, because Word stores only the styles a file uses) take the template's *theme* fonts and colours. In Word, these are under *Design > Fonts* and *Design > Colors*. Many company templates set their font in each style instead. Then these headings come out in another font, often Calibri. To fix this, write your font under `[document]` in the style file (for example `font = Arial`), or set up those headings in the template.
+* **Caption** is black, italic and centred, in the body font. **List Paragraph** is like the body text, indented.
+* **The report's own paragraph styles** (Requirement Text, Table Text, Scanned Header Footer and Report Note) are based on the template's Normal style. Table Heading is based on Table Text.
+* **Requirement Tag and Requirement Keyword** change only the words they mark, which keep the font of their paragraph.
+
+To use a style of your template for a part instead, name it in the style file. For example, if your requirements are normally set in a style called *Req Text*:
+
+```ini
+[requirements]
+word_style = Req Text
+```
+
+Write the name as Word's *Styles* pane shows it. For Word's built-in styles, use the English name, such as *Heading 1* or *Body Text*.
+
+#### Restyling the report in Word
+
+1. Double-click **`make_word_template.bat`**. It writes `word_style\report_template.docx` and opens it in Word. The file holds every style the report uses, with a sample of each part of the report. If that file already exists, the new one is called `report_template (2).docx`, and so on. The window shows the name and the line to write in step 4.
+2. Change the styles there: on the *Home* tab open the *Styles* pane (Alt+Ctrl+Shift+S), right-click a style and choose *Modify*. For a logo, a classification marking or page numbers, double-click the top or bottom of the page and edit the header or footer. Page size and margins are on the *Layout* tab.
+3. Save the file, keeping the `.docx` format.
+4. In `word_style\report_style.ini`, under `[document]`, change the `template =` line (the one with nothing in front of it) to `template = report_template.docx`, and save. If the window showed another name, such as `report_template (2).docx`, write that name instead. Do not add a second `template =` line.
+
+An existing file is never overwritten. If a template is already named in the style file, the new file starts from that template. So this is also a quick way to see, and fine-tune, how your organisation's template looks in the report.
+
+#### Changing single values: fonts, sizes, spacing, page layout
+
+The style file `word_style\report_style.ini` already has a section for each part of the report, with a line for each setting, and every setting is explained inside the file.
+
+* To change a value, write it after the `=` of the line that is already there, and save.
+* Do not paste a second copy of a section or of a line. Each may appear only once, or the run stops.
+
+* A value left **empty** keeps the template's look. Without a template, it keeps the tool's own look, which the file shows in brackets.
+* A value you fill in always wins, even over the template. So fill in only what you want to change.
+
+For example, after filling in these lines, the file contains:
+
+```ini
+[document]
+template = Company Report.dotx
+font = Arial
+
+[page]
+paper = A4
+margin_left = 2.5 cm
+
+[heading 1]
+size = 16
+
+[body]
+space_after = 6
+line_spacing = 1.15
+
+[requirements]
+tag_position = start
+mark_keywords = yes
+
+[table header row]
+fill = D9D9D9
+```
+
+How to write the values:
+
+* **Font sizes, and space before and after,** are in points, as in Word (`10.5`).
+* **Line spacing** is `single`, `double` or a number of lines (`1.15`, `1.5`). For a fixed height, add `pt` (`12 pt`), or write `at least 12 pt`.
+* **Indents and margins** need a unit: `cm`, `mm` or `in`.
+* **Text colours** are the 6-character code from Word's *Font Color > More Colors > Custom* (`1F4E9A`), or a name such as `dark blue`.
+* **Shading** (`fill`, `cell_fill`) takes only the 6-character code (`D9D9D9`); `fill = none` gives no shading.
+* **Highlights** take the name of one of Word's highlighter colours, such as `yellow`. The style file lists them.
+* **Switches** are `yes` or `no`.
+
+Two settings set the convention for requirement text:
+
+* `tag_position = start` puts the `[R-0001]` tag in front of each requirement, where a requirement ID usually stands.
+* `mark_keywords = yes` prints *shall*, *must*, *should* ... in the Requirement Keyword style, which is bold.
+
+`[table header row]` sets the shading of table heading rows, and repeats the heading row at the top of each page a long table runs onto. The review marks (highlighted words, shaded table cells) can be recoloured under `[review marks]`, but not switched off, because they are the point of the report.
+
+A mistake in the file stops the run **before any document is read**, with the line number and what to write instead. Examples are a misspelt setting, a size of "ten", or a style the template does not have. `--word-style FILE` uses another style file, for example one per customer or program. Its template name is looked for next to that file.
+
+#### When the template is refused, or the report does not look right
+
+| The message or problem | What to do |
+|---|---|
+| *... can hold macros, so it is not used* (a `.dotm` or `.docm` file), or *... contains macros* | In Word: **File > Save As**, *Save as type* **Word Template (\*.dotx)**. If Word asks whether to save it without macros, choose **Yes**. Save it in the `word_style` folder (Word suggests another folder), then write the new name after `template =` in the style file |
+| *... contains ActiveX controls* | These are boxes or buttons added from Word's *Developer* tab, and saving again does not remove them. On the *Developer* tab click *Design Mode*, select each control, press Delete, and save the template again |
+| *... is not in Word's current format* (a `.dot` or `.doc` file) | The same: save it as **Word Template (\*.dotx)** in the `word_style` folder, and write the new name in the style file |
+| *... is protected with a password* | Save an unprotected copy as **Word Template (\*.dotx)** in the `word_style` folder, and use that |
+| *The header (or footer, first-page header ...) of the template holds a picture that is not stored in the template* | The picture is linked to a file or a web address. In Word, double-click the header or footer the message names. Delete the picture and insert it again with **Insert > Pictures > This Device**, without choosing *Link to File* |
+| *The header (or footer ...) of the template holds an embedded object or control*, or *... something other than text and pictures* | Remove that object from the header or footer, or replace it with a picture of it |
+| *The Word template named in report_style.ini was not found* | Check the spelling and the ending (`.dotx` or `.docx`). The message shows where the tool looked and lists the Word files in that folder |
+| *A style named in report_style.ini does not exist* | Write the style's name as Word's *Styles* pane shows it. The message lists similar names in the template |
+| *The page of the report would leave only ... in for the text* | The margins are wider than the paper allows. Make them smaller in the template or under `[page]` |
+| *The template ... could not be read*, *could not be used*, *is damaged*, *is not a Word .docx/.dotx file* or *has no document in it* | The file is damaged, or is not really a Word file (for example a web page or an RTF file whose name ends in `.docx`). Open it in Word, save it again as **Word Template (\*.dotx)** in the `word_style` folder, and use the new file |
+| The report does not look like the template | Check that the *Word report look* line of the run names your template, and that the name is on the `template =` line itself, not on the example line above it that starts with `;`. A value filled in in the style file wins over the template: empty it |
+| The third-level headings and below are in another font (often Calibri) | The template sets its font in each style rather than in its theme, and has no Heading 3 or Heading 4 of its own. Write the font under `[document]` in the style file (`font = Arial`), or add those headings to the template |
+| The fonts look different on another computer | That computer does not have the template's font. Word then uses a similar one; install the font, or choose another in the template |
+
+**Keeping the template.** Templates put in the `word_style` folder are not committed to git (`word_style\.gitignore`), because a template can carry logos, classification markings, author names and server paths. If your repository is internal and should keep the template, delete those lines from `word_style\.gitignore`. Keep the `word_style` folder, with your template and `report_style.ini`, when you install a new version of the tool.
 
 ---
 
@@ -165,7 +381,7 @@ Everything else, such as keyword classes, table header names and thresholds, is 
 * A faint scan can lose the space after a paragraph number, or read it as a speck of dirt (`4.2Extended verification.`, `3.2.2.2.Input power.`). Both are repaired, while list markers (`1.Built-in test`), part numbers (`MIL-STD-1553B`) and file names are left exactly as read.
 * A faint scan can also lose the **blank line between two numbered paragraphs**, leaving both in one block. Each number found inside a block starts a new paragraph, so every requirement keeps the number and title it was written under instead of inheriting the one above. A cross-reference in running text ("… as defined in 3.2.1. Testing shall …") and a quantity ("3.3 V shall …") are not mistaken for one.
 * A keyword sentence that **leads into a list** is a stem, and each list item below it becomes a row. It usually ends in ":", but the colon is often left out, or lost on the scan, so a sentence ending with a lead-in phrase counts too: *… each of the following.*, *… within the following limits.*, *… as follows.*, *… as specified below.* Without a colon, the items must look like items: a marker, a label, or a run of two or more short lines indented level with each other that state no requirement of their own ("Own ship position and heading." / "Target range and bearing."); a single sentence after *… on the following day.* is not a list. (A lead-in phrase with nothing under it is simply a requirement. A colon with nothing under it is flagged, and so is a lead-in phrase followed by one short indented line that was not taken as an item.) A stamp or figure between list items does not break the list. Because a marker can be misread (`e.` for `c.`, `3.` for `8.`) or lost altogether, **indentation outranks the marker character**: an item that keeps the list's indentation stays in the list even when its letter or number makes no sense, and a numbered line at a list's indentation is an item rather than a heading. In a list with labels, an item whose marker was lost starts with its label in the label column, which is enough to recognise it. An item that loses its marker in a list **without** labels starts exactly where a wrapped line of the item above would; when the markers either side show the gap (`a.` then `c.`, in a list that otherwise counts up one at a time), the item above is split where the new sentence starts and the lost item gets its letter back from the sequence (reported). A list that counts in twos (tests 1, 3, 5) is left as printed. *Known limitation:* the last item of a list has no marker after it to show the gap, so if it loses its marker it stays joined to the item above.
-* **Numbers must follow in sequence.** Paragraph numbers count up: after 3.2.4 may come 3.2.4.1, 3.2.5, 3.3 or 4, and up to three may be skipped, because a scan can miss a heading. A number that fits none of these - 1.5 or 20 after 3.2.4 - is a value that happens to start a line ("1.5 V peak-to-peak", "20 Hz to 2000 Hz"): it does not start a new section, end a list, or split a paragraph. The other way round, a line that starts with exactly the number that should come next (3.5.1 under 3.5) starts a new paragraph even when a speck made the line above look unfinished. **List markers count up the same way** (a, b, c / 1, 2, 3 / i, ii, iii / (a), (b)): a marker the scan misread ("C." for "c.") or lost is taken from its neighbours, and *Review Reasons* says so ("List marker read as 'C.' - taken as 'c.' from the sequence"), because the letter came from the tool rather than the page. A list that really skips a letter keeps its letters: a valid marker is only replaced when the next item confirms the expected one. A notice between or after the items ("NOTE:", "WARNING:", "CAUTION:") is never numbered and keeps a row of its own, and a requirement ID on tab stops ("SRS-101:   The software shall …") stays the requirement's ID rather than becoming a list label. Each level of a nested list is judged on its own (`A.`, `B.` with `a.`, `b.` below them keep their capitals). Several lost markers are counted from the nearest letter the scan kept, also at the start of a list (`Acceleration: …`, `Vibration: …`, `c. Shock: …` gives a., b., c.). A block between two items that cannot be an item - the letter it would get belongs to a later item - is joined to the item above it at its own level when it is only a piece of text, and keeps its own row, unnumbered, when it states a requirement of its own or leads into a list of its own. A numbered list is never mistaken for section headings by the paragraph after it: `1.` `2.` `3.` followed by `3.2.5 Weight. …` are list items; only a title-like last line followed by its own first sub-paragraph (`4. Verification` then `4.1 General. …`) is a heading. A blank line under an item that has finished its sentence ends the item: a paragraph after it is a requirement of its own, and a value only goes on past a blank line in its value column.
+* **Numbers must follow in sequence.** Paragraph numbers count up: after 3.2.4 may come 3.2.4.1, 3.2.5, 3.3 or 4, and up to three may be skipped, because a scan can miss a heading. A number that fits none of these - 1.5 or 20 after 3.2.4 - is a value that happens to start a line ("1.5 V peak-to-peak", "20 Hz to 2000 Hz"): it does not start a new section, end a list, or split a paragraph. The other way round, a line that starts with exactly the number that should come next (3.5.1 under 3.5) starts a new paragraph even when a speck made the line above look unfinished. **List markers count up the same way** (a, b, c / 1, 2, 3 / i, ii, iii / (a), (b)): a marker the scan misread ("C." for "c.") or lost is taken from its neighbours, and *Review Reasons* says so ("List marker read as 'C.' - taken as 'c.' from the sequence"), because the letter came from the tool rather than the page. The same misread - a capital read as the small letter of the same shape (c, o, s, v, w, x, z) - is allowed for in a paragraph title (`3.2.7 output. The …` keeps its number) and in a label (`current:` still starts its own item). A list that really skips a letter keeps its letters: a valid marker is only replaced when the next item confirms the expected one. A notice between or after the items ("NOTE:", "WARNING:", "CAUTION:") is never numbered and keeps a row of its own, and a requirement ID on tab stops ("SRS-101:   The software shall …") stays the requirement's ID rather than becoming a list label. Each level of a nested list is judged on its own (`A.`, `B.` with `a.`, `b.` below them keep their capitals). Several lost markers are counted from the nearest letter the scan kept, also at the start of a list (`Acceleration: …`, `Vibration: …`, `c. Shock: …` gives a., b., c.). A block between two items that cannot be an item - the letter it would get belongs to a later item - is joined to the item above it at its own level when it is only a piece of text, and keeps its own row, unnumbered, when it states a requirement of its own or leads into a list of its own. A numbered list is never mistaken for section headings by the paragraph after it: `1.` `2.` `3.` followed by `3.2.5 Weight. …` are list items; only a title-like last line followed by its own first sub-paragraph (`4. Verification` then `4.1 General. …`) is a heading. A blank line under an item that has finished its sentence ends the item: a paragraph after it is a requirement of its own, and a value only goes on past a blank line in its value column.
 * A **table** is a requirement table when a column header names the requirement text (*Requirement*, *Requirement Text*, *Shall Statement* – not *Requirement ID/Type/Title*; then every row counts), or when most cells of a column contain a keyword. Headers are read from every header row, so a banner merged across the top (*VERIFICATION METHOD* above *I / A / D / T*) does not hide the real column names. The ID column is found by header (*Req ID, Requirement No., Para* …) or by content, and a *Method/Verification* column fills the verification method.
 * Garbled keywords are repaired only for exact OCR patterns (`sha11`, `shaII`, `rnust`, `wi11`). Real words such as *shell*, *small* or *most* never match, and every repair is listed in *Review Reasons*.
 * A word the document repeats is normally a term of the program's own, not a misread, so it is not flagged. But OCR repeats *its* mistakes too - the same word read the same wrong way on every page - and those are the errors most easily missed. So a repeated word that is in no dictionary is still flagged when the document **also writes the ordinary English word one edit away from it** (`systen` printed beside `system`). A term of the program's own has no such twin in its own document and stays unflagged.
@@ -208,11 +424,13 @@ Of the 24 requirement rows that still contained an OCR character error, **21 wer
 
 Table **cells** are 100 % right on the clean and office scans of the ordinary documents and 97 % on the table-structure document, where the sideways headers are read from a quarter-turned crop and lose a character or two. On the heavy photocopies cell accuracy is 82–100 %, on the supplied low-resolution pages 90 % and on the fax 71 %; those are OCR misreads inside cells that were correctly found and correctly divided into rows and columns, and they are flagged for review.
 
-The same test was re-run for 1.2.0 on Python **3.10, 3.11, 3.12 and 3.13**. All four pass, and their results are identical: every cell of every Excel sheet matches (apart from the run information), so the figures above apply to each of them. **Python 3.14 has not been re-run since release 1.0.1**, where it also passed (see section 9). On 3.13 and 3.14 the OCR-based orientation check costs a few seconds per page - about 13 s per page against 7.6 s on 3.12 on the single-core test machine.
+The same test was re-run for 1.4.0 on Python **3.10, 3.11, 3.12 and 3.13**. All four pass, and their results are identical: every cell of every Excel sheet matches (apart from the run information), so the figures above apply to each of them. **Python 3.14 has not been re-run since release 1.0.1**, where it also passed (see section 9). On 3.13 and 3.14 the OCR-based orientation check costs a few seconds per page - about 13 s per page against 7.6 s on 3.12 on the single-core test machine.
 
-Page orientation was right in 32 of 32 tests (every quarter turn of 8 different pages). Processing took 5–9 s per page (6.4 s on average) on a 2-core virtual machine; typical laptops with more cores are faster. After the OCR, a synthetic 300-page document with a 40-row table on every page needed about one minute for document clean-up, extraction, Excel and Word output.
+Page orientation was right in 32 of 32 tests (every quarter turn of 8 different pages, among them a title page and pages with only a few lines at their top or foot), with the orientation classifier (Python 3.11) and without it (3.13). Processing took 5–9 s per page (6.4 s on average) on a 2-core virtual machine; typical laptops with more cores are faster. After the OCR, a synthetic 300-page document with a 40-row table on every page needed about one minute for document clean-up, extraction, Excel and Word output.
 
 The requirement text errors that remain are OCR misreads of damaged print (for example "fro" for "from", "958" for "95%"). They are left as read, never silently "corrected", which is why the review flags matter.
+
+**The test-case library.** Besides these documents, `tests/cases` holds 149 small scans, each showing one situation the tool must get right or once got wrong - a list on wide tab stops, a marker the scan lost, a lead-in without a colon, a heading after a list, a list beside a column of prose, a table under a lead-in, a list that carries on over a page break - with the exact rows it must produce. Each has a fixed ID such as `TAB-01`, and `tests/cases/CASEBOOK.pdf` shows them all, one page per case. 136 of them pass; the 13 marked there as *known limitations* are what the tool still gets wrong, each with a description of what happens instead (see section 9).
 
 **Real documents will differ.** Before relying on the tool for a program, run a pilot of 20–30 pages of your own documents and compare against a manual extraction.
 
@@ -231,13 +449,15 @@ The requirement text errors that remain are OCR misreads of damaged print (for e
 | A page is text but nothing was found | Look at *Page Quality* and the Word report. Try `--dpi 300` for very small print, or `--remove-color-marks` for colored stamps |
 | Every line of a table cell became its own table row | Fixed in 1.1.1. If it reappears, the table's records are not being told from its wrapped lines: check the Word report to see how the page was grouped, and try `--no-inferred-rows` to see whether the row inference is responsible |
 | A verification matrix came out as **one huge row**, with every X bundled together | Fixed in 1.2.0 for the usual shape: a legend band across the top, a header row, column rules and no line between the requirements. If it reappears, the rows are not being found from the text: check the Word report to see how the page was grouped, and send the page to the maintainer - a fixture of that exact shape is the way these get fixed |
-| A list item has only its label ("a. Acceleration:") and its value appears elsewhere, or later items are missing | Fixed in 1.3.0: wide tab stops between marker, label and value are no longer taken for text columns or for a borderless table. If it reappears, check the Word report: if the values sit in paragraphs of their own, the layout step split the items - send the page to the maintainer |
-| A list entry was joined to the one before it | The scan lost that entry's letter or number, so its line looks like a wrapped line of the item above. When the letters either side show the gap (`a.` then `c.`), the item is split where the new sentence starts and the entry gets its letter back, marked *List marker missing - taken as 'b.' from the sequence*; when the split point is not clear, the item before the gap is flagged (*The list goes from 'a.' to 'c.' …*). An entry that lost its marker at the END of a list has no letter after it to show the gap - correct it in the Excel file |
-| List items lost their values right above a two-column section | *Known limitation:* when a list on wide tab stops is followed directly by text set in two columns, with no full-width line between them, the list's tab and the column gutter merge into one band and are read as columns. The values are still in the Word report and the *Full Text* sheet; add them to the rows by hand |
-| A table under "… the following characteristics:" came out as list rows, or a list came out as a table | A borderless grid under a lead-in is read as a list when its first column holds labels ("Voltage:") or list markers. It stays a **table** when it has a real third column of short repeated entries (a Method column: *Test*, *Analysis*), a header row, or its caption ("TABLE I. …") right above it or directly under it. (A caption after a blank line under a list usually belongs to the next table, so it does not count.) Check the Word report; the text is kept either way |
+| A list item has only its label ("a. Acceleration:") and its value appears elsewhere, or later items are missing | Fixed in 1.3.0: wide tab stops between marker, label and value are no longer taken for text columns or for a borderless table. If it reappears, check the Word report: if the values sit in paragraphs of their own, the layout step split the items - send the page to the maintainer. Test cases TAB-01 to TAB-54 cover these layouts |
+| A list entry was joined to the one before it | The scan lost that entry's letter or number, so its line looks like a wrapped line of the item above. When the letters either side show the gap (`a.` then `c.`), the item is split where the new sentence starts and the entry gets its letter back, marked *List marker missing - taken as 'b.' from the sequence*; when the split point is not clear, the item before the gap is flagged (*The list goes from 'a.' to 'c.' …*). An entry that lost its marker at the END of a list has no letter after it to show the gap - correct it in the Excel file Test cases LST-03 to LST-12; a lost marker on the LAST item of a list is not found yet (LST-24) |
+| List items lost their values right above a two-column section | *Known limitation* (test case COL-13): when a list on wide tab stops is followed directly by text set in two columns, with no full-width line between them, the list's tab and the column gutter merge into one band and are read as columns. The values are still in the Word report and the *Full Text* sheet; add them to the rows by hand |
+| A table under "… the following characteristics:" came out as list rows, or a list came out as a table | A borderless grid under a lead-in is read as a list when its first column holds labels ("Voltage:") or list markers. It stays a **table** when it has a real third column of short repeated entries (a Method column: *Test*, *Analysis*), a header row, or its caption ("TABLE I. …") right above it or directly under it. (A caption after a blank line under a list usually belongs to the next table, so it does not count.) Check the Word report; the text is kept either way Test cases TBL-01 to TBL-21; labels that are abbreviations with a full stop ('Min.', 'Temp.') still make a table read as a list (TBL-15, TBL-16) |
 | A page image looks fine but the text is read badly | Check *Scan dpi* and *OCR dpi* in the **Page Quality** sheet. A page exported at screen size (roughly 60-100 dpi) is enlarged automatically, but a photograph of a page, or a page cropped to part of a sheet, can still be too coarse to read: re-export or re-scan it at 200-300 dpi |
 | A list became normal paragraphs, or a table was missed | Check the Word report for how the page was grouped. Very faint ruling lines can make a ruled table fall back to text; the text and requirements are still extracted |
+| A result looks wrong for a particular layout | Look the layout up in `tests/cases/CASEBOOK.pdf`: each test case shows one situation, the rows the tool must give for it, and - for the ones marked *known limitation* - what the tool does instead. Quote the case ID (for example LST-20) when reporting a problem, or send a page of the same shape |
 | Excel file "is open in another program" | The tool saves a copy with the time added to the name |
+| *The Word style file has a mistake*, a Word template is refused, or the report does not look like the template | A style-file message gives the line and what to write instead; an empty value, or deleting the line, gives the normal look. For templates, see [When the template is refused, or the report does not look right](#when-the-template-is-refused-or-the-report-does-not-look-right) |
 | Dragging a file onto `run_extractor.bat` does nothing or shows an error | The file or folder name probably contains `&`. Rename it, or double-click the .bat and use the file picker |
 | A page is graded **FAILED** in *Page Quality* | That page could not be read (usually damaged in the file). The other pages were processed. Results with a failed page are not cached, so simply running again retries it; if it fails again, open the page in an image viewer, and if it opens, save/print it to a new PDF and run that |
 | Slow on large batches | Normal on CPU. Unchanged files re-use `_cache`. `--threads N` sets CPU threads |
@@ -268,11 +488,12 @@ python spec_extractor.py spec.pdf --engine docling
 * **After any change**, run the three test levels (install once: `python -m pip install -r requirements-dev.txt -c constraints.txt`):
   * `python tests/test_rules.py` takes seconds and needs no OCR. It feeds realistic page geometry through the layout, clean-up and extraction rules: text across a page break, numbers/units/designators at the start of wrapped lines, headings without a period, unmarked lists, footer-zone items, captions inside table frames and below tables, merged cells, page selection, output names, a damaged page, and more. The table-structure tests draw a **real page image** and run the real detector on it, because those failures are in how the ruling lines (or the absence of them) are read: a table with column rules and no row lines, a fully ruled table that must be left alone, a cell that wraps and must not be split, sparse verification matrices, sideways headers and the arithmetic that maps them back onto their columns. It also checks that `constraints.txt`, the `requirements*.txt` files and `setup_windows.bat` agree on the supported Python versions and packages, and it ends by saying whether it ran on the tested configuration. Add a test here for every new rule or bug.
   * `python tests/run_regression.py` takes a few minutes. It builds the synthetic scanned documents, runs the whole tool, scores it against exact ground truth (requirement recall/precision, paragraph numbers, captions, caption-to-table links, tables, review flags) and prints PASS/FAIL. `--reuse` skips the OCR.
-  * `python tests/list_suite/runner.py` takes a minute or two. It draws ten pages of **list formats** - markers `a.` `(a)` `1)` `(1)` `i.` `(i)` `A.` and bullets; small and very large tabs; with and without labels; labels that wrap; values of one to four lines that start with numbers; nested lists; lead-ins with and without a colon; a typewriter and a proportional font; a photocopy - plus controls that must not change (an ordinary tight list, a real borderless table, a two-column page). It runs the whole tool with the real OCR and checks every row: its paragraph number and marker, and its text. 24 cases; all must pass.
+  * `python tests/cases/run_cases.py` takes ten to twenty minutes. It runs the whole tool, with the real OCR, on the **test-case library**: 149 small scanned documents, each showing **one situation** the tool must get right - lists on wide tab stops, list markers the scan lost or misread, lead-ins with and without a colon, paragraph numbers and headings, paragraphs after a list, two-column pages, tables beside lists, page breaks - together with the exact rows it must produce. Every case has a fixed ID (`TAB-01`, `LST-07`, `PAGE-02` ...): use it to refer to a situation in a report, a review or a commit. **`tests/cases/CASEBOOK.pdf`** is the catalog - one page per case with the situation, what the tool must do and why, the page itself and the rows expected - and `python tests/cases/build_cases.py` draws the scanned documents into `tests/cases/documents/` (one PDF per case, named by its ID) so that any case can be opened and looked at, or run through the tool on its own. A case marked **known limitation** is one the tool still gets wrong; it is kept, with what happens instead, and does not fail the run. Every other case must pass. Each run lists the cases whose result changed since the previous run, and writes the full comparison to `tests/cases/_results/case_report.txt`; `--only TAB` runs one area, `--only TAB-07` one case. **To add a case**, write its page and rows in the right `tests/cases/area_*.py` file (the format is explained at the top of `tests/cases/casekit.py`) under the next free ID, then run `build_cases.py` to draw it and rewrite the catalog; `test_rules.py` fails until the catalog is up to date.
+* **The Word report** is section 11. Its look comes from one table, `REPORT_PARTS` (each part's Word style and the tool's own look), the style file `word_style/report_style.ini` (read by `read_style_file`) and an optional template (read by `read_word_template`). A template is never used as the base document. `_report_document` makes a new document and copies in only the checked styles, theme, list numbering, layout settings, page size and headers/footers. `outside_references` checks every finished report before `_save_word_file` writes it. When adding a part to the report, add it to `REPORT_PARTS` and to `report_style.ini`: `test_rules.py` checks the two agree. Apart from the review marks, a few labels (*Source:*, *Text inside figure:*, the could-not-be-read warning, *[continues across pages]*), the bold and italic of the tags and keywords (Word's bold and italic are toggles, so a style alone cannot hold them inside a bold or italic paragraph), picture paragraphs, the table width, a table alignment set in the style file and the tool's own heading-row shading, the report is formatted only through styles, so a template or Word itself decides the look.
 * **Table detection** lives in section 6c and turns on three questions, each in its own function, so a misbehaving document can be traced to one of them: `_rows_are_under_split` (did the printed ruling lines really describe this table, or has each row swallowed several rows of text?), `_plausible_borderless_table` / `_reads_like_prose` (is this a table at all, or tidy-looking running text?) and `_is_mark_matrix` (is it a verification matrix, which is mostly empty on purpose and must not be judged on how many of its cells are filled?).
 * Rows that had to be worked out from the text are grouped into records by `_record_breaks` (the key column, else `_gap_threshold` on the table's own leading) and joined by `_merge_continuation_rows`; the same grouping drives the borderless detector, so both read a wrapped cell the same way.
 * Each area of a page is read up to three ways, and `_better_row_split` puts them in the order to try: as the printed ruling lines describe it; with the missing separators inferred by img2table; and, when that inference gives up - it does on badly degraded scans, where the ink is too broken for it to measure a row pitch - with the rows cut from the text by `_resplit_rows`. A reading that the checks above then reject falls back to the next one, so a table is never lost by trying to improve it. Both behaviours can be switched off, with `--no-inferred-rows` and `--no-sideways-headers`; that is the quickest way to tell whether one of them is behind a surprising result.
-* **Tested configurations.** Release **1.3.0** passed both test levels on 64-bit Python 3.10.20, 3.11.15, 3.12.3 and 3.13.12 with the package versions in `constraints.txt` (the tests ran on Linux; Windows installs the same package versions), with identical scores on every one of them; the list suite (`tests/list_suite/runner.py`) passed on 3.11. **Python 3.14 was not available where 1.3.0 was built, so it has not been re-run since release 1.0.1: run both test levels on 3.14 before handing this version out.** Release 1.0.1 passed on 64-bit Python 3.10.21, 3.11.16, 3.12.3, 3.13.15 and 3.14.6. To add a Python version or change a package version: update `SUPPORTED_PYTHON` in `spec_extractor.py`, the search list and `PY_CHECK` in `setup_windows.bat`, `constraints.txt` and this README; install; run both test levels on **every** supported version; hand the folder out only when all of them pass.
+* **Tested configurations.** Release **1.4.0** passed the rule tests (236 of them) and the regression on 64-bit Python 3.10.20, 3.11.15, 3.12.3 and 3.13.12 with the package versions in `constraints.txt` (the tests ran on Linux; Windows installs the same package versions), with identical results on every one of them - every cell of every Excel sheet - and the test-case library (`tests/cases/run_cases.py`) on 3.11 and 3.13: 136 cases pass, and the other 13 are the known limitations, still wrong as the catalog describes. Its Word report was also checked with about 50 test templates, both company-style ones and ones built to reach outside the computer, and every report written passed the Word file format schema. Word itself was not available there: open a report, and one made with a company template, in Word before handing this version out. **Python 3.14 was not available where 1.4.0 was built, so it has not been re-run since release 1.0.1: run both test levels on 3.14 before handing this version out.** Release 1.0.1 passed on 64-bit Python 3.10.21, 3.11.16, 3.12.3, 3.13.15 and 3.14.6. To add a Python version or change a package version: update `SUPPORTED_PYTHON` in `spec_extractor.py`, the search list and `PY_CHECK` in `setup_windows.bat`, `constraints.txt` and this README; install; run both test levels on **every** supported version; hand the folder out only when all of them pass.
 * The OCR cache (`_cache`) holds the page layout too. It is keyed on the file, the OCR settings, the requirement keywords (the layout rules protect keyword sentences) a fingerprint of the code sections that produce it (3–6 and 8) and the tool version (so a new release reads documents again once). Editing that code therefore re-reads documents automatically, while changes to the requirement rules and exports (sections 7, 9–12) re-use the cache. Documents with a page that could not be read or saved are not cached.
 * `tests/make_test_corpus.py` shows how to add new document styles with ground truth, and `tests/evaluate.py --details` lists every miss, extra, wrong paragraph number and wrong caption link.
 

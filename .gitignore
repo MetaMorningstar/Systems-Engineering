@@ -14,6 +14,7 @@ extraction_output/
 spec_extractor_log.txt
 spec_extractor/tests/corpus/
 spec_extractor/tests/_results/
-spec_extractor/tests/list_suite/images/
-spec_extractor/tests/list_suite/expectations.json
-spec_extractor/tests/list_suite/_results/
+# the test-case library: its scan documents are drawn from the case definitions (tests/cases/build_cases.py)
+# and its results are written by each run; only the definitions and CASEBOOK.pdf are kept
+spec_extractor/tests/cases/documents/
+spec_extractor/tests/cases/_results*/
