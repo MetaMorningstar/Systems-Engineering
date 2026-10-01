@@ -3967,6 +3967,130 @@ def test_a_damaged_template_gives_a_message_not_a_crash():
         se.read_word_template(broken)                                    # (no styles: Word's standard ones)
 
 
+def test_a_template_header_with_a_table_or_a_text_box_is_not_taken_for_a_tall_one():
+    """A header laid out as a table (logo | title | marking) or holding a floating text box takes the room of its
+    rows, not of every paragraph in it; the start-up check judges the margins only, and a damaged picture size in
+    a header is ignored rather than stopping the run."""
+    from docx.oxml import parse_xml
+    cell = "<w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p><w:p><w:r><w:t>y</w:t></w:r></w:p></w:tc>"
+    rows = "".join(f"<w:tr>{cell * 4}</w:tr>" for _ in range(3))
+    box = ('<w:r><w:drawing><wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+           + "".join("<w:p><w:r><w:t>side</w:t></w:r></w:p>" for _ in range(20)) + "</wp:anchor></w:drawing></w:r>")
+
+    def busy_header(d):
+        header = d.sections[0].header
+        header.is_linked_to_previous = False
+        header.part._element = parse_xml(
+            f'<w:hdr xmlns:w="{W_NS[1:-1]}" xmlns:v="urn:schemas-microsoft-com:vml"><w:tbl>{rows}</w:tbl>'
+            f'<w:p>{box}<w:r><w:pict><v:rect style="width:10pt;height:1.2.3pt"/></w:pict></w:r></w:p></w:hdr>')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        template = _word_template(Path(tmp), extra=busy_header)
+        look = se.ReportLook(template=se.read_word_template(template))
+        d, _styles = se._report_document(look)
+        height = se._story_height(d.sections[0].header._element)
+        assert 3 * 2 * 228600 <= height <= 3 * 2 * 228600 + 228600, height / 914400     # 3 rows of 2 lines + 1 line
+        d, _path = _write_report(Path(tmp), f"[document]\ntemplate = {template.name}\n")
+        assert d.paragraphs                                                       # (accepted, no crash)
+
+
+def test_damaged_or_hostile_bits_of_a_template_are_cleaned_without_breaking_the_rest():
+    """A stray field code sharing a run with a page number's field mark goes and the page number stays; a deleted
+    field code (delInstrText) left outside its deletion goes; a deleted paragraph and a deleted table row go, as
+    with Word's Accept All Changes; and a SECTION field is frozen like other fields."""
+    def header(d):
+        _header_xml(d, '<w:r><w:instrText>junk</w:instrText><w:fldChar w:fldCharType="begin"/></w:r>'
+                       '<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>'
+                       '<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r>'
+                       '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+                       '<w:r><w:delInstrText> INCLUDEPICTURE "http://198.51.100.8/x.png" </w:delInstrText></w:r>'
+                       '<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> SECTION </w:instrText></w:r>'
+                       '<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t> part 2</w:t></w:r>'
+                       '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+                       '<w:p><w:pPr><w:rPr><w:del w:id="1" w:author="A"/></w:rPr></w:pPr><w:del w:id="2" w:author="A">'
+                       '<w:r><w:delText>SECRET</w:delText></w:r></w:del></w:p>'
+                       '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Doc 123</w:t></w:r></w:p></w:tc></w:tr>'
+                       '<w:tr><w:trPr><w:del w:id="3" w:author="A"/></w:trPr><w:tc><w:p><w:r><w:t>NOFORN</w:t></w:r>'
+                       '</w:p></w:tc></w:tr></w:tbl><w:p>')
+    with tempfile.TemporaryDirectory() as tmp:
+        template = _word_template(Path(tmp), extra=header)
+        d, path = _write_report(Path(tmp), f"[document]\ntemplate = {template.name}\n")
+        story = d.sections[0].header._element
+        assert [se._field_name(c) for c in se._field_codes(story)] == ["PAGE"], se._field_codes(story)
+        assert d.sections[0].header.paragraphs[0].text == "1 part 2"
+        package = _package_text(path)
+        for gone in ("198.51.100.8", "SECRET", "NOFORN", "delInstrText", "junk"):
+            assert gone not in package, gone
+        assert len(d.sections[0].header.paragraphs) == 2 and len(d.sections[0].header.tables[0].rows) == 1
+        doc, _styles = se._report_document(se.ReportLook())
+        doc.add_paragraph()._p.append(se._safe_xml(f'<w:r xmlns:w="{W_NS[1:-1]}"><w:delInstrText> LINK x '
+                                                   '</w:delInstrText></w:r>'.encode(), "test"))
+        assert any("LINK" in p for p in se.outside_references(_saved(doc)))
+
+
+def test_a_template_whose_normal_style_is_not_marked_as_the_default_still_has_one_normal():
+    def not_default(d):
+        d.styles["Normal"].element.attrib.pop(f"{W_NS}default", None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        template = _word_template(Path(tmp), extra=not_default)
+        d, _path = _write_report(Path(tmp), f"[document]\ntemplate = {template.name}\n")
+        names = [s.name for s in d.styles]
+        assert names.count("Normal") == 1, names
+        assert _style_value(d, "Caption", "font") == "Arial" and _style_value(d, "List Paragraph", "font") == "Arial"
+
+
+def test_tables_are_centred_by_the_table_style_and_the_starter_keeps_it_with_its_shading():
+    """The tool's own centring goes into the table style (Table Grid), like its heading-row shading in the starter
+    template, so a template that lacks Table Grid gets centred tables and a report made from the unchanged starter
+    looks like the starter; a centring or shading set in the style file is put on the table itself."""
+    import docx
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        d, _path = _write_report(folder)
+        assert d.tables[0]._tbl.find(f"{W_NS}tblPr/{W_NS}jc") is None
+        assert d.styles["Table Grid"].element.find(f"{W_NS}tblPr/{W_NS}jc").get(f"{W_NS}val") == "center"
+        template = _word_template(folder)                                  # (it has no Table Grid of its own)
+        d, _path = _write_report(folder, f"[document]\ntemplate = {template.name}\n", name="t.docx")
+        assert d.styles["Table Grid"].element.find(f"{W_NS}tblPr/{W_NS}jc").get(f"{W_NS}val") == "center"
+        s = se.Settings()
+        s.word_style_file = folder / "fill.ini"
+        s.word_style_file.write_text("[table header row]\nfill = FFFF00\n", encoding="utf-8")
+        starter = docx.Document(se.write_starter_template(folder, se.report_look(s)))
+        assert starter.tables[0].cell(0, 0)._tc.find(f".//{W_NS}shd").get(f"{W_NS}fill") == "FFFF00"
+        sample = next(p for p in starter.paragraphs if "Output voltage" in p.text)
+        assert all(r.bold is None and r.italic is None for r in sample.runs)        # (styles only, for restyling)
+
+
+def test_word_on_off_settings_written_as_off_are_off():
+    from docx.oxml import parse_xml
+
+    def gutter_off(d):
+        from docx.shared import Cm
+        d.sections[0].gutter = Cm(2)
+        d.settings.element.append(parse_xml(f'<w:gutterAtTop xmlns:w="{W_NS[1:-1]}" w:val="0"/>'))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        template = _word_template(Path(tmp), extra=gutter_off)
+        d, _styles = se._report_document(se.ReportLook(template=se.read_word_template(template)))
+        width, _height = se._usable_page(d)
+        section = d.sections[0]
+        assert abs(width - (section.page_width - section.left_margin - section.right_margin - section.gutter)
+                   / 914400) < 0.01
+
+
+def test_a_dark_highlight_for_misread_words_gets_white_text_and_a_damaged_style_file_a_message():
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        path = folder / "dark.ini"
+        path.write_text("[review marks]\nlikely_wrong_highlight = blue\nlikely_wrong_color = C00000\n", encoding="utf-8")
+        assert se.likely_wrong_colour(se.read_style_file(path)) == "FFFFFF"
+        path.write_bytes(b"\xff\xfe" + "[body]\r\nsize = 11\r\n".encode("utf-16-le") + b"\x00")
+        assert "is damaged" in _style_file_error(folder, path.read_bytes())
+        message = _style_file_error(folder, "[document]\ntemplate ..\\new templates\\report.dotx\n")
+        assert "Line 2: template ..\\new templates\\report.dotx" in message, message
+
+
 def _saved(d) -> bytes:
     import io
     buffer = io.BytesIO()

@@ -5885,8 +5885,9 @@ def _save_workbook(wb, path: Path) -> Path:
 # Every part is written in a Word STYLE, not with formatting typed onto the text, so a template (or Word itself,
 # afterwards) decides the look. The exceptions: the review marks - the highlighted words and shaded table cells that
 # are the point of the report - are put directly on the words, so no template can hide them; a few labels ("Source:",
-# "Text inside figure:"); the bold and italic of tags and keywords (see _styled_run); picture paragraphs; and the
-# table width, alignment and (without a template) heading-row shading.
+# "Text inside figure:"); the bold and italic of tags and keywords (see _styled_run); picture paragraphs; the table
+# width; and (without a template) the heading-row shading. A table alignment set in the style file goes on each table;
+# the tool's own centring is part of the Table Grid style.
 PARAGRAPH_KEYS = ("word_style", "font", "size", "bold", "italic", "color", "alignment", "space_before",
                   "space_after", "line_spacing", "indent_left", "first_line_indent")
 CHARACTER_KEYS = ("word_style", "font", "size", "bold", "italic", "color")
@@ -5927,7 +5928,8 @@ REPORT_PARTS = (
     ReportPart("captions", "paragraph", "Caption", "",
                (("italic", True), ("bold", False), ("color", "auto"), ("size", INHERIT), ("line_spacing", INHERIT),
                 ("alignment", "center")), "table and figure titles"),
-    ReportPart("tables", "table", "Table Grid", "", (), "tables read from the scan", ("alignment",)),
+    ReportPart("tables", "table", "Table Grid", "", (("alignment", "center"),), "tables read from the scan",
+               ("alignment",)),
     ReportPart("table text", "paragraph", "Table Text", "",
                (("size", 8.5), ("space_before", 0.0), ("space_after", 0.0), ("line_spacing", ("multiple", 1.0)),
                 ("alignment", "left"), ("indent_left", 0), ("first_line_indent", 0)),
@@ -5952,7 +5954,7 @@ BUILT_IN_PAGE = {"paper": "letter", "orientation": "portrait", "margin_top": 548
                  "margin_left": 640080, "margin_right": 640080}          # 0.6 in and 0.7 in, in EMU
 # values used when the style file leaves a switch or review mark empty (or there is no style file)
 BUILT_IN_SWITCHES = {("requirements", "tag_position"): "end", ("requirements", "mark_keywords"): False,
-                     ("table header row", "repeat_on_each_page"): True, ("tables", "alignment"): "center",
+                     ("table header row", "repeat_on_each_page"): True,
                      ("review marks", "check_highlight"): "yellow", ("review marks", "likely_wrong_highlight"): "yellow",
                      ("review marks", "likely_wrong_color"): "C00000", ("review marks", "cell_fill"): "FFF2CC"}
 BUILT_IN_HEADER_FILL = "D9E2F3"     # without a template; with one, the template's table style decides
@@ -6140,7 +6142,11 @@ def _style_file_text(path: Path) -> str:
     except OSError as exc:
         raise ReportLookError(f"The Word style file {path} cannot be read ({exc.strerror or exc}).") from None
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16")                 # Notepad's "Unicode" (and PowerShell's Out-File)
+        try:
+            return raw.decode("utf-16")             # Notepad's "Unicode" (and PowerShell's Out-File)
+        except UnicodeDecodeError:
+            raise ReportLookError(f"The Word style file {path} is damaged. Open it in Notepad, choose File > Save As, "
+                                  "set Encoding to UTF-8 and save it again.") from None
     if b"\x00" in raw:
         raise ReportLookError(f"The Word style file {path} is not a text file Notepad saved as UTF-8 or ANSI. Open it "
                               "in Notepad, choose File > Save As, set Encoding to UTF-8 and save it again.")
@@ -6180,9 +6186,9 @@ def read_style_file(path: Path) -> dict:
                               f"twice. Put all its settings under one [{exc.section}] line.")])) from None
     except configparser.ParsingError as exc:
         raise ReportLookError(_style_file_message(path, [
-            (number, line.strip().strip("'").replace("\\n", "").strip(), "This line is not a setting: write "
+            (number, lines[number - 1].strip()[:60] if 0 < number <= len(lines) else "", "This line is not a setting: write "
              "name = value, or start the line with ; to make it a comment. A section name needs both brackets, "
-             "such as [body].") for number, line in exc.errors])) from None
+             "such as [body].") for number, _line in exc.errors])) from None
     except configparser.Error as exc:
         raise ReportLookError(_style_file_message(path, [(getattr(exc, "lineno", 0) or 0, "",
                                                           str(exc).splitlines()[0])])) from None
@@ -6249,18 +6255,34 @@ _HIGHLIGHT_RGB = {"yellow": "FFFF00", "bright green": "00FF00", "turquoise": "00
                   "gray 50": "808080", "black": "000000"}
 
 
+def _contrast(colour_a: str, colour_b: str) -> float:
+    """How well two colours (RRGGBB) stand apart, as for the contrast of text on a web page (1 = not at all)."""
+    def luminance(hex_colour: str) -> float:
+        channels = [int(hex_colour[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+    light, dark = sorted((luminance(colour_a), luminance(colour_b)), reverse=True)
+    return (light + 0.05) / (dark + 0.05)
+
+
+def likely_wrong_colour(values: dict) -> str:
+    """The text colour of words very likely misread: the style file's, or C00000 - or, on a highlight too dark for
+    C00000 to be read (blue, red, green ...), white."""
+    default = BUILT_IN_SWITCHES[("review marks", "likely_wrong_color")]
+    chosen = values.get(("review marks", "likely_wrong_color"), default)
+    if chosen != default:
+        return chosen
+    highlight = _HIGHLIGHT_RGB[values.get(("review marks", "likely_wrong_highlight"),
+                                          BUILT_IN_SWITCHES[("review marks", "likely_wrong_highlight")])]
+    return default if _contrast(highlight, default) >= 2.0 else "FFFFFF"
+
+
 def _unreadable_marks(values: dict, lines: list) -> list:
     """The review marks cannot be switched off - so they may not be made unreadable either (black on black)."""
     def get(key):
         return values.get(("review marks", key), BUILT_IN_SWITCHES[("review marks", key)])
-    def luminance(hex_colour: str) -> float:                       # (as for the contrast of web text)
-        channels = [int(hex_colour[i:i + 2], 16) / 255 for i in (0, 2, 4)]
-        linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
-        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-
-    highlight, colour = _HIGHLIGHT_RGB[get("likely_wrong_highlight")], get("likely_wrong_color")
-    light, dark = sorted((luminance(highlight), luminance(colour)), reverse=True)
-    if (light + 0.05) / (dark + 0.05) >= 2.0:
+    highlight, colour = _HIGHLIGHT_RGB[get("likely_wrong_highlight")], likely_wrong_colour(values)
+    if _contrast(highlight, colour) >= 2.0:
         return []
     key = "likely_wrong_color" if ("review marks", "likely_wrong_color") in values else "likely_wrong_highlight"
     return [(_line_of(lines, "review marks", key), f"[review marks]  {key}",
@@ -6322,8 +6344,8 @@ _PICTURE_TYPES = {"image/png": ".png", "image/jpeg": ".jpeg", "image/gif": ".gif
 # fields that only number or date the pages (or repeat a heading of the report): they keep working in a copied
 # header or footer. Any other field (TITLE, DOCPROPERTY, INCLUDEPICTURE ...) is replaced by the text it showed, so
 # what the template's header says never changes.
-SAFE_FIELDS = {"PAGE", "NUMPAGES", "SECTIONPAGES", "SECTION", "DATE", "TIME", "PRINTDATE", "SAVEDATE",
-               "CREATEDATE", "STYLEREF"}
+SAFE_FIELDS = {"PAGE", "NUMPAGES", "SECTIONPAGES", "DATE", "TIME", "PRINTDATE", "SAVEDATE", "CREATEDATE",
+               "STYLEREF"}
 # the only page-layout settings copied from the template's settings (none of them can point anywhere)
 _LAYOUT_SETTINGS = {"view", "zoom", "mirrorMargins", "alignBordersAndEdges", "bordersDoNotSurroundHeader",
                     "bordersDoNotSurroundFooter", "gutterAtTop", "defaultTabStop", "autoHyphenation",
@@ -6494,7 +6516,7 @@ def _field_codes(root) -> list:
     putting another field in the middle of it."""
     codes = [fs.get(_q(_W, "instr"), "") for fs in root.iter(_q(_W, "fldSimple"))]
     stack = []
-    for el in root.iter(_q(_W, "fldChar"), _q(_W, "instrText")):
+    for el in root.iter(_q(_W, "fldChar"), _q(_W, "instrText"), _q(_W, "delInstrText")):
         if _local(el) == "fldChar":
             kind = el.get(_q(_W, "fldCharType"))
             if kind == "begin":
@@ -6550,7 +6572,8 @@ def _freeze_fields(root, keep: set) -> list:
     whole, marks = set(), set()
     for i, el in stray:
         runs[i].remove(el)
-        marks.add(i)
+        if not any(_local(c) != "rPr" for c in runs[i]) and runs[i].getparent() is not None:
+            runs[i].getparent().remove(runs[i])
     for f in fields:
         name = _field_name("".join(f["code"]))
         if name in keep:
@@ -6571,7 +6594,7 @@ def _freeze_fields(root, keep: set) -> list:
     return frozen
 
 
-_REVISION_DROPS = {"del", "moveFrom", "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd",
+_REVISION_DROPS = {"del", "delText", "delInstrText", "moveFrom", "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd",
                    "cellDel", "cellIns", "cellMerge", "rPrChange", "pPrChange", "sectPrChange", "tblPrChange",
                    "tblPrExChange", "trPrChange", "tcPrChange", "tblGridChange", "numberingChange",
                    "customXmlDelRangeStart", "customXmlDelRangeEnd", "customXmlInsRangeStart", "customXmlInsRangeEnd",
@@ -6585,6 +6608,29 @@ def _accept_revisions(root) -> int:
     carry the struck-out SECRET into every report.) Returns the number of changes."""
     changes = [el for el in root.iter() if isinstance(el.tag, str) and el.tag.startswith(f"{{{_W}}}")
                and _local(el) in _REVISION_DROPS | {"ins", "moveTo"}]
+    deleted = (_q(_W, "del"), _q(_W, "moveFrom"))
+    for row in list(root.iter(_q(_W, "tr"))):                     # a deleted table row goes (and an emptied table)
+        props = row.find(_q(_W, "trPr"))
+        if props is not None and any(props.find(tag) is not None for tag in deleted) and row.getparent() is not None:
+            table = row.getparent()
+            table.remove(row)
+            if table.find(_q(_W, "tr")) is None and table.getparent() is not None:
+                table.getparent().remove(table)
+    for p in list(root.iter(_q(_W, "p"))):                        # a deleted paragraph mark joins the paragraph to
+        mark = p.find(f"{_q(_W, 'pPr')}/{_q(_W, 'rPr')}")         # the next one, as Word's Accept All does
+        if mark is None or not any(mark.find(tag) is not None for tag in deleted) or p.getparent() is None:
+            continue
+        content = [c for c in p if _local(c) != "pPr" and not (_local(c) in ("del", "moveFrom"))]
+        following = p.getnext()
+        if following is not None and _local(following) == "p":
+            props = following.find(_q(_W, "pPr"))
+            at = 1 if props is not None else 0
+            for c in content:
+                following.insert(at, c)
+                at += 1
+            p.getparent().remove(p)
+        elif not content:
+            p.getparent().remove(p)
     for el in changes:
         if el.getparent() is None:
             continue
@@ -6892,6 +6938,10 @@ def report_look(settings: Settings) -> ReportLook:
     # used, is reported before any page is read - not after an hour of OCR
     try:
         probe, _styles = _report_document(look)
+        section = probe.sections[0]
+        width = (section.page_width - section.left_margin - section.right_margin - (section.gutter or 0)) / 914400
+        height = (section.page_height - abs(section.top_margin) - abs(section.bottom_margin)) / 914400
+        _usable_page(probe)                   # (reads the template's header pictures: a damaged one is caught here)
     except ReportLookError:
         raise
     except Exception as exc:                  # something in a template python-docx cannot use: a message, not a crash
@@ -6900,7 +6950,6 @@ def report_look(settings: Settings) -> ReportLook:
         raise ReportLookError(f"The template '{look.template.path.name}' could not be used ({type(exc).__name__}: "
                               f"{exc}). Open it in Word, save it again as 'Word Template (*.dotx)' and use the new "
                               "file.") from None
-    width, height = _usable_page(probe)
     if width < 1.5 or height < 1.5:
         lines = [f"  {_at_line(_line_of(look.lines, 'page', k))}[page]  {k}" for k in OTHER_SECTIONS["page"]
                  if ("page", k) in look.values]
@@ -6956,7 +7005,7 @@ def _free_style_id(root, wanted: str, ignore=None) -> str:
     return new
 
 
-def _copy_standard_style(d, name: str, added: set):
+def _copy_standard_style(d, name: str, added: set, copied: dict):
     """Copy a standard style from python-docx's template into the report; None when Word has no standard style of
     that name. The styles it refers to (based on, linked to, next) are matched BY NAME in the report first - a
     template from a non-English Word stores Normal under the id 'Standard' or 'Normale' - and the report's default
@@ -6966,13 +7015,20 @@ def _copy_standard_style(d, name: str, added: set):
     source = _find_style_element(standard, name)
     if source is None:
         return None
-    root = d.styles.element
-    copied = {}                                          # python-docx's style id -> the report's style id
+    root = d.styles.element                              # (copied: python-docx's style id -> the report's)
+
+    def names_of(el) -> set:
+        from docx.styles import BabelFish
+        name_el = el.find(_q(_W, "name"))
+        stored = name_el.get(_q(_W, "val")) if name_el is not None else ""
+        return {stored.casefold(), BabelFish.internal2ui(stored).casefold()} - {""}
 
     def in_report(src):
-        names = _style_names(src) - {(src.get(_q(_W, "styleId")) or "").casefold()}
-        found = next((el for el in root.findall(_q(_W, "style")) if (_style_names(el) & names)
-                      and el.get(_q(_W, "type")) == src.get(_q(_W, "type"))), None)
+        kind, names = src.get(_q(_W, "type")), names_of(src)
+        same_kind = [el for el in root.findall(_q(_W, "style")) if el.get(_q(_W, "type")) == kind]
+        found = next((el for el in same_kind if names_of(el) & names), None)
+        if found is None:                                # (no style of that name: one with python-docx's id)
+            found = next((el for el in same_kind if el.get(_q(_W, "styleId")) == src.get(_q(_W, "styleId"))), None)
         if found is None and src.get(_q(_W, "default")) == "1":
             found = next((el for el in root.findall(_q(_W, "style")) if el.get(_q(_W, "default")) == "1"
                           and el.get(_q(_W, "type")) == src.get(_q(_W, "type"))), None)
@@ -7017,7 +7073,7 @@ _STYLE_TYPES = {"paragraph": WD_STYLE_TYPE.PARAGRAPH, "character": WD_STYLE_TYPE
                 "table": WD_STYLE_TYPE.TABLE}
 
 
-def _report_style(d, part: ReportPart, look: ReportLook, styles: dict, added: set):
+def _report_style(d, part: ReportPart, look: ReportLook, styles: dict, added: set, copied: dict):
     """-> (style, added): the style a part uses, added to the document when it does not have it yet (the ids of
     styles added to this document are in `added`)."""
     from docx.styles.style import StyleFactory
@@ -7027,7 +7083,7 @@ def _report_style(d, part: ReportPart, look: ReportLook, styles: dict, added: se
     if el is None and name.casefold() == "normal":      # (a template whose default paragraph style has another name)
         el = d.styles.default(WD_STYLE_TYPE.PARAGRAPH).element if d.styles.default(WD_STYLE_TYPE.PARAGRAPH) else None
     if el is None:
-        el = _copy_standard_style(d, name, added)
+        el = _copy_standard_style(d, name, added, copied)
     if el is None and named:
         known = sorted({StyleFactory(s).name for s in d.styles.element.findall(_q(_W, "style"))
                         if (s.get(_q(_W, "type")) or "paragraph") == part.kind})
@@ -7101,6 +7157,15 @@ def _apply_look(style, look: dict, styles_root=None) -> None:
         elif key == "color":
             rPr._remove_color()
             rPr.get_or_add_color().set(_q(_W, "val"), value)
+    if style.type == WD_STYLE_TYPE.TABLE and "alignment" in look:      # (a table style: where its tables sit)
+        table_props = style.element.find(_q(_W, "tblPr"))
+        if table_props is None:
+            from docx.oxml import parse_xml
+            table_props = parse_xml(f'<w:tblPr xmlns:w="{_W}"/>')
+            later = next((c for c in style.element if _local(c) in ("trPr", "tcPr", "tblStylePr")), None)
+            later.addprevious(table_props) if later is not None else style.element.append(table_props)
+        table_props.alignment = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
+                                 "right": WD_TABLE_ALIGNMENT.RIGHT}[look["alignment"]]
     if style.type == WD_STYLE_TYPE.PARAGRAPH:
         pf = style.paragraph_format
         for key, value in look.items():
@@ -7284,9 +7349,9 @@ def _report_document(look: ReportLook) -> tuple:
     d = docx.Document()
     if look.template is not None:
         _install_template(d, look.template)
-    styles, added_ids = {}, set()
+    styles, added_ids, copied = {}, set(), {}
     for part in REPORT_PARTS:
-        style, added = _report_style(d, part, look, styles, added_ids)
+        style, added = _report_style(d, part, look, styles, added_ids, copied)
         styles[part.section] = style
         own = _style_name_of(part.section, look.values).casefold() == part.style.casefold()
         if own and (look.template is None or added):
@@ -7358,7 +7423,8 @@ def outside_references(data: bytes) -> list:
                     problems.append(f"{name}: a {kind} relationship, which a report never needs")
         elif low.endswith(".xml"):
             content = z.read(name)
-            if not any(k in content for k in (b"fldChar", b"fldSimple", b"instrText", b"altChunk", b"subDoc",
+            if not any(k in content for k in (b"fldChar", b"fldSimple", b"instrText", b"InstrText", b"altChunk",
+                                              b"subDoc",
                                               b"object", b"control", b"attachedTemplate", b"mailMerge", b"frameset",
                                               b"OLEObject", b"href", b"hlink", b"dataBinding", b"HyperlinkBase",
                                               b"src=")):
@@ -7413,7 +7479,7 @@ def _mark_review(run, level: str, look: ReportLook) -> None:
         run.font.highlight_color = _highlight(look.get("review marks", "check_highlight"))
     elif level == "likely_wrong":
         run.font.highlight_color = _highlight(look.get("review marks", "likely_wrong_highlight"))
-        run.font.color.rgb = RGBColor.from_string(look.get("review marks", "likely_wrong_color"))
+        run.font.color.rgb = RGBColor.from_string(likely_wrong_colour(look.values))
         run.bold = True
 
 
@@ -7480,24 +7546,50 @@ _MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 _CSS_LENGTH = {"pt": 12700, "in": 914400, "cm": 360000, "mm": 36000, "px": 9525, "": 12700}
 
 
+def _length_emu(value, unit: str = "") -> int:
+    """A size from a picture's settings, in EMU; 0 when it cannot be read (a damaged file must not stop a run)."""
+    try:
+        return int(float(value) * _CSS_LENGTH.get(unit, 0)) if unit != "emu" else int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _block_height(el) -> int:
+    """Rough height (EMU) of a paragraph or table of a header or footer: a line of text, or the tallest picture
+    placed in the line (DrawingML or the older VML) when that is taller; a table row is as tall as its tallest cell.
+    Floating pictures and text boxes take no room, and Word's second copy of a drawing (mc:Fallback) is skipped."""
+    if _local(el) == "tbl":
+        return sum(max([sum(_block_height(b) for b in cell if _local(b) in ("p", "tbl"))
+                        for cell in row.iter(_q(_W, "tc"))] or [0])
+                   for row in el if _local(row) == "tr")
+    tallest = 228600                                          # a line of text: about 0.25 in
+    stack = list(el)
+    while stack:
+        child = stack.pop()
+        if not isinstance(child.tag, str) or _local(child) in ("anchor", "Fallback", "txbxContent", "textbox"):
+            continue
+        if child.tag == f"{{{_WP}}}inline":
+            extent = child.find(f"{{{_WP}}}extent")
+            tallest = max(tallest, _length_emu(extent.get("cy") if extent is not None else 0, "emu"))
+            continue
+        style = child.get("style") if child.tag.startswith(f"{{{_V}}}") else None
+        if style and "position:absolute" not in style:
+            m = re.search(r"(?:^|;)\s*height:\s*(\d+(?:\.\d+)?|\.\d+)\s*(pt|in|cm|mm|px|)\s*(?:;|$)", style)
+            if m:
+                tallest = max(tallest, _length_emu(m.group(1), m.group(2)))
+            continue
+        stack.extend(child)
+    return tallest
+
+
 def _story_height(story) -> int:
-    """Rough height (EMU) of a header or footer: a line per paragraph, or the tallest picture in it (DrawingML or
-    the older VML) when that is taller. Floating pictures take no room; a picture Word stores twice (new and
-    old format, mc:AlternateContent) counts once."""
-    total = 0
-    for p in story.iter(_q(_W, "p")):
-        tallest = 228600                                          # a line of text: about 0.25 in
-        for el in p.iter():
-            if not isinstance(el.tag, str) or any(a.tag == f"{{{_MC}}}Fallback" for a in el.iterancestors()):
-                continue
-            if el.tag == f"{{{_WP}}}extent" and _local(el.getparent()) == "inline":
-                tallest = max(tallest, int(el.get("cy") or 0))
-            elif el.tag.startswith(f"{{{_V}}}") and el.get("style") and "position:absolute" not in el.get("style"):
-                m = re.search(r"(?:^|;)\s*height:\s*([\d.]+)\s*(pt|in|cm|mm|px|)", el.get("style"))
-                if m:
-                    tallest = max(tallest, int(float(m.group(1)) * _CSS_LENGTH[m.group(2)]))
-        total += tallest
-    return total
+    """Rough height (EMU) of a header or footer: its paragraphs and tables one under the other."""
+    return sum(_block_height(el) for el in story if _local(el) in ("p", "tbl"))
+
+
+def _on(el) -> bool:
+    """A Word on/off setting: on when present, unless its value says off."""
+    return el is not None and (el.get(_q(_W, "val")) or "true").lower() in ("1", "true", "on")
 
 
 def _usable_page(d) -> tuple:
@@ -7505,11 +7597,11 @@ def _usable_page(d) -> tuple:
     and less any part of a header or footer that reaches into the text area (a tall logo pushes the text down)."""
     section = d.sections[0]
     settings = d.settings.element
-    gutter_at_top = settings.find(_q(_W, "gutterAtTop")) is not None
+    gutter_at_top = _on(settings.find(_q(_W, "gutterAtTop")))
     gutter = section.gutter or 0
     width = section.page_width - section.left_margin - section.right_margin - (0 if gutter_at_top else gutter)
     height = section.page_height - abs(section.top_margin) - abs(section.bottom_margin) - (gutter if gutter_at_top else 0)
-    even = settings.find(_q(_W, "evenAndOddHeaders")) is not None
+    even = _on(settings.find(_q(_W, "evenAndOddHeaders")))
     for stories, distance, margin in (((section.header, section.even_page_header), section.header_distance,
                                        section.top_margin),
                                       ((section.footer, section.even_page_footer), section.footer_distance,
@@ -7527,7 +7619,7 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
     look = report_look(settings)
     d, styles = _report_document(look)
     usable_w, usable_h = _usable_page(d)
-    table_alignment = look.values.get(("tables", "alignment")) or (None if look.template else "center")
+    table_alignment = look.values.get(("tables", "alignment"))     # (else the table style decides)
     tag_start = look.get("requirements", "tag_position") == "start"
     keyword_re = None
     if look.get("requirements", "mark_keywords"):
@@ -7639,7 +7731,7 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
                     tag(paragraph("body"), ids, "start", alone=True)
                 tbl = d._body.add_table(t.n_rows, t.n_cols, Emu(int(usable_w * 914400)))   # (the text width,
                 tbl.style = styles["tables"]                                                # less any gutter)
-                if table_alignment:                         # (empty with a template: its table style decides)
+                if table_alignment:
                     tbl.alignment = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
                                      "right": WD_TABLE_ALIGNMENT.RIGHT}[table_alignment]
                 table_look = tbl._tbl.tblPr.find(_q(_W, "tblLook"))
@@ -7789,13 +7881,14 @@ def write_starter_template(target: Path, look: ReportLook) -> Path:
         paragraph("list items", text)
     label(by_section["requirements"])
     p = paragraph("requirements")
+    # (the samples carry the styles only, so that changing a style in Word shows on them at once)
     if look.get("requirements", "tag_position") == "start":
-        _styled_run(p, "[R-0001]  ", styles["requirement tag"])
+        p.add_run("[R-0001]  ", style=styles["requirement tag"])
     p.add_run("3.2.1.1 Output voltage. The power supply ")
-    _styled_run(p, "shall", styles["requirement keywords"])
+    p.add_run("shall", style=styles["requirement keywords"])
     p.add_run(" deliver 28 V DC within 0.5 V.")
     if look.get("requirements", "tag_position") != "start":
-        _styled_run(p, "  [R-0001]", styles["requirement tag"])
+        p.add_run("  [R-0001]", style=styles["requirement tag"])
     for section in ("requirement tag", "requirement keywords"):
         label(by_section[section])
     label(by_section["captions"])
@@ -7805,13 +7898,15 @@ def write_starter_template(target: Path, look: ReportLook) -> Path:
     label(by_section["table text"])
     table = d._body.add_table(3, 3, Emu(int(_usable_page(d)[0] * 914400)))
     table.style = styles["tables"]
-    alignment = look.values.get(("tables", "alignment")) or (None if look.template else "center")
+    alignment = look.values.get(("tables", "alignment"))
     if alignment:
         table.alignment = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
                            "right": WD_TABLE_ALIGNMENT.RIGHT}[alignment]
-    # The heading-row shading goes into the table style here (a report puts it on the cells), so that it can be
-    # changed in Word, and a report made with this file as its template shades its heading rows the same way.
-    fill = look.values.get(("table header row", "fill")) or (BUILT_IN_HEADER_FILL if look.template is None else "none")
+    # The tool's own heading-row shading goes into the table style here (a report puts it on the cells), so that it
+    # can be changed in Word, and a report made with this file as its template shades its heading rows the same way.
+    # A shading set in the style file is put on the cells, as in the reports.
+    explicit_fill = look.values.get(("table header row", "fill"))
+    fill = BUILT_IN_HEADER_FILL if look.template is None and explicit_fill is None else "none"
     table_style = styles["tables"].element
     if fill != "none" and not any(el.get(_q(_W, "type")) == "firstRow" for el in table_style.findall(_q(_W, "tblStylePr"))):
         from docx.oxml import parse_xml
@@ -7823,7 +7918,9 @@ def write_starter_template(target: Path, look: ReportLook) -> Path:
             cell = table.cell(r, c)
             cell.paragraphs[0].style = styles["table header row" if r == 0 else "table text"]
             cell.paragraphs[0].add_run(text)
-            if r == 2 and c == 1:
+            if r == 0 and explicit_fill not in (None, "none"):
+                _shade_cell(cell, explicit_fill)
+            elif r == 2 and c == 1:
                 _shade_cell(cell, look.get("review marks", "cell_fill"))
     label(by_section["scanned header footer"])
     paragraph("scanned header footer", "[header] SPEC-1234 Rev. A")
