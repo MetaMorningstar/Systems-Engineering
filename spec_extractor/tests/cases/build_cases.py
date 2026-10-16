@@ -49,6 +49,9 @@ def build_documents(cases: list, force: bool = False) -> dict:
         manifest = {}
     paths, made = {}, 0
     for c in cases:
+        if c.scan:                                   # your own scan (my_cases): used as it is
+            paths[c.id] = Path(c.scan)
+            continue
         path = DOCUMENTS / c.filename
         fp = fingerprint(c)
         if force or not path.exists() or manifest.get(c.id) != fp:

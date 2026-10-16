@@ -77,7 +77,8 @@ def read_items(xlsx: Path) -> list:
     items = [dict(zip(header, r)) for r in rows[1:] if any(v is not None for v in r)]
     tables = {}
     for name in wb.sheetnames:
-        if name in ("Extracted Items", "Full Text", "Page Quality", "Run Info"):
+        if name in ("Extracted Items", "Full Text", "Page Quality", "Run Info", "Document Structure",
+                    "Applicable Documents"):                     # (every other sheet holds one table)
             continue
         sh = wb[name]
         grid = [list(r) for r in sh.iter_rows(min_row=5, values_only=True)]

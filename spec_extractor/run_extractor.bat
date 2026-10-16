@@ -5,7 +5,8 @@ REM   * Double-click: a window opens to choose scanned PDF/TIFF files (or a fold
 REM   * Or drag and drop files/folders onto this .bat file.
 REM     (A file or folder name containing "&" cannot be dragged onto a .bat file -
 REM      rename it, or double-click and use the file window instead.)
-REM  Results are written to an "extraction_output" folder next to the documents.
+REM  Results are written to a folder next to the documents named after the tool's
+REM  version, for example "extraction_output_1.5.0".
 REM ============================================================================
 REM pushd (not cd) also works when this folder is on a network share (\\server\share)
 pushd "%~dp0"

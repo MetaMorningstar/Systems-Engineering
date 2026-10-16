@@ -1,0 +1,5 @@
+# Your own scans and their expected results stay on this computer: nothing in this folder is ever committed
+# (a scan of a real specification may hold sensitive or classified content). Only this file and README.txt are kept.
+*
+!.gitignore
+!README.txt

@@ -24,6 +24,9 @@ HOW A PAGE IS WRITTEN. Most cases give the page as plain text, typed the way it 
     a list are written as runs of spaces, exactly where they are on the page. Single spaces are ordinary
     word spaces.
   * An empty line is a blank line.
+  * <u>...</u> underlines text and <b>...</b> prints it in bold, as a typewriter or word processor would:
+        3.2.1  <u>Power input.</u>  The equipment shall operate from 115 V ac.
+    The tags take up no room: columns are counted on the text without them.
 Lines that start with '@' are drawing instructions, not text:
     @gap 0.5                    a gap of half a line (any number of lines; '~' alone is short for @gap 0.5)
     @y 9.4                      continue 9.4 inches from the top of the page (to reach the foot of a page)
@@ -52,6 +55,19 @@ stem (the lead-in sentence) in front of each item, as the tool does. A row may e
     [no marker note]              its Review Reasons must say nothing about list markers
     [section: 4 Verification]     its Section column must be exactly this ('' = empty)
     [pages: 1-2]                  its Page(s) column must be exactly this
+    [title: Power input]          its Title column (the paragraph's run-in title) must be exactly this
+    [corrected: requ1red]         its OCR Corrections column must contain this text
+    [quality: section 6]          its Quality Notes column must contain this text
+A case can also check the document's structure and its list of documents (see Case):
+    outline=("1 | 3 REQUIREMENTS", "2 | 3.1 General", ...)     the headings of the Document Structure sheet, in
+                                                                order: level, then paragraph number and title
+    documents=("MIL-STD-461G | Requirements for ... | 3.2.5", ...)   the Applicable Documents sheet, in order:
+                                                                document, title, referencing paragraphs
+
+YOUR OWN SCANS AS CASES (kept on this computer only): put a scan in tests/cases/my_cases/ and run
+    python tests/cases/run_cases.py --record tests/cases/my_cases/<file>
+which writes <file>.expected.txt with what the tool produces now. Correct that file to what it SHOULD produce;
+from then on the scan is checked with every run (--only MY runs only your own). See tests/README.md.
 Nothing on this page reaches the network: documents are drawn with PIL and saved on this computer.
 """
 from __future__ import annotations
@@ -70,9 +86,68 @@ HERE = Path(__file__).resolve().parent
 _FONT_CHOICES = {"mono": ["/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", "C:/Windows/Fonts/cour.ttf"],
                  "serif": ["/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf", "C:/Windows/Fonts/times.ttf"]}
 FONT_FILES = {k: next((p for p in v if Path(p).exists()), v[0]) for k, v in _FONT_CHOICES.items()}
+_BOLD_CHOICES = {"mono": ["/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf", "C:/Windows/Fonts/courbd.ttf"],
+                 "serif": ["/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf", "C:/Windows/Fonts/timesbd.ttf"]}
+BOLD_FILES = {k: next((p for p in v if Path(p).exists()), v[0]) for k, v in _BOLD_CHOICES.items()}
+_TAG = re.compile(r"</?[bu]>")
+
+
+def _formatted(text: str, state: tuple = (False, False)) -> tuple:
+    """'<u>Power input.</u> The' -> ([('Power input.', False, True), (' The', False, False)], state at the end):
+    runs of (text, bold, underline). `state` is (bold, underline) at the start - a tag may stay open over a line."""
+    bold, underline = state
+    runs, pos = [], 0
+    for m in _TAG.finditer(text):
+        if m.start() > pos:
+            runs.append((text[pos:m.start()], bold, underline))
+        tag = m.group(0)
+        if tag in ("<b>", "</b>"):
+            bold = tag == "<b>"
+        else:
+            underline = tag == "<u>"
+        pos = m.end()
+    if pos < len(text):
+        runs.append((text[pos:], bold, underline))
+    return runs, (bold, underline)
+
+
+def plain(text: str) -> str:
+    """The text without its <b>/<u> tags."""
+    return _TAG.sub("", text)
+
+
+def _pieces(line: str) -> list:
+    """[(column, tagged text)] - a typed line split where two or more spaces follow each other, each piece at the
+    column where it starts on the line WITHOUT its tags, with the tags that apply to it."""
+    chars, state = [], (False, False)
+    for text, bold, underline in _formatted(line)[0]:
+        chars += [(ch, bold, underline) for ch in text]
+    visible = "".join(ch for ch, _b, _u in chars)
+    out = []
+    for m in re.finditer(r"\S+(?: \S+)*", visible):
+        tagged, cur = "", (False, False)
+        for ch, bold, underline in chars[m.start():m.end()]:
+            if (bold, underline) != cur:
+                tagged += ("</b>" if cur[0] and not bold else "") + ("</u>" if cur[1] and not underline else "")
+                tagged += ("<b>" if bold and not cur[0] else "") + ("<u>" if underline and not cur[1] else "")
+                cur = (bold, underline)
+            tagged += ch
+        tagged += ("</b>" if cur[0] else "") + ("</u>" if cur[1] else "")
+        out.append((m.start(), tagged))
+    return out
+
+
+def _balanced(lines: list) -> list:
+    """Wrapped lines of tagged text, each closing the tags it opened and reopening those still open from above."""
+    out, state = [], (False, False)
+    for x, text in lines:
+        opening = ("<b>" if state[0] else "") + ("<u>" if state[1] else "")
+        _runs, state = _formatted(text, state)
+        out.append((x, opening + text + ("</b>" if state[0] else "") + ("</u>" if state[1] else "")))
+    return out
 BULLETS = set("•●▪■‣⁃∙·◦*-o–—")
 AREAS = ["area_tab", "area_lists", "area_leadin", "area_numbering", "area_paragraphs", "area_columns",
-         "area_tables", "area_pages"]
+         "area_tables", "area_pages", "area_structure"]
 AREA_DOCS = {}          # area name -> the description at the top of its file (filled in by load_cases)
 
 
@@ -90,6 +165,7 @@ class Sheet:
         self.dpi, self.font_name, self.pt = dpi, font, pt
         self.W, self.H = int(8.5 * dpi), int(11 * dpi)
         self.font = ImageFont.truetype(FONT_FILES[font], round(pt / 72 * dpi))
+        self.bold_font = ImageFont.truetype(BOLD_FILES[font], round(pt / 72 * dpi))
         self.lh = round(pitch * dpi)
         self.L = round(margin * dpi)
         self.R = self.W - self.L
@@ -105,7 +181,8 @@ class Sheet:
         return self.L + round((self.col[0] + inch) * self.dpi)
 
     def width(self, s: str) -> float:
-        return self.font.getlength(s)
+        """Printed width of a text in pixels (<b>/<u> tags take no room; bold text is a little wider)."""
+        return sum((self.bold_font if bold else self.font).getlength(t) for t, bold, _u in _formatted(s)[0])
 
     def text(self, x_in: float, s: str):
         x = self.x(x_in)
@@ -114,8 +191,16 @@ class Sheet:
             raise ValueError(f"text runs past the column edge by {x + self.width(s) - right:.0f} px: {s!r}")
         if self.y + self.lh > self.H - round(0.7 * self.dpi):
             raise ValueError(f"page overflow at {s!r}")
-        self.d.text((x, self.y), s, font=self.font, fill=0)
-        self.pieces.append((x, self.y, s, self.font_name, self.pt))
+        for run, bold, underline in _formatted(s)[0]:
+            font = self.bold_font if bold else self.font
+            self.d.text((x, self.y), run, font=font, fill=0)
+            self.pieces.append((x, self.y, run, self.font_name + ("-bold" if bold else ""), self.pt))
+            w = font.getlength(run)
+            if underline and run.strip():
+                ascent = font.getmetrics()[0]          # an underline just below the baseline, as Word draws it
+                uy = self.y + ascent + max(2, round(0.10 * font.size))
+                self.line_px(round(x), uy, round(x + w), uy, max(2, round(0.06 * font.size)))
+            x += w
 
     def newline(self, n: float = 1.0):
         self.y += round(n * self.lh)
@@ -151,7 +236,7 @@ class Sheet:
                 cur = trial
         if cur:
             lines.append(cur)
-        return lines
+        return [ln for _x, ln in _balanced([(0, ln) for ln in lines])]
 
     def para(self, text: str, x_in: float = 0.0):
         for ln in self.wrap(text, x_in):
@@ -206,7 +291,7 @@ def draw_layout(text: str, new_sheet) -> list:
                         cur = trial
                 if cur:
                     lines.append((first * pg.col_in if not lines else rest * pg.col_in, cur))
-                for x, ln in lines:
+                for x, ln in _balanced(lines):
                     pg.text(x, ln)
                     pg.newline()
             else:
@@ -215,8 +300,8 @@ def draw_layout(text: str, new_sheet) -> list:
         if not stripped:
             pg.newline()
             continue
-        for m in re.finditer(r"\S+(?: \S+)*", line):           # pieces: split at two or more spaces
-            pg.text(m.start() * pg.col_in, m.group(0))
+        for column, piece in _pieces(line):                   # pieces: split at two or more spaces
+            pg.text(column * pg.col_in, piece)
         pg.newline()
     return sheets
 
@@ -293,9 +378,18 @@ class Row:
     no_marker_note: bool = False      # its Review Reasons must not mention list markers
     section: str = None               # exact Section column, when given
     pages: str = None                 # exact Page(s) column, when given
+    title: str = None                 # exact Title column (run-in title), when given
+    corrected: str = ""               # text its OCR Corrections must contain
+    quality: str = ""                 # text its Quality Notes must contain
 
     def label(self) -> str:
         checks = []
+        if self.title is not None:
+            checks.append(f"Title: {self.title or '(empty)'}")
+        if self.corrected:
+            checks.append(f"corrected: {self.corrected}")
+        if self.quality:
+            checks.append(f"quality note: {self.quality}")
         if self.note:
             checks.append(f"review note: {self.note}")
         if self.no_marker_note:
@@ -307,11 +401,12 @@ class Row:
         return "; ".join(checks)
 
 
-_CHECK = re.compile(r"\s*\[(note|no marker note|section|pages)(?::\s*([^\]]*))?\]\s*$", re.I)
+_CHECK = re.compile(r"\s*\[(note|no marker note|section|pages|title|corrected|quality)(?::\s*([^\]]*))?\]\s*$", re.I)
 
 
 def _row(spec: str, stem: str = "") -> Row:
     note, no_note, section, pages = "", False, None, None
+    extra = {}
     while True:
         m = _CHECK.search(spec)
         if not m:
@@ -323,15 +418,18 @@ def _row(spec: str, stem: str = "") -> Row:
             no_note = True
         elif kind == "section":
             section = value
-        else:
+        elif kind == "pages":
             pages = value
+        else:
+            extra[kind] = value
         spec = spec[:m.start()]
     ref, sep, text = spec.partition("|")
     if not sep:
         raise ValueError(f"an expected row needs '<Doc Ref> | <Content>': {spec!r}")
     text = " ".join(text.split())
     content = f"{stem} {text}" if stem else text
-    return Row(" ".join(ref.split()), content, stem, note, no_note, section, pages)
+    return Row(" ".join(ref.split()), content, stem, note, no_note, section, pages, extra.get("title"),
+               extra.get("corrected", ""), extra.get("quality", ""))
 
 
 def para(*specs: str) -> list:
@@ -455,6 +553,12 @@ class Case:
     table_has: tuple = ()             # text each expected table must contain ('Impedance: | 50 ohm | Analysis')
     captions: tuple = None            # caption labels expected ('TABLE I', 'FIGURE 3'), when checked
     known: str = ""                   # a KNOWN LIMITATION: why the tool still gets this wrong (it may fail)
+    # the headings of the Document Structure sheet, in order, as "level | number and title" ("2 | 3.1 General")
+    outline: tuple = None
+    # the Applicable Documents sheet, in order, as "document | title | paragraphs" ("MIL-STD-461G | Requirements ... |
+    # 3.2.5"); the title is compared like a requirement's text, the rest exactly
+    documents: tuple = None
+    scan: str = ""                    # your own scan (my_cases): its file, used as it is instead of a drawn page
     area: str = ""                    # filled in from the area file
 
     @property
@@ -492,6 +596,59 @@ class Case:
                       title=f"{self.id} {self.title}", subject=self.situation[:250], author="spec_extractor test cases")
 
 
+LOCAL_FOLDER = HERE / "my_cases"     # your own scans and what the tool must produce for them (never in git)
+SCAN_TYPES = (".pdf", ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp")
+
+
+def read_expected(path: Path, scan: Path) -> "Case":
+    """A case from your own scan and its .expected.txt (written by run_cases.py --record, then corrected by hand).
+    One expectation per line; # starts a comment:
+        requirement: 3.2.1 | The equipment shall operate from 115 V ac.  [title: Power input]
+        tables: 1                     table has: Flow control              caption: TABLE I
+        heading: 2 | 3.1 General      document: MIL-STD-461G | Requirements for ... | 3.2.5"""
+    rows, tables, table_has, captions, outline, documents = [], 0, [], [], [], []
+    for n, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.split("  #", 1)[0].strip() if not raw.lstrip().startswith("#") else ""
+        if not line:
+            continue
+        kind, sep, value = line.partition(":")
+        kind, value = kind.strip().lower(), value.strip()
+        if not sep:
+            raise ValueError(f"{path.name} line {n}: write 'requirement: ...', 'tables: 1', 'heading: ...' and so on")
+        if kind == "requirement":
+            rows.append(_row(value))
+        elif kind == "tables":
+            tables = int(value)
+        elif kind == "table has":
+            table_has.append(value)
+        elif kind == "caption":
+            captions.append(value)
+        elif kind == "heading":
+            outline.append(value)
+        elif kind == "document":
+            documents.append(value)
+        else:
+            raise ValueError(f"{path.name} line {n}: unknown kind of expectation {kind!r}")
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", scan.stem).strip("-").upper()[:40] or "SCAN"
+    return Case(f"MY-{slug}", scan.name, "Your own scan (tests/cases/my_cases), kept on this computer.",
+                "What the tool must produce for it, as written in " + path.name + ".", "my_cases", expect=rows,
+                tables=tables, table_has=tuple(table_has), captions=tuple(captions) if captions else None,
+                outline=tuple(outline) if outline else None, documents=tuple(documents) if documents else None,
+                scan=str(scan), area="Your own scans")
+
+
+def load_local_cases(folder: Path = LOCAL_FOLDER) -> list:
+    """Your own scans in tests/cases/my_cases that have an <file>.expected.txt beside them."""
+    if not folder.is_dir():
+        return []
+    cases = []
+    for expected in sorted(folder.glob("*.expected.txt")):          # "page12.pdf.expected.txt" beside "page12.pdf"
+        scan = folder / expected.name[:-len(".expected.txt")]
+        if scan.is_file() and scan.suffix.lower() in SCAN_TYPES:
+            cases.append(read_expected(expected, scan))
+    return cases
+
+
 def load_cases(folder: Path = HERE) -> list:
     """All cases of the library, area by area, with their IDs checked (unique, and shaped like 'TAB-01')."""
     cases, seen = [], {}
@@ -507,8 +664,8 @@ def load_cases(folder: Path = HERE) -> list:
                 raise ValueError(f"{path.name}: case ID {c.id!r} is not shaped like 'TAB-01'")
             if c.id in seen:
                 raise ValueError(f"case ID {c.id} is used twice ({seen[c.id]} and {path.name})")
-            if not c.expect and not c.tables:
-                raise ValueError(f"{c.id}: a case must expect at least one row or table")
+            if not c.expect and not c.tables and not c.outline and not c.documents:
+                raise ValueError(f"{c.id}: a case must expect at least one row, table, heading or document")
             if bool(c.text) == (c.draw is not None):
                 raise ValueError(f"{c.id}: give the page as text=... or draw=..., not both / neither")
             seen[c.id] = path.name

@@ -5,6 +5,9 @@ run_cases.py - run spec_extractor.py on every test-case document and check its o
     python tests/cases/run_cases.py                   (all cases, a few minutes)
     python tests/cases/run_cases.py --only TAB        (only the tab-list cases; --only TAB-07 for one case)
     python tests/cases/run_cases.py path/to/other/spec_extractor.py    (test another version of the tool)
+    python tests/cases/run_cases.py --only MY         (only your own scans, kept in tests/cases/my_cases)
+    python tests/cases/run_cases.py --record tests/cases/my_cases/page12.pdf
+                                                      (turn your own scan into a case - see tests/README.md)
 
 The documents are built first when they are missing or out of date (build_cases.py). Each document is run
 through the real tool, offline (--no-combined --no-cache --no-word), and the 'Extracted Items' sheet of its
@@ -14,8 +17,11 @@ workbook is compared with the case:
   * every row's Content is similar to the expected text (difflib ratio >= 0.9, whitespace normalised), both the
     whole Content AND the part after the lead-in, so a list item that lost its value cannot pass on the
     strength of a long shared lead-in,
-  * the checks written in brackets on a row (review note, no list-marker note, Section, Page(s)),
-  * the number of Table items, the text each table must contain, and the caption labels when the case says so.
+  * the checks written in brackets on a row (review note, no list-marker note, Section, Page(s), Title,
+    OCR Corrections, Quality Notes),
+  * the number of Table items, the text each table must contain, and the caption labels when the case says so,
+  * the headings of the Document Structure sheet (level, number and title) and the documents of the Applicable
+    Documents sheet, when the case gives them.
 
 Result of each case: PASS, FAIL, or - for a case marked as a known limitation - KNOWN (still wrong, as
 recorded) or KNOWN-PASSES (the limitation seems to be fixed: check it and remove the mark).
@@ -107,18 +113,40 @@ def find_workbook(outdir: Path, document: Path):
     return hits[0] if hits else None
 
 
-def read_items(xlsx: Path) -> list:
-    wb = openpyxl.load_workbook(xlsx, read_only=True, data_only=True)
-    rows = list(wb["Extracted Items"].iter_rows(values_only=True))
-    wb.close()
+def _sheet(wb, name: str) -> list:
+    """The rows of a sheet as dicts by column name ([] when the workbook has no such sheet)."""
+    if name not in wb.sheetnames:
+        return []
+    rows = list(wb[name].iter_rows(values_only=True))
     if not rows:
         return []
-    col = {name: k for k, name in enumerate(rows[0]) if name}
-    get = lambda r, name: norm(r[col[name]]) if name in col else ""
-    return [{"type": get(r, "Type"), "doc_ref": get(r, "Doc Ref"), "content": get(r, "Content"),
-             "reasons": str(r[col["Review Reasons"]] or "") if "Review Reasons" in col else "",
-             "section": get(r, "Section"), "pages": get(r, "Page(s)"), "item": get(r, "Item #")}
-            for r in rows[1:] if any(v is not None for v in r)]
+    col = {n: k for k, n in enumerate(rows[0]) if n}
+    return [{n: (r[k] if k < len(r) else None) for n, k in col.items()} for r in rows[1:] if any(v is not None for v in r)]
+
+
+def read_items(xlsx: Path) -> list:
+    """The Extracted Items rows (dicts), with the workbook's structure and documents on the first one's list."""
+    wb = openpyxl.load_workbook(xlsx, read_only=True, data_only=True)
+    try:
+        items = _sheet(wb, "Extracted Items")
+        structure, documents = _sheet(wb, "Document Structure"), _sheet(wb, "Applicable Documents")
+        for r in items:          # a table's row links to the sheet holding it: its text is read from there
+            sheet = r.get("Table Sheet")
+            if sheet and sheet in wb.sheetnames:
+                cells = [" | ".join(norm(v) for v in row if v is not None) for row in
+                         wb[sheet].iter_rows(min_row=5, values_only=True)]
+                r["Content"] = " || ".join(c for c in cells if c)
+    finally:
+        wb.close()
+    get = lambda r, name: norm(r.get(name))
+    out = [{"type": get(r, "Type"), "doc_ref": get(r, "Doc Ref"), "content": get(r, "Content"),
+            "reasons": str(r.get("Review Reasons") or ""), "section": get(r, "Section"), "pages": get(r, "Page(s)"),
+            "item": get(r, "Item #"), "title": get(r, "Title"), "corrections": str(r.get("OCR Corrections") or ""),
+            "quality": str(r.get("Quality Notes") or "")} for r in items]
+    headings = [f"{r.get('Level')} | {norm(r.get('Heading / Text'))}" for r in structure if r.get("Is Heading") == "Yes"]
+    docs = [" | ".join(norm(r.get(k)) for k in ("Document", "Title", "Referenced In (paragraphs)")) for r in documents
+            if r.get("Document")]
+    return [{"type": "_structure", "headings": headings, "documents": docs}] + out
 
 
 def compare_row(e: casekit.Row, a: dict) -> list:
@@ -140,6 +168,12 @@ def compare_row(e: casekit.Row, a: dict) -> list:
         bad.append(f"Section {a['section']!r} != {e.section!r}")
     if e.pages is not None and a["pages"] != norm(e.pages):
         bad.append(f"Page(s) {a['pages']!r} != {e.pages!r}")
+    if e.title is not None and a["title"] != norm(e.title):
+        bad.append(f"Title {a['title']!r} != {e.title!r}")
+    if e.corrected and e.corrected.lower() not in a["corrections"].lower():
+        bad.append(f"OCR Corrections {a['corrections']!r} lack {e.corrected!r}")
+    if e.quality and e.quality.lower() not in a["quality"].lower():
+        bad.append(f"Quality Notes {a['quality']!r} lack {e.quality!r}")
     return bad
 
 
@@ -156,6 +190,7 @@ def align(exp: list, got: list) -> list:
 def evaluate(case: casekit.Case, rows: list) -> tuple:
     """-> (passed, one-line reason, detail lines)"""
     exp = case.expect
+    structure = next((r for r in rows if r["type"] == "_structure"), {"headings": [], "documents": []})
     reqs = [r for r in rows if r["type"] == "Requirement"]
     tables = [r for r in rows if r["type"] == "Table"]
     captions = [r for r in rows if r["type"] in ("Table Caption", "Figure Caption")]
@@ -196,7 +231,68 @@ def evaluate(case: casekit.Case, rows: list) -> tuple:
             problems.append(f"captions {got_caps}, expected {sorted(case.captions)}")
     for c in captions:
         detail.append(f"      CAPTION {c['doc_ref']}: {c['content'][:120]}")
+    if case.outline is not None:
+        want = [norm(h) for h in case.outline]
+        if structure["headings"] != want:
+            problems.append(f"headings {structure['headings']}, expected {want}")
+        for h in structure["headings"]:
+            detail.append(f"   {'  ' if h in want else '!!'} HEADING {h}")
+    if case.documents is not None:
+        want = [norm(x) for x in case.documents]
+        got = structure["documents"]
+
+        def same(a: str, b: str) -> bool:
+            (ai, at, ap), (bi, bt, bp) = (a.split(" | ") + ["", ""])[:3], (b.split(" | ") + ["", ""])[:3]
+            return ai == bi and ap == bp and ratio(at, bt) >= THRESHOLD
+        if len(got) != len(want) or not all(same(a, b) for a, b in zip(got, want)):
+            problems.append(f"documents {got}, expected {want}")
+        for x in got:
+            detail.append(f"      DOCUMENT {x}")
     return (not problems), "; ".join(problems[:3]) + (" ..." if len(problems) > 3 else ""), detail
+
+
+def record(spec: Path, scan: Path, outdir: Path) -> int:
+    """Run the tool on your own scan and write <scan>.expected.txt beside it: what the tool produces NOW, one line
+    per expectation, for you to correct to what it SHOULD produce. An existing file is never overwritten."""
+    if not scan.is_file() or scan.suffix.lower() not in casekit.SCAN_TYPES:
+        print(f"no scan here: {scan} (a PDF, TIFF, PNG or JPG file)")
+        return 2
+    expected = scan.with_name(scan.name + ".expected.txt")
+    if expected.exists():
+        print(f"{expected.name} already exists - correct it by hand, or delete it to record again")
+        return 2
+    if casekit.LOCAL_FOLDER.resolve() not in scan.parents:
+        print(f"note: {scan.name} is not in {casekit.LOCAL_FOLDER} - only scans there are run as cases")
+    target = outdir / "record"
+    target.mkdir(parents=True, exist_ok=True)
+    for old in target.rglob(f"{scan.stem}_extracted.xlsx"):
+        old.unlink()
+    run_tool(spec, [scan], target, 1)
+    xlsx = find_workbook(target, scan)
+    if xlsx is None:
+        print("the tool wrote no workbook - see", target / "run1" / "tool_output.txt")
+        return 2
+    rows = read_items(xlsx)
+    structure = rows[0]
+    lines = [f"# What spec_extractor produced for {scan.name} on {time.strftime('%Y-%m-%d')}.",
+             "# CORRECT THIS FILE to what the tool SHOULD produce, then run:  python tests/cases/run_cases.py --only MY",
+             "# One expectation per line ('#' starts a comment). Kinds:",
+             "#   requirement: <Doc Ref> | <Content>      [title: ...] [note: ...] [corrected: ...] may follow",
+             "#   tables: <number of tables>    table has: <text a table holds>    caption: <TABLE I>",
+             "#   heading: <level> | <number and title>   document: <number> | <title> | <paragraphs>", ""]
+    for r in rows[1:]:
+        if r["type"] == "Requirement":
+            checks = f"  [title: {r['title']}]" if r["title"] else ""
+            lines.append(f"requirement: {r['doc_ref']} | {r['content']}{checks}")
+    tables = [r for r in rows[1:] if r["type"] == "Table"]
+    lines += ["", f"tables: {len(tables)}"]
+    lines += [f"caption: {r['doc_ref']}" for r in rows[1:] if r["type"] in ("Table Caption", "Figure Caption") and r["doc_ref"]]
+    lines += [""] + [f"heading: {h}" for h in structure["headings"]]
+    lines += [""] + [f"document: {d}" for d in structure["documents"]]
+    expected.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"wrote {expected}\nOpen it, correct it to what the tool should produce, and run:  "
+          f"python tests/cases/run_cases.py --only MY")
+    return 0
 
 
 def status_of(case: casekit.Case, ok: bool) -> str:
@@ -230,13 +326,17 @@ def main(argv=None) -> int:
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="parallel tool processes")
     ap.add_argument("--reuse", action="store_true", help="re-check existing workbooks in outdir without re-running")
     ap.add_argument("-v", "--verbose", action="store_true", help="print expected/actual rows of failing cases")
+    ap.add_argument("--record", metavar="SCAN", help="turn your own scan (in tests/cases/my_cases) into a case: write "
+                                                      "<SCAN>.expected.txt with what the tool produces now")
     args = ap.parse_args(argv)
+    if args.record:
+        return record(Path(args.spec).resolve(), Path(args.record).resolve(), Path(args.outdir).resolve())
 
     spec, outdir = Path(args.spec).resolve(), Path(args.outdir).resolve()
     if not spec.is_file():
         ap.error(f"no such file: {spec}")
     outdir.mkdir(parents=True, exist_ok=True)
-    cases = casekit.load_cases()
+    cases = casekit.load_cases() + casekit.load_local_cases()
     wanted = [w.strip() for w in args.only.split(",") if w.strip()]
 
     def chosen(c) -> bool:

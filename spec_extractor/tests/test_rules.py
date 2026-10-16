@@ -2,7 +2,9 @@
 """
 test_rules.py - fast checks of the layout and requirement rules (no OCR, runs in seconds).
 
-    python tests/test_rules.py          (or:  python -m pytest tests/test_rules.py)
+    python tests/test_rules.py                    all of them   (or:  python -m pytest tests/test_rules.py)
+    python tests/test_rules.py underline table    only the tests with "underline" or "table" in their name
+    python tests/test_rules.py --list             the name and first line of every test
 
 Each test builds OCR "lines" with realistic page geometry, runs them through the same steps as a
 real document (layout -> document clean-up -> requirement extraction) and checks the rows.
@@ -1472,8 +1474,8 @@ def test_readme_states_the_same_version_as_the_code():
     """The version at the top of the README is what a user compares against the line a run prints,
     so the two must never drift apart. Raise both in the same commit."""
     readme = (HERE.parent / "README.md").read_text(encoding="utf-8")
-    stated = re.search(r"^>\s*##\s*Version\s+([0-9]+\.[0-9]+\.[0-9]+)\s*$", readme, re.M)
-    assert stated, "README.md must carry a '> ## Version X.Y.Z' heading at the top"
+    stated = re.search(r"^>\s*##\s*Version\s+([0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?)\s*$", readme, re.M)
+    assert stated, "README.md must carry a '> ## Version X.Y.Z' heading at the top (or X.Y.Z-local.1 after a hand edit)"
     assert stated.group(1) == se.__version__, (stated.group(1), se.__version__)
 
 
@@ -2414,17 +2416,32 @@ def test_a_label_that_wraps_is_read_before_its_value_even_when_the_value_is_shor
         assert rows[1] == ("3.2.4 b", "b. Humidity: 95 percent."), rows
 
 
-def test_a_table_under_a_lead_in_with_a_method_column_or_a_caption_below_stays_a_table():
-    """'Voltage: | 28 VDC nominal | Test' under '... the following characteristics:' is a table: its third column
-    is short and repeated ('Test', 'Analysis'). So is a label table with 'TABLE I. ...' printed under it."""
+def test_columns_under_a_lead_in_are_a_list_unless_a_title_or_heading_row_makes_them_a_table():
+    """'Voltage: | 28 VDC nominal | Test' under '... the following characteristics:' is a list since 1.5.0 - one row
+    per line with the lead-in in front, even with a short repeated Method column - because it has neither a title
+    nor a heading row. The same columns with 'TABLE I. ...' printed under them, or under a heading row that names
+    the columns, are a table."""
     lead = "3.2.1 Interface. The interface shall have the following characteristics:"
     rows_ = [("Voltage:", "28 VDC nominal", "Test"), ("Current:", "5 A maximum", "Test"),
              ("Impedance:", "50 ohm", "Analysis"), ("Isolation:", "100 Mohm at 500 VDC", "Test")]
-    lines = [make_line(lead, LEFT, 300)] + [make_line(t, LEFT + x, 372 + k * 64) for k, row in enumerate(rows_)
-                                            for x, t in zip((0, 420, 1000), row)]
-    _doc, items = run({1: lines}, settings(detect_tables=True, borderless_tables=True))
-    tables = [it for it in items if it.item_type == "Table"]
-    assert tables and "Impedance: | 50 ohm | Analysis" in tables[0].text, [(it.item_type, it.text) for it in items]
+
+    def page(extra_top=(), extra_bottom=()):
+        top = [make_line(lead, LEFT, 300)] + [make_line(t, LEFT + x, 372) for x, t in zip((0, 420, 1000), extra_top)]
+        y0 = 436 if extra_top else 372
+        body = [make_line(t, LEFT + x, y0 + k * 64) for k, row in enumerate(rows_) for x, t in zip((0, 420, 1000), row)]
+        bottom = [make_line(t, LEFT + 300, y0 + len(rows_) * 64) for t in extra_bottom]     # (straight under it)
+        return top + body + bottom
+
+    s = settings(detect_tables=True, borderless_tables=True)
+    _doc, items = run({1: page()}, s)
+    assert not [it for it in items if it.item_type == "Table"], [(it.item_type, it.text) for it in items]
+    assert texts(items) == [f"The interface shall have the following characteristics: {a} {b} {c}" for a, b, c in rows_], \
+        texts(items)
+    for extra in ({"extra_bottom": ["TABLE I. Interface characteristics."]},
+                  {"extra_top": ("Characteristic", "Requirement", "Method")}):
+        _doc, items = run({1: page(**extra)}, s)
+        tables = [it for it in items if it.item_type == "Table"]
+        assert tables and "Impedance: | 50 ohm | Analysis" in tables[0].text, (extra, [(it.item_type, it.text) for it in items])
     assert se._has_real_extra_column([list(r) for r in rows_])
     # a label-only list whose value the OCR split at word gaps has ragged 'columns', not a real one
     assert not se._has_real_extra_column([["Power:", "150 W", "maximum."], ["Transients:", "as in", "MIL-STD-704F."],
@@ -3016,6 +3033,391 @@ def test_unreadable_image_page_does_not_stop_the_file():
 
 
 # =====================================================================================================================
+# 1.5.0: how the text is printed, tables and lists, autocorrection, document structure, DOORS
+# =====================================================================================================================
+def _draw_formatted(rows: list, kind: str = "serif", dpi: int = 300, ruled_under: int = -1) -> tuple:
+    """A page image with lines of text printed as asked, and their OCR lines with one box per word (the boxes an OCR
+    engine gives: from the top of the capitals to the descenders). rows: [[(text, underlined, bold), ...], ...].
+    ruled_under: the row under which a rule is drawn across the whole page, as a table draws one."""
+    from PIL import Image, ImageDraw, ImageFont
+    sys.path.insert(0, str(HERE / "cases"))
+    import casekit
+    regular = ImageFont.truetype(casekit.FONT_FILES[kind], round(11 / 72 * dpi))
+    heavy = ImageFont.truetype(casekit.BOLD_FILES[kind], round(11 / 72 * dpi))
+    img = Image.new("L", (int(8.5 * dpi), int(11 * dpi)), 255)
+    d = ImageDraw.Draw(img)
+    lines, y = [], dpi
+    for k, row in enumerate(rows):
+        x, words = dpi, []
+        for text, underlined, bold in row:
+            f = heavy if bold else regular
+            ascent, descent = f.getmetrics()
+            start = x
+            for word in text.split():
+                d.text((x, y), word, font=f, fill=0)
+                width = f.getlength(word)
+                words.append(se.Word(word, 0.99, (int(x), int(y + 0.15 * ascent), int(x + width),
+                                                  int(y + ascent + 0.6 * descent))))
+                x += width + f.getlength(" ")
+            if underlined:
+                uy = y + ascent + max(2, round(0.12 * f.size))
+                d.line((start, uy, x - f.getlength(" "), uy), fill=0, width=max(2, round(0.06 * f.size)))
+            x += 0.4 * dpi
+        if k == ruled_under:
+            ry = y + regular.getmetrics()[0] + max(2, round(0.12 * regular.size))
+            d.line((0.5 * dpi, ry, 8 * dpi, ry), fill=0, width=3)
+        box = (min(w.box[0] for w in words), min(w.box[1] for w in words), max(w.box[2] for w in words),
+               max(w.box[3] for w in words))
+        lines.append(se.Line(" ".join(w.text for w in words), 0.99, box, words))
+        y += round(0.3 * dpi)
+    return np.array(img), lines
+
+
+def test_underlined_words_and_bold_lines_are_measured_on_the_page():
+    """An underline under a title is found word by word, in a serif and a typewriter font; a rule printed across
+    the page under a line (a table's rule) is not an underline; a bold line is measured heavier than the page's
+    ordinary text. Measured on the page image itself, as the tool does before its clean-up."""
+    rows = [[("3.2.1", False, False), ("Power input", True, False), ("The equipment shall operate from 115 V.", False, False)],
+            [("The quick brown fox jumps over the lazy dog, typing gyp jog quay.", False, False)],
+            [("Bold words; equipment; typography; jumping quickly.", False, True)],
+            [("Parameter values under a ruled line across the page.", False, False)],
+            [("Normal words; equipment; typography; jumping quickly.", False, False)]]
+    for kind in ("serif", "mono"):
+        gray, lines = _draw_formatted(rows, kind, ruled_under=3)
+        se.measure_text_format(gray, lines, 300)
+        marked = [[w.text for w in ln.words if w.underline] for ln in lines]
+        assert marked == [["Power", "input"], [], [], [], []], (kind, marked)
+        assert lines[2].weight >= 1.2 and all(0.85 <= lines[k].weight <= 1.1 for k in (0, 1, 3, 4)), \
+            (kind, [ln.weight for ln in lines])
+        assert isinstance(lines[2].weight, float) and type(lines[0].words[1].underline) is bool   # (JSON cache)
+
+
+def test_a_table_heading_row_is_one_only_when_printed_as_one():
+    """A first row of short words is not a heading row by its words alone: it must be set apart in print
+    (underlined, bold, capitals) or name the columns. A data row such as 'Voltage: | 28 VDC nominal | Test' is never
+    taken for column names."""
+    def words(row, underline=False, weight=1.0):
+        return [(se.Word(t, 0.99, (0, 0, 10, 10), underline=underline), weight) for t in " ".join(row).split()]
+    data = [["Input voltage", "22 to 29 VDC", "Test"], ["Ripple", "1.5 V", "Analysis"]]
+    plain = [["Antenna", "Receiver", "Display"]] + data
+    assert se._header_rows(plain, [], [words(r) for r in plain]) == (0, "")
+    assert se._header_rows(plain, [], [words(plain[0], underline=True)] + [words(r) for r in data]) == (1, "underlined")
+    assert se._header_rows(plain, [], [words(plain[0], weight=1.4)] + [words(r) for r in data]) == (1, "bold")
+    named = [["Parameter", "Requirement", "Method"]] + data
+    assert se._header_rows(named, [], [words(r) for r in named]) == (1, "column names")
+    capitals = [["SIGNAL", "LEVEL", "SOURCE"]] + data
+    assert se._header_rows(capitals, [], [words(r) for r in capitals]) == (1, "capitals")
+    first_data = [["Voltage:", "28 VDC nominal", "Test"], ["Current:", "5 A maximum", "Test"]]
+    assert not se._names_columns(first_data[0])
+    assert se._header_rows(first_data, [], [words(r) for r in first_data]) == (0, "")
+
+
+def test_a_table_without_heading_or_title_is_shown_as_a_list():
+    """Columns with no heading row and no title are a list: each row one list entry, its cells kept apart and in
+    order, and a row whose first cell is empty is the wrapped line of the entry above it."""
+    lines = make_lines([(0, "MIL-STD-461G       Requirements for the Control of Electromagnetic"),
+                        (0, "                   Interference Characteristics"),
+                        (0, "MIL-STD-704F       Aircraft Electric Power Characteristics")], y0=600)
+    grid = [["MIL-STD-461G", "Requirements for the Control of Electromagnetic"], ["", "Interference Characteristics"],
+            ["MIL-STD-704F", "Aircraft Electric Power Characteristics"]]
+    boxes = [[(LEFT, ln.box[1], LEFT + 250, ln.box[3]), (LEFT + 285, ln.box[1], LEFT + 1100, ln.box[3])] for ln in lines]
+    table = se.TableData(grid=grid, conf=[[0.99, 0.99] for _ in grid], cell_boxes=boxes)
+    block = se.Block("table", 1, (LEFT, lines[0].box[1], LEFT + 1100, lines[-1].box[3]), lines=lines, table=table)
+    rows = se.table_rows_as_list(block, DPI)
+    assert [b.kind for b in rows] == ["list_item", "list_item"], [b.kind for b in rows]
+    assert rows[0].meta["cells"] == ["MIL-STD-461G", "Requirements for the Control of Electromagnetic Interference "
+                                     "Characteristics"], rows[0].meta["cells"]
+    assert rows[1].text == "MIL-STD-704F Aircraft Electric Power Characteristics" and rows[0].meta["from_table"]
+    assert len(rows[0].lines) == 2 and rows[0].meta["cell_x"][0] == 0.0
+
+
+def test_a_table_carried_onto_the_next_page_without_its_heading_row_is_joined():
+    """A table that ends a page goes on at the top of the next page without repeating its heading row: the piece is
+    joined to it, with its columns matched by position. A grid at the top of a page that continues nothing (the page
+    before ended with text) is a list."""
+    def table_block(page, grid, top, header_format=""):
+        boxes = [[(LEFT + 400 * c, top + 60 * r, LEFT + 400 * c + 350, top + 60 * r + 40) for c in range(len(row))]
+                 for r, row in enumerate(grid)]
+        lines = [make_line("   ".join(row), LEFT, top + 60 * r) for r, row in enumerate(grid)]
+        t = se.TableData(grid=grid, conf=[[0.99] * len(row) for row in grid], cell_boxes=boxes,
+                         header_rows=1 if header_format else 0, header_format=header_format)
+        b = se.Block("table", page, (LEFT, top, LEFT + 1150, top + 60 * len(grid)), lines=lines, table=t)
+        if not header_format:
+            b.meta["may_continue"] = True
+        return b
+    s = settings()
+    doc = se.DocResult(source="t.pdf", engine="standard")
+    for n in (1, 2):
+        doc.pages.append(se.PageInfo(number=n, width=PAGE_W, height=PAGE_H, source_dpi=DPI, dpi=DPI))
+    doc.blocks = [table_block(1, [["Signal", "Level", "Source"], ["Power", "28 V", "J1"], ["Ground", "0 V", "J1"]],
+                              1900, "underlined"),
+                  table_block(2, [["Clock", "5 V", "J2"], ["Reset", "5 V", "J2"]], 250)]
+    se.finalize_document(doc, s)
+    tables = [b for b in doc.blocks if b.kind == "table"]
+    assert len(tables) == 1 and tables[0].table.n_rows == 5, [(b.kind, b.text) for b in doc.blocks]
+    assert tables[0].table.grid[3] == ["Clock", "5 V", "J2"] and tables[0].pages == [1, 2], tables[0].table.grid
+
+    doc = se.DocResult(source="t.pdf", engine="standard")
+    for n in (1, 2):
+        doc.pages.append(se.PageInfo(number=n, width=PAGE_W, height=PAGE_H, source_dpi=DPI, dpi=DPI))
+    doc.blocks = se.analyze_page(1, blank_page(), make_lines(["3.1 General. The unit shall be painted."], y0=1900), s)
+    doc.blocks.append(table_block(2, [["Clock", "5 V", "J2"], ["Reset", "5 V", "J2"]], 250))
+    se.finalize_document(doc, s)
+    assert not any(b.kind == "table" for b in doc.blocks), [(b.kind, b.text) for b in doc.blocks]
+    assert [b.text for b in doc.blocks if b.kind == "list_item"] == ["Clock 5 V J2", "Reset 5 V J2"]
+
+
+def test_look_alike_misreads_are_corrected_only_when_certain():
+    """A letter or digit the scan misread for one of the same shape is put back when exactly one ordinary word comes
+    out ('requ1red', 'c0ntrol', 'systern'), as is a same-shape capital ('sCope') and a number with a letter O or l
+    ('1O0'). Acronyms ('UTC' is not 'UTE'), Roman numerals, identifiers, words the document repeats and real words
+    are never changed. A word one letter away from a word the document writes elsewhere is corrected, but marked
+    'twin': it stays a word to check."""
+    from collections import Counter
+    checker = se.WordChecker(Counter({"government": 3, "the": 20, "systen": 2}), settings())
+    assert checker.correct("requ1red", "") == ("required", "word")
+    assert checker.correct("c0ntrol.", "") == ("control.", "word")
+    assert checker.correct("systern", "") == ("system", "word")
+    assert checker.correct("sCope", "") == ("scope", "capital")
+    assert checker.correct("1O0", "") == ("100", "number")
+    assert checker.correct("governmient", "not in the English dictionary") == ("government", "twin")
+    for left_alone in ("UTC", "UTC.", "VIII.", "iii", "MIL-STD-461G", "SW-001", "l/min", "shall", "Horn", "systen",
+                       "TABLE", "0.65", "A", "I"):
+        assert checker.correct(left_alone, checker.issue(left_alone, left_alone)) == ("", ""), left_alone
+    off = se.WordChecker(Counter(), settings(spell_check_flags=False))
+    assert off.correct("requ1red", "") == ("", "")          # (no dictionary: nothing is certain)
+
+
+def test_corrected_words_are_listed_and_marked_and_a_guess_is_still_checked():
+    """A correction changes the row's text, is listed in the OCR Corrections column (not in Review Reasons), and is
+    highlighted in the Word report. A number the tool corrected, and a one-letter guess from the document's own
+    words, still mark the row Needs Review."""
+    lines = make_lines(["3.1 Power. The unit shall be requ1red to draw no more than 1O0 W.", None,
+                        "3.2 Ownership. The government shall own the data.", None,
+                        "3.3 Rights. The governmient shall approve the government data."])
+    doc, items = run({1: lines})
+    power = find(items, "draw no more")
+    assert "required" in power.text and "100 W" in power.text, power.text
+    assert "'requ1red' -> 'required'" in power.corrections and "'1O0' -> '100'" in power.corrections, power.corrections
+    assert power.needs_review and any("Number corrected" in r for r in power.review_reasons), power.review_reasons
+    assert not any("requ1red" in r for r in power.review_reasons), power.review_reasons
+    guess = find(items, "approve")
+    assert "The government shall approve" in guess.text and guess.needs_review, (guess.text, guess.review_reasons)
+    with tempfile.TemporaryDirectory() as tmp:
+        report = se.write_word_report(Path(tmp) / "r.docx", doc, items, settings(word_page_images=False))
+        import docx
+        green = [r.text.strip() for p in docx.Document(str(report)).paragraphs for r in p.runs
+                 if r.font.highlight_color is not None and "GREEN" in str(r.font.highlight_color)]
+        assert any("required" in t for t in green) and any("government" in t for t in green), green
+    _, raw = run({1: lines}, settings(autocorrect=False))
+    assert "requ1red" in find(raw, "draw no more").text and not find(raw, "draw no more").corrections
+
+
+def test_sections_nest_by_their_numbers_and_run_in_titles_are_split():
+    """Each numbered paragraph is a section at the level of its number (3 = 1, 3.1 = 2, 3.1.1.1 = 4) whatever its
+    indent, a run-in title is split from its text - ended by a full stop, or by underlining when the number is
+    indented by a tab - and the sections are typed by their titles."""
+    lines = make_lines(["1. SCOPE", None, "1.1 Scope. This specification covers the radar.", None,
+                        "3. REQUIREMENTS", None, (90, "3.1  Power input  The equipment shall operate from 115 V."),
+                        None, "3.1.1 Inrush. The inrush current shall not exceed 20 A.", None,
+                        (160, "3.1.1.1 The inrush shall be measured at turn on."), None,
+                        "4. VERIFICATION", None, "4.1 Tests. The tests shall be done in the laboratory."])
+    for w in lines[3].words[1:3]:                       # "Power input" printed underlined
+        w.underline = True
+    s = settings()
+    doc, items = run({1: lines}, s)
+    headings = se.build_outline(doc, se.RequirementExtractor(s))
+    got = [(h["level"], h["number"], h["title"], h["type"]) for h in headings]
+    assert got == [(1, "1", "SCOPE", "scope"), (2, "1.1", "Scope", "scope"), (1, "3", "REQUIREMENTS", "requirements"),
+                   (2, "3.1", "Power input", "requirements"), (3, "3.1.1", "Inrush", "requirements"),
+                   (4, "3.1.1.1", "", "requirements"), (1, "4", "VERIFICATION", "verification"),
+                   (2, "4.1", "Tests", "verification")], got
+    power = find(items, "115 V")
+    assert (power.doc_ref, power.title, power.text) == ("3.1", "Power input", "The equipment shall operate from 115 V.")
+
+
+def test_document_numbers_are_recognised_and_entries_parsed():
+    """The numbers of military, federal and industry documents are recognised as the start of a document entry -
+    paragraph numbers, requirement IDs and designators are not - and an entry gives its number, title and the
+    paragraphs that call it up, in the tab-stop and the dash layouts."""
+    for doc_id in ("MIL-STD-461G", "MIL-DTL-38999/26", "MIL-PRF-19500/543", "DOD-STD-1686", "FED-STD-595",
+                   "QQ-A-250/4", "SAE AS50881", "ANSI/EIA-649", "IEEE Std 1394", "ISO 9001:2015", "JESD22-A114",
+                   "MIL-HDBK-217F", "DI-IPSC-81433", "ASTM D3951", "RTCA DO-160G", "NASA-STD-8739.4"):
+        assert se.RE_DOC_ID_START.match(doc_id + " Title of the document"), doc_id
+    for not_a_document in ("3.2.1", "SW-001", "F-35", "3.3 V", "TABLE I", "CB12", "The radar"):
+        assert not se.RE_DOC_ID_START.match(not_a_document + " shall"), not_a_document
+    entry = se.parse_document_entry("MIL-STD-461G  Requirements for the Control of Electromagnetic Interference "
+                                    "Characteristics  3.2.5, 4.3.2")
+    assert entry == {"id": "MIL-STD-461G", "title": "Requirements for the Control of Electromagnetic Interference "
+                     "Characteristics", "paragraphs": "3.2.5, 4.3.2"}, entry
+    dash = se.parse_document_entry("MIL-STD-810H - Environmental Engineering Considerations and Laboratory Tests")
+    assert dash["title"] == "Environmental Engineering Considerations and Laboratory Tests" and not dash["paragraphs"]
+    assert se.parse_document_entry("The radar shall meet MIL-STD-461G.") is None
+
+
+def test_the_documents_of_section_2_are_read_under_their_group_titles():
+    """In section 2 each line of a document list is one document, filed under its group title ('SPECIFICATIONS')
+    and the sub-title indented under it ('Military'); a section titled by its first sentence ('The following
+    documents form a part of this specification') counts too."""
+    rows = [["2. APPLICABLE DOCUMENTS"], None, ["2.1 Government documents."], None, [(300, "SPECIFICATIONS")], None,
+            [(90, "Military")], None,
+            [(0, "MIL-PRF-38534"), (300, "Hybrid Microcircuits, General Specification for"), (1100, "3.2.1")],
+            [(0, "MIL-DTL-38999"), (300, "Connectors, Electrical, Circular"), (1100, "3.4")], None,
+            [(300, "STANDARDS")], None, [(90, "Military")], None,
+            [(0, "MIL-STD-461G"), (300, "Requirements for the Control of Electromagnetic"), (1100, "3.2.5")],
+            [(300, "Interference Characteristics")], None,
+            ["3. REQUIREMENTS"], None, ["3.1 General. The radar shall meet MIL-STD-461G."]]
+    lines, y = [], 300
+    for row in rows:                    # (the OCR returns the pieces of a line on tab stops as lines of their own)
+        for piece in row or []:
+            indent, text = piece if isinstance(piece, tuple) else (0, piece)
+            lines.append(make_line(text, LEFT + indent, y))
+        y += PITCH
+    s = settings()
+    doc, items = run({1: lines}, s)
+    se.build_outline(doc, se.RequirementExtractor(s))
+    entries = se.read_document_lists(doc)
+    got = [(e["group"], e["subgroup"], e["id"], e["title"], e["paragraphs"]) for e in entries]
+    assert got == [("SPECIFICATIONS", "Military", "MIL-PRF-38534", "Hybrid Microcircuits, General Specification for",
+                    "3.2.1"),
+                   ("SPECIFICATIONS", "Military", "MIL-DTL-38999", "Connectors, Electrical, Circular", "3.4"),
+                   ("STANDARDS", "Military", "MIL-STD-461G", "Requirements for the Control of Electromagnetic "
+                    "Interference Characteristics", "3.2.5")], got
+    assert len(requirements(items)) == 1, texts(items)
+
+
+def test_the_doors_document_follows_the_rules_doors_imports_by():
+    """<name>_for_doors.docx: Heading 1-9 only for numbered sections, no level skipped (a parent the scan did not
+    show is written as a placeholder), nothing else with an outline level, no empty paragraphs, tabs or line
+    breaks, tables without merged cells and with borders on every cell, no tags or marks - and a heading that is only
+    a number keeps it when heading numbers are removed."""
+    import docx
+    lines = make_lines(["SPEC-1234 Rev A", None, "3. REQUIREMENTS", None, "3.2.1 Range. The radar shall detect targets.",
+                        None, "3.2.1.1 The radar shall detect a 1 m2 target at 100 km.", None,
+                        "3.3 Cooling. The radar shall be cooled by forced air."])
+    s = settings()
+    doc, items = run({1: lines}, s)
+    table = se.TableData(grid=[["Signal", "Level", "Level"], ["Power", "28 V", "J1"]], conf=[[1.0] * 3] * 2,
+                         merges=[(0, 1, 0, 2)], header_rows=1, header_format="bold")
+    doc.blocks.append(se.Block("table", 1, (LEFT, 2400, LEFT + 1000, 2500), table=table, uid=len(doc.blocks) + 1))
+    se.build_outline(doc, se.RequirementExtractor(s))
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    for numbers in ("keep", "remove"):
+        style = Path(tempfile.mkdtemp()) / "style.ini"
+        style.write_text(f"[doors]\nheading_numbers = {numbers}\n", encoding="utf-8")
+        out = se.write_doors_document(style.parent / "d.docx", doc, items, settings(word_style_file=style))
+        d = docx.Document(str(out))
+        paras = [(p.style.name, p.text) for p in d.paragraphs]
+        headings = [(name, text) for name, text in paras if name.startswith("Heading")]
+        if numbers == "keep":
+            assert headings == [("Heading 1", "3. REQUIREMENTS"), ("Heading 2", "3.2 [heading not found in the scan]"),
+                                ("Heading 3", "3.2.1 Range"), ("Heading 4", "3.2.1.1"), ("Heading 2", "3.3 Cooling")], headings
+        else:
+            assert headings == [("Heading 1", "REQUIREMENTS"), ("Heading 2", "[heading not found in the scan]"),
+                                ("Heading 3", "Range"), ("Heading 4", "3.2.1.1"), ("Heading 2", "Cooling")], headings
+        assert ("Normal", "SPEC-1234 Rev A") in paras and paras[0][1] == "SPEC-1234 Rev A", paras[:3]
+        assert all(text.strip() for _name, text in paras[:-1]), paras
+        assert not any("[R-" in text for _name, text in paras), paras
+        body = d.element.body
+        assert not body.findall(f".//{W}tab") and not body.findall(f".//{W}br") and not body.findall(f".//{W}highlight")
+        assert not body.findall(f".//{W}gridSpan") and not body.findall(f".//{W}vMerge")
+        cells = body.findall(f".//{W}tc")
+        assert len(cells) == 6 and all(tc.find(f"{W}tcPr/{W}tcBorders") is not None for tc in cells)
+        for st in d.styles:                         # an outline level (own, or from the style it is based on)
+            if st.type != se.WD_STYLE_TYPE.PARAGRAPH or st.name.startswith("Heading"):
+                continue
+            chain, level = st, None
+            while chain is not None and level is None:
+                found = chain.element.find(f"{W}pPr/{W}outlineLvl")
+                level = found.get(f"{W}val") if found is not None else None
+                chain = chain.base_style
+            assert level in (None, "9"), (st.name, level)       # 9 = body text
+
+
+def test_merged_cells_are_the_same_in_excel_and_word_and_heading_text_stays_readable():
+    """Merged ranges that overlap or run out of the table are cut down once (_table_merges) and used by both files,
+    so a merged heading cell can no longer be emptied in Word; heading text that would be the colour of its shading
+    (white Table Heading text on a light row) is written in Word's automatic colour."""
+    t = se.TableData(grid=[["Parameter", "Parameter", "Units"], ["Voltage", "Parameter", "V"], ["Current", "5", "A"]],
+                     conf=[[1.0] * 3] * 3, merges=[(0, 0, 0, 1), (0, 1, 1, 1), (2, 2, 2, 5), (1, 0, 1, 0)],
+                     header_rows=1, header_format="bold")
+    assert se._table_merges(t) == [(0, 0, 0, 1)], se._table_merges(t)
+    import docx
+    tmp = Path(tempfile.mkdtemp())
+    style = tmp / "style.ini"
+    style.write_text("[table header row]\ncolor = FFFFFF\n", encoding="utf-8")
+    doc = se.DocResult(source="t.pdf", engine="standard", pages=[se.PageInfo(1, PAGE_W, PAGE_H, DPI, DPI)],
+                       blocks=[se.Block("table", 1, (100, 100, 900, 400), table=t, uid=1)])
+    out = se.write_word_report(tmp / "r.docx", doc, [], settings(word_style_file=style, word_page_images=False))
+    table = docx.Document(str(out)).tables[0]
+    assert [c.text for c in table.rows[0].cells] == ["Parameter", "Parameter", "Units"]
+    assert [c.text for c in table.rows[1].cells] == ["Voltage", "Parameter", "V"]
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    colours = {c.get(f"{W}val") for c in table._tbl.findall(f".//{W}tr")[0].findall(f".//{W}color")}
+    assert colours == {"auto"}, colours
+
+
+def test_the_excel_file_links_tables_and_holds_the_structure_and_the_documents():
+    """A table's row in Extracted Items links to its sheet instead of holding the grid as text; the Document
+    Structure and Applicable Documents sheets are written; the output folder carries the version."""
+    import openpyxl
+    lines = make_lines(["2. APPLICABLE DOCUMENTS", None, "MIL-STD-461G    Requirements for the Control of EMI    3.1",
+                        None, "3. REQUIREMENTS", None, "3.1 General. The radar shall meet MIL-STD-461G."])
+    s = settings()
+    doc, items = run({1: lines}, s)
+    t = se.TableData(grid=[["Signal", "Level"], ["Power", "28 V"]], conf=[[1.0] * 2] * 2, header_rows=1,
+                     header_format="underlined")
+    doc.blocks.append(se.Block("table", 1, (LEFT, 2400, LEFT + 1000, 2500), table=t, uid=len(doc.blocks) + 1,
+                               meta={"caption": "TABLE I. Signals."}))
+    items = se.RequirementExtractor(s).extract(doc)
+    se.build_outline(doc, se.RequirementExtractor(s))
+    se.read_document_lists(doc)
+    out = se.write_workbook(Path(tempfile.mkdtemp()) / "x.xlsx", [(doc, items)], s)
+    wb = openpyxl.load_workbook(out)
+    assert {"Document Structure", "Applicable Documents"} <= set(wb.sheetnames), wb.sheetnames
+    ws = wb["Extracted Items"]
+    header = [c.value for c in ws[1]]
+    row = next(r for r in ws.iter_rows(min_row=2) if r[header.index("Type")].value == "Table")
+    content = row[header.index("Content")]
+    assert content.hyperlink is not None and content.hyperlink.location.startswith("'T001'"), content.value
+    docs = [[c.value for c in r] for r in wb["Applicable Documents"].iter_rows(min_row=2)]
+    assert any("MIL-STD-461G" in [str(v) for v in r] for r in docs), docs
+    assert se.OUTPUT_FOLDER == "extraction_output_" + se.__version__
+
+
+def test_the_commit_is_read_from_the_git_folder_also_after_git_gc():
+    """The commit shown beside the build is read from .git without running git: from the branch's own file, from
+    packed-refs after 'git gc', or from a detached HEAD; nothing when the folder is not a checkout."""
+    root = Path(tempfile.mkdtemp())
+    assert se._git_commit(root) == ""
+    git = root / ".git"
+    (git / "refs" / "heads").mkdir(parents=True)
+    (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git / "packed-refs").write_text("# pack-refs with: peeled\n0123456789abcdef refs/heads/main\n", encoding="utf-8")
+    assert se._git_commit(root) == "0123456"
+    (git / "refs" / "heads" / "main").write_text("fedcba9876543210\n", encoding="utf-8")
+    assert se._git_commit(root) == "fedcba9"
+    (git / "HEAD").write_text("abcdef0123456789\n", encoding="utf-8")
+    assert se._git_commit(root) == "abcdef0"
+
+
+def test_the_code_guide_names_only_functions_that_exist():
+    """CODE_GUIDE.md tells someone editing the tool which function does each step. A function renamed or removed
+    must not leave the guide pointing at nothing: every `name()` it mentions must exist."""
+    guide = (HERE.parent / "CODE_GUIDE.md").read_text(encoding="utf-8")
+    missing = []
+    for name in sorted(set(re.findall(r"`([A-Za-z_][A-Za-z0-9_.]*)\(\)`", guide))):
+        if name in ("name", "Class.name", "Table.cell", "bool", "int", "float"):
+            continue                                    # (the guide's own explanation, python-docx, built-ins)
+        obj = se
+        for part in name.split("."):
+            obj = getattr(obj, part, None)
+        if not callable(obj):
+            missing.append(name)
+    assert not missing, f"CODE_GUIDE.md names functions that do not exist: {missing}"
+
+
+# =====================================================================================================================
 # Tested configuration: supported Python versions and the pinned package versions (constraints.txt)
 # =====================================================================================================================
 def test_the_case_library_is_well_formed_and_its_catalog_is_up_to_date():
@@ -3060,8 +3462,9 @@ def _report_sample(s: se.Settings | None = None) -> tuple:
                         "TABLE I. Power characteristics."], y0=300)
     doc.blocks.extend(se.analyze_page(1, blank_page(), lines, s))
     grid = [["Parameter", "Value"], ["Voltage", "28 V"], ["Ripple", "0.5 V"]]
-    doc.blocks.append(se.Block("table", 1, (220, 1300, 1500, 1500),
-                               table=se.TableData(grid=grid, conf=[[1.0, 1.0], [1.0, 1.0], [1.0, 0.4]])))
+    doc.blocks.append(se.Block("table", 1, (220, 1300, 1500, 1500),           # (its heading row is printed in bold)
+                               table=se.TableData(grid=grid, conf=[[1.0, 1.0], [1.0, 1.0], [1.0, 0.4]],
+                                                  header_format="bold")))
     doc.blocks.append(se.Block("page_header", 1, (220, 80, 900, 110), text="SPEC-1234 Rev A"))
     se.finalize_document(doc, s)
     items = se.RequirementExtractor(s).extract(doc)
@@ -3426,12 +3829,21 @@ def test_template_heading_numbering_is_switched_off_in_the_report():
         assert number is not None and number.get(f"{W_NS}val") == "0"
 
 
-def test_page_headings_start_a_new_page_without_blank_paragraphs():
+def test_page_labels_are_in_the_page_header_and_the_page_holds_only_what_was_read():
+    """Each scanned page starts a Word section of its own on a new page, labelled in that section's page header
+    ("Page 1 of 1  -  text read by the tool"); no label, page break or blank paragraph is left in the text itself,
+    and the document's own headings keep their levels (3.2 -> Heading 2)."""
     with tempfile.TemporaryDirectory() as tmp:
         d, _path = _write_report(Path(tmp))
-        page = next(p for p in d.paragraphs if p.text == "Page 1")
-        assert page.paragraph_format.page_break_before is True
+        assert not any(p.text.startswith("Page 1") for p in d.paragraphs)
+        labels = [p.text for p in d.sections[-1].header.paragraphs]
+        assert labels == ["Page 1 of 1  -  text read by the tool"], labels
+        assert d.sections[-1].header.paragraphs[0].style.name == "Page Label"
+        assert not d.sections[-1].header.is_linked_to_previous and d.sections[-1].footer.is_linked_to_previous
         assert not d.element.body.findall(f".//{W_NS}br[@{W_NS}type='page']")
+        assert next(p.style.name for p in d.paragraphs if p.text.startswith("3.2 Electrical")) == "Heading 2"
+        breaks = [p for p in d.paragraphs if p._p.find(f"{W_NS}pPr/{W_NS}sectPr") is not None]
+        assert breaks and all(p.text.strip() for p in breaks), [p.text for p in breaks]   # on a real paragraph
 
 
 def test_page_images_fit_inside_the_page_a_template_sets():
@@ -3458,7 +3870,9 @@ def test_requirement_tags_can_go_in_front_of_the_text():
     with tempfile.TemporaryDirectory() as tmp:
         d, _path = _write_report(Path(tmp), "[requirements]\ntag_position = start\n")
         requirement = next(p for p in d.paragraphs if "shall deliver 28 V" in p.text)
-        assert re.match(r"\[R-\d{4}\]  3\.2\.1 Output", requirement.text), requirement.text
+        assert re.match(r"\[R-\d{4}\]  The power supply", requirement.text), requirement.text
+        before = d.paragraphs[[q._p for q in d.paragraphs].index(requirement._p) - 1]
+        assert (before.text, before.style.name) == ("3.2.1 Output", "Heading 3")   # its run-in title, split off
         body = list(d.element.body)
         table = body.index(d.tables[0]._tbl)
         tag = body[table - 1]
@@ -3495,7 +3909,8 @@ def test_the_requirement_style_is_used_for_requirement_paragraphs_only():
         d, _path = _write_report(Path(tmp), "[requirements]\nbold = yes\n")
         def style_of(text: str) -> str:
             return next(p.style.name for p in d.paragraphs if p.text.startswith(text))
-        assert style_of("3.2.1 Output. The power supply") == "Requirement Text"
+        assert style_of("3.2.1 Output") == "Heading 3"                 # the run-in title is a heading of its own
+        assert style_of("The power supply") == "Requirement Text"
         assert style_of("This paragraph explains") == "Normal"
         assert style_of("a. Search mode.") == "List Paragraph"
         assert _style_value(d, "Requirement Text", "bold") is True and _style_value(d, "Normal", "bold") in (None, False)
@@ -3926,9 +4341,9 @@ def test_the_look_checked_at_start_up_is_used_for_the_whole_run():
         assert _style_value(d, "Heading 1", "size") == 16.0
 
 
-def test_page_images_leave_room_for_the_heading_and_tall_header_pictures():
-    """The page image leaves room for the 'Page N' heading and a line of notes (as before), and a tall logo in the
-    header - DrawingML or the older VML, in the default or the even-page header - takes room from it."""
+def test_page_images_fit_under_the_page_label_and_tall_header_pictures():
+    """The page image fits the text area of its page, under the page label in the page header, and a tall logo in
+    the header - DrawingML or the older VML, in the default or the even-page header - takes room from it."""
     def vml_logo(d):
         _header_xml(d, '<w:r><w:pict><v:shape style="width:144pt;height:144pt"><v:imagedata/></v:shape></w:pict></w:r>')
 
@@ -3947,7 +4362,9 @@ def test_page_images_leave_room_for_the_heading_and_tall_header_pictures():
         _png(folder / "page1.png", 1870, 2420)
         doc.cache_dir, doc.pages[0].image_file = str(folder), "page1.png"
         d, _path = _write_report(folder, None, sample=(doc, items, s))
-        assert d.inline_shapes[0].height <= int((9.8 - 1.2) * 914400) + 9144
+        usable = se._usable_page(d, d.sections[1])[1]                 # the page holding the scan, with its label
+        assert usable < 9.8 and d.inline_shapes[0].height <= int(usable * 914400) + 9144, usable
+        assert [p.text for p in d.sections[1].header.paragraphs] == ["Page 1 of 1  -  scanned page"]
 
 
 def test_the_starter_template_keeps_the_heading_row_shading_when_used_as_the_template():
@@ -4189,8 +4606,20 @@ def test_configuration_report_names_every_difference():
 
 
 # =====================================================================================================================
-def main() -> int:
+def main(argv=None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)]
+    if "--list" in args:
+        for name, fn in tests:
+            first = " ".join((fn.__doc__ or "").split()).split(". ")[0]
+            print(f"{name}\n      {first}" if first else name)
+        return 0
+    words = [a.lower() for a in args if not a.startswith("-")]
+    if words:
+        tests = [(name, fn) for name, fn in tests if any(w in name.lower() for w in words)]
+        if not tests:
+            print(f"no test name contains {' or '.join(words)!r} (python tests/test_rules.py --list shows them all)")
+            return 2
     failed = 0
     for name, fn in tests:
         try:
