@@ -477,18 +477,18 @@ Each rendered document was then "aged" into:
 | Photocopy | 200 dpi, faded ink, speckle, punch holes, dark copier edges |
 | Fax | Bilevel G4, 204×98 dpi |
 
-Results of the current version (38 pages in 10 files, `python tests/run_regression.py`):
+Results of the current version (42 pages in 12 files, `python tests/run_regression.py`):
 
 | | Clean / office scan | Heavy photocopy | Fax | Supplied pages (≈64 dpi) |
 |---|---|---|---|---|
 | Requirements found (recall) | 100 % | 100 % | 100 % | 100 % |
 | Extracted rows that are real requirements (precision) | 100 % | 100 % | 100 % | 100 % |
 | Paragraph number / requirement ID correct | 100 % | 100 % | 100 % | 100 % |
-| Requirement text exactly right | 100 % | 67–81 % | 43 % | 50 % |
-| Character errors in the requirement text | 0 % | 0.3–1.0 % | 1.9 % | 0.6 % |
+| Requirement text exactly right | 100 % | 53–81 % | 43 % | 50 % |
+| Character errors in the requirement text | 0 % | 0.3–0.8 % | 1.9 % | 0.6 % |
 | Captions and tables found, each table linked to its own caption | all | all | all | all |
 
-Of the 24 requirement rows that still contained an OCR character error, **21 were flagged** *Needs Review* (88 %), and one correct row was flagged (a "115" that the OCR itself read at 0.51 confidence - the cautious direction). The three unflagged errors are a "95%" read as "958", a "150 km" read as "150 kn" and a "45 kilograms" read as "45.kilograms": in each the misread token carries a digit, which no dictionary can check.
+Of the 32 requirement rows that still contained an OCR character error, **26 were flagged** *Needs Review* (81 %), and one correct row was flagged (a "115" that the OCR itself read at 0.51 confidence - the cautious direction). The six unflagged errors are a "95%" read as "958", a "150 km" read as "150 kn", a "45 kilograms" read as "45.kilograms" and, on the photocopy of the tabbed-list document, specks read as a full stop beside a number ("32 VDC,. 28 VDC", "time:. 2.0 s"): in each the misread token carries a digit or a mark, which no dictionary can check.
 
 Table **cells** are 100 % right on the clean and office scans of the ordinary documents and 97 % on the table-structure document, where the sideways headers are read from a quarter-turned crop and lose a character or two. On the heavy photocopies cell accuracy is 82–100 %, on the supplied low-resolution pages 90 % and on the fax 71 %; those are OCR misreads inside cells that were correctly found and correctly divided into rows and columns, and they are flagged for review.
 
@@ -498,7 +498,7 @@ Page orientation was right in 32 of 32 tests (every quarter turn of 8 different 
 
 The requirement text errors that remain are OCR misreads of damaged print (for example "fro" for "from", "958" for "95%"). Only misreads that can be undone with certainty are corrected (a look-alike letter or digit; see [section 1](#1-what-you-get)), and never silently: every correction is highlighted in the Word report and listed in the *OCR Corrections* column (a heading's in the *Document Structure* sheet), and a corrected number, keyword or one-letter guess is still flagged for review. Everything else is left as read, which is why the review flags matter.
 
-**The test-case library.** Besides these documents, `tests/cases` holds 162 small scans, each showing one situation the tool must get right or once got wrong - a list on wide tab stops, a marker the scan lost, a lead-in without a colon, a heading after a list, a list beside a column of prose, a table under a lead-in, a list that carries on over a page break, an underlined title, a list of applicable documents, a table without a heading row - with the exact rows (and, where it matters, the headings and documents) it must produce. Each has a fixed ID such as `TAB-01`, and `tests/cases/CASEBOOK.pdf` shows them all, one page per case. 152 of them pass; the 10 marked there as *known limitations* are what the tool still gets wrong, each with a description of what happens instead (see section 10). [tests/README.md](tests/README.md) explains how to run one case, and how to add a case - or a page of your own documents - as a test.
+**The test-case library.** Besides these documents, `tests/cases` holds 162 small scans, each showing one situation the tool must get right or once got wrong - a list on wide tab stops, a marker the scan lost, a lead-in without a colon, a heading after a list, a list beside a column of prose, a table under a lead-in, a list that carries on over a page break, an underlined title, a list of applicable documents, a table without a heading row - with the exact rows (and, where it matters, the headings and documents) it must produce. Each has a fixed ID such as `TAB-01`, and `tests/cases/CASEBOOK.pdf` shows them all, one page per case. 154 of them pass; the 8 marked there as *known limitations* are what the tool still gets wrong, each with a description of what happens instead (see section 10). [tests/README.md](tests/README.md) explains how to run one case, and how to add a case - or a page of your own documents - as a test.
 
 **Real documents will differ.** Before relying on the tool for a program, run a pilot of 20–30 pages of your own documents and compare against a manual extraction.
 

@@ -3597,7 +3597,8 @@ def _section_of(number: str) -> Optional[int]:
 
 # the words a document's title may wrap after, before the number of its part: "... Electronic Systems, Part" / "3
 # Software Requirements"
-_ENDS_IN_PART_NAME = re.compile(r"\b(?:Part|Volume|Vol|No|Number|Section|Chapter|Book)\.?\s*$", re.I)
+_ENDS_IN_PART_NAME = re.compile(r"\b(?:Part|Volume|Vol|No|Number|Section|Chapter|Book|Table|Figure|Category|Class|Type|"
+                                r"Method|Procedure|Note|Sheet|Paragraph|Clause|Appendix|Annex|Level|Grade)\.?\s*$", re.I)
 # a section's label on a line of its own, its title on the next: "APPENDIX A" / "GLOSSARY OF TERMS"
 _SECTION_LABEL = re.compile(r"(?:APPENDIX|ANNEX)\s+(?:[A-Z]|[IVX]{1,4}|\d{1,2})\.?|SECTION\s+\d{1,2}(?:\.0)?\.?")
 
@@ -3780,13 +3781,13 @@ _DOCUMENTS_APPLY = re.compile(r"\b(?:documents|specifications|standards|handbook
                               r"\b(?:shall|will)\s+form\s+(?:a\s+)?part\b", re.I)
 
 
-def _says_requirement(text: str) -> bool:
+def _says_requirement(text: str, capitals: bool = True) -> bool:
     """Does text of a document list hold a requirement keyword used as one - in small letters, outside brackets, or
-    in capitals among capitals ('THE UNIT SHALL COMPLY ...')? A document's title never says 'shall'; 'Human
-    Engineering (15 May 2020)' and '... 15 MAY 2020' only name a month."""
+    (`capitals`) in capitals among capitals ('THE UNIT SHALL COMPLY ...')? A document's title never says 'shall';
+    'Human Engineering (15 May 2020)' and '... 15 MAY 2020' only name a month."""
     plain = _DOCUMENTS_APPLY.sub(" ", re.sub(r"\([^()]*\)", " ", text or ""))
     return any(m.group(0)[:1].islower()
-               or (m.group(0).isupper() and m.group(0).lower() != "may"
+               or (capitals and m.group(0).isupper() and m.group(0).lower() != "may"
                    and not re.search(r"[a-z]", plain[max(0, m.start() - 25):m.end() + 25]))
                for m in _modal_re().finditer(plain))
 
@@ -3798,7 +3799,9 @@ def _starts_listed_document(text: str) -> bool:
     lead-in or a sub-title, and never where the line above leaves a phrase open: a line of running text may also
     start with a document number ('... as specified in' / 'MIL-STD-461G, RE102, and ...')."""
     m = _LISTED_DOCUMENT.match(text)
-    return bool(m) and not _cites_a_part(m.group("title")) and not _says_requirement(text)
+    # (in small letters only: "MIL-STD-461C, PART 2, CE03 LIMITS SHALL BE MET ..." under a lead-in is an item that
+    # starts with a document number, a line of its own)
+    return bool(m) and not _cites_a_part(m.group("title")) and not _says_requirement(text, capitals=False)
 
 
 def _rows_of(lines: list) -> list:
@@ -4268,7 +4271,7 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                 # (a centred sub-title, "Non-Government publications", may start near the title's tab stop: it is one
                 # when the title above it is finished)
                 centred = (abs((row_box[0] + row_box[2]) / 2 - (text_x0 + text_w / 2)) < 1.5 * stats.line_h
-                           and abs(row_box[0] - stops[1]) > 0.6 * stats.line_h
+                           and abs(row_box[0] - stops[1]) > 0.6 * stats.line_h and row_box[2] - row_box[0] < 0.6 * text_w
                            and not _leaves_phrase_open(prev_text) and not _leaves_phrase_open(row_text))
                 document_entry = (document_entry or not in_its_columns or centred or group_under_entry
                                   or note_under_entry)
@@ -4315,8 +4318,10 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                               and bool(re.match(r"(?:Method|Procedure|Test|Part|Section|Table|Volume)\s+\d"
                                                 r"|\S+(?:\s+\S+)?\s+[-–—]\s+\S", row_text)))
                 centred_title = (row_text.isupper() and _is_heading_text(row_text)
+                                 and row_text.count("(") == row_text.count(")")
                                  and abs((row_box[0] + row_box[2]) / 2 - (text_x0 + text_w / 2)) < 1.5 * stats.line_h
-                                 and row_box[0] > first_box[0] + 1.5 * stats.line_h)       # ("STANDARDS", centred)
+                                 and row_box[2] - row_box[0] < 0.6 * text_w
+                                 and row_box[0] > first_box[0] + 4 * stats.line_h)         # ("STANDARDS", centred)
                 document_entry = (ends or note_under_entry or bool(RE_LIST_MARKER.match(row_text)) or group_under_entry
                                   or cited_list or _says_requirement(row_text) or _starts_with_delimited_id(row_text)
                                   or centred_title)
@@ -4351,6 +4356,12 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                 or bool(row_num and "." not in row_num.group("num") + row_num.group("dot")
                         and row_num.group("rest")[:1].isupper() and word_count(row_num.group("rest")) <= 10
                         and re.match(re.escape(clean_para_number(row_num.group("num"))) + r"\.1\b", next_row_text))
+                # (an undotted number and a title, "6 Production and acceptance", with no full stop after it)
+                or bool(row_num and "." not in row_num.group("num") + row_num.group("dot")
+                        and row_num.group("rest")[:1].isupper() and word_count(row_num.group("rest")) <= 10
+                        and not row_text.rstrip().endswith(".") and not _starts_with_unit(row_num.group("rest"))
+                        and clean_para_number(row_num.group("num")).isdigit()
+                        and int(clean_para_number(row_num.group("num"))) <= 50)
                 or (not row_num and bool(_SECTION_LABEL.fullmatch(row_text.strip())) and not row_text.endswith("."))
                 or (not row_num and row_text.isupper() and bool(re.search(r"[a-z]", block_so_far)))
                 # (under text in capitals, only a top-level title of its own: "QUALITY ASSURANCE PROVISIONS", not
@@ -4417,8 +4428,10 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                     and ((sentence_ended and row_text[:1].isupper()) or new_requirement))
             )
             # (a new block for that reason alone is marked: see listed_split)
-            # ("lead" also inside a block that states a requirement: no list of documents says "shall")
-            weak_split = (("lead" if listed_lead or (_says_requirement(block_so_far) and item_x is None) else "next")
+            # ("lead" also inside a block that states a requirement, under a line that leaves its sentence open: no
+            # list of documents says "shall")
+            weak_split = (("lead" if listed_lead or (_says_requirement(block_so_far) and item_x is None
+                                                     and not _ends_sentence(prev_text)) else "next")
                           if listed_split and not new_block else "")
             new_block = new_block or listed_split
             if new_block and hanging and max(prev_h, row_h) <= 1.45 * max(1, min(prev_h, row_h)):
@@ -5217,8 +5230,10 @@ def _rejoin_running_text(doc: DocResult) -> None:
         parts = _number_parts(_outline_number(number)) if number else None
         if b.kind == "heading" and ((parts and len(parts) == 1) or (not parts and section_type(title) in TOP_LEVEL_TYPES)):
             plain_title = " ".join(title.lower().split()).strip(" .:")
-            top_type = section_type(title) or ("applicable documents" if _DOCUMENT_LIST_TITLES.fullmatch(plain_title)
-                                               else "other")                 # ("2. STANDARDS")
+            top_type = section_type(title) or (
+                "applicable documents" if (_DOCUMENT_LIST_TITLES.fullmatch(plain_title) or re.search(
+                    r"\b(?:documents?|documentation|standards|specifications|references|publications|handbooks)$",
+                    plain_title)) else "other")         # ("2. STANDARDS", "2. NORMATIVE REFERENCES")
             top_number = parts[0] if parts else None
         elif parts and parts[0] != top_number:
             top_type, top_number = "", parts[0]                # (its heading was lost: "2.1" after section 1)
@@ -7694,6 +7709,7 @@ def read_document_lists(doc: DocResult) -> list:
     entries = []
     in_list, group, subgroup = False, "", ""
     entry_title_x = None              # where the title of the entry just read starts, when it is on a tab stop
+    after_requirement = False         # the block above in the list is a requirement (its tests follow it)
     for b in doc.blocks:
         if b.kind in ("page_header", "page_footer"):
             continue
@@ -7712,20 +7728,21 @@ def read_document_lists(doc: DocResult) -> list:
                            and (in_section_2 or not _GENERIC_LIST_TITLES.fullmatch(plain)))
                        or bool(_DOCUMENTS_FOLLOW.search(b.text or "")))
             group = subgroup = ""
-            entry_title_x = None
+            entry_title_x, after_requirement = None, False
             if not any(p["kind"] == "body" for p in parts):
                 continue
         if not in_list or b.kind in ("table", "figure", "caption"):
             continue
         text = (b.text or "").strip()
         if _says_requirement(text):
-            entry_title_x = None
+            entry_title_x, after_requirement = None, True
             continue                                 # a requirement, not a document: no document's title says "shall"
         entry = parse_document_entry(text, _entry_columns(b) if RE_DOC_ID_START.match(text) else None)
-        if entry is not None and re.match(r"(?:Method|Procedure|Table|Figure|Paragraph|Condition)\.?\s+\d",
-                                          entry["title"]):
+        if (entry is not None and after_requirement
+                and re.match(r"(?:Method|Procedure|Table|Figure|Paragraph|Condition)\.?\s+\d", entry["title"])):
             entry_title_x = None
-            continue                                 # "MIL-STD-810H, Method 514.8 Vibration, ...": a test, not a document
+            continue                                 # "... The methods to be used are:" / "MIL-STD-810H, Method 514.8
+                                                     # Vibration, ...": a test that requirement names, not a document
         if entry is not None:
             lead = None if RE_DOC_ID_START.match(text) else RE_LIST_MARKER.match(text)
             entry.update({"group": group, "subgroup": subgroup, "page": b.page_label(), "uid": b.uid,

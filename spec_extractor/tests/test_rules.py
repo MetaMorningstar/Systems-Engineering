@@ -5348,6 +5348,73 @@ def test_review3_titles_in_capitals_that_end_in_for_or_of_above_more_title_or_a_
         ("DEPARTMENT OF DEFENSE HANDBOOKS", "EQUIPMENT")], got
 
 
+def test_review3_items_that_name_standards_across_a_page_and_titles_that_wrap_before_a_number():
+    """Review 1.5.0 (round 3): items under a lead-in that start with a document number and say 'shall' stay a row each
+    also when they continue on the next page or are typed in capitals; an item that wraps before a table's number
+    ('..., Table' / '8, Navy Aircraft Internal') is one item; and a long title wrapped with a hanging indent in a list
+    typed in capitals is not taken for a centred group title."""
+    items = [(90, "MIL-STD-461G, CE102 conducted emission limits for Navy aircraft, as tailored by table IV,"),
+             (90, "shall be met on all power leads of the unit, including the returns."),
+             (90, "MIL-STD-461G, RE102 radiated emission limits for Navy fixed-wing internal installations"),
+             (90, "shall be met with all of the units of the system operating together."),
+             (90, "MIL-STD-461G, RS103 radiated susceptibility limits of 200 V/m from 2 MHz to 18 GHz"),
+             (90, "shall be met with no degradation of performance.")]
+    doc, items_out = _pages(["3. REQUIREMENTS", None, "3.3 EMC. The unit shall meet the following limits:"] + items[:2],
+                            items[2:] + [None, "3.9 Weight. The unit shall weigh not more than 5 kg."])
+    assert len([t for t in texts(items_out) if t.startswith("The unit shall meet the following limits:")]) == 3, \
+        texts(items_out)
+    _doc, items_out = run({1: make_lines(["3. REQUIREMENTS", None, "3.2 ELECTROMAGNETIC INTERFERENCE. THE DISPLAY UNIT "
+                                          "SHALL MEET THE FOLLOWING:",
+                                          (90, "MIL-STD-461C, PART 2, CE03 LIMITS SHALL BE MET ON ALL POWER LEADS."),
+                                          (90, "MIL-STD-461C, PART 2, RE02 LIMITS SHALL BE MET IN EACH OF ITS MODES."),
+                                          (90, "MIL-STD-461C, PART 2, RS03 LIMITS SHALL BE MET WITH NO DEGRADATION."), None,
+                                          "3.3 WEIGHT. THE DISPLAY UNIT SHALL NOT EXCEED 9 KILOGRAMS."])})
+    assert len([t for t in texts(items_out) if t.startswith("THE DISPLAY UNIT SHALL MEET THE FOLLOWING:")]) == 3, \
+        texts(items_out)
+    doc, items_out, _s = _outline_doc(["4. VERIFICATION", None, "4.2 Environmental tests. The following tests shall be "
+                                       "performed on each unit:",
+                                       "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference, RS103, "
+                                       "Table", "8, Navy Aircraft Internal",
+                                       "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference, RE102, "
+                                       "Figure RE102-6", None, "4.3 EMI tests. EMI tests shall be performed in accordance "
+                                       "with MIL-STD-461G."])
+    assert [h["number"] for h in doc._outline] == ["4", "4.2", "4.3"], doc._outline
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS. THE FOLLOWING DOCUMENTS FORM A PART OF "
+                      "THIS SPECIFICATION.", None, (400, "DEPARTMENT OF DEFENSE STANDARDS"), None,
+                      "MIL-STD-1686C - ELECTROSTATIC DISCHARGE CONTROL PROGRAM FOR PROTECTION OF",
+                      (75, "ELECTRICAL AND ELECTRONIC PARTS, ASSEMBLIES AND EQUIPMENT (EXCLUDING"),
+                      (75, "ELECTRICALLY INITIATED EXPLOSIVE DEVICES)"),
+                      "MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF ELECTROMAGNETIC INTERFERENCE",
+                      (75, "CHARACTERISTICS OF SUBSYSTEMS AND EQUIPMENT"), None, "3. REQUIREMENTS", None,
+                      "3.1 GENERAL. THE UNIT SHALL MEET MIL-STD-461G."])
+    assert [(g, t.split()[-1]) for g, _s, _n, t, _p in got] == [("DEPARTMENT OF DEFENSE STANDARDS", "DEVICES)"),
+                                                                ("DEPARTMENT OF DEFENSE STANDARDS", "EQUIPMENT")], got
+
+
+def test_review3_section_2_with_compound_titles_entries_of_test_methods_and_undotted_headings():
+    """Review 1.5.0 (round 3): a section 2 titled 'APPLICABLE STANDARDS' or 'NORMATIVE REFERENCES' holds its list;
+    documents listed by test method ('MIL-STD-810H - Method 500.6, Low Pressure') are documents, while the methods a
+    requirement names under it are not; and an undotted heading with text under it ('2 Normative references') is a
+    heading."""
+    for title in ("2. APPLICABLE STANDARDS", "2. NORMATIVE REFERENCES"):
+        got = _documents(["1. SCOPE", None, "1.1 Scope. This specification covers the radar receiver.", None, title, None,
+                          "2.1 Standards.", None, "The following documents form a part of this specification to the "
+                          "extent specified herein:"] + _THREE + _REQUIREMENTS_TAIL)
+        assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-810H", "MIL-STD-461G", "MIL-STD-704F"], (title, got)
+    got = _documents(_DASH_HEAD + ["MIL-STD-461G - Requirements for the Control of Electromagnetic Interference",
+                                   "MIL-STD-810H - Method 500.6, Low Pressure (Altitude)",
+                                   "MIL-STD-810H - Method 514.8, Vibration", "MIL-STD-202H - Method 107, Thermal Shock"]
+                     + _REQUIREMENTS_TAIL)
+    assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-461G", "MIL-STD-810H", "MIL-STD-810H", "MIL-STD-202H"], got
+    doc, _items, _s = _outline_doc(["1 Scope", "This Standard specifies the requirements for the verification of radar "
+                                    "equipment. It applies to:", (60, "- flight equipment"),
+                                    (60, "- ground support equipment"), "2 Normative references",
+                                    "The following documents are referred to in the text of this standard.",
+                                    "3 Terms and definitions", "3.1 Track. A track is a sequence of detections."])
+    assert [h["title"] for h in doc._outline if h["level"] == 1] == ["Scope", "Normative references",
+                                                                    "Terms and definitions"], doc._outline
+
+
 def test_the_commit_is_read_from_the_git_folder_also_after_git_gc():
     """The commit shown beside the build is read from .git without running git: from the branch's own file, from
     packed-refs after 'git gc', or from a detached HEAD; nothing when the folder is not a checkout."""
