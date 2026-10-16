@@ -5414,6 +5414,10 @@ class RequirementExtractor:
                 it.review_reasons = [r for r in it.review_reasons if not r.startswith(CORRECTIONS_NOTE)]
                 for note in notes:
                     it.corrections += [c for c in note[len(CORRECTIONS_NOTE):].split("; ") if c not in it.corrections]
+            for reason in it.review_reasons:             # a list marker put right from the sequence ("C." -> "c."):
+                fix = re.match(r"List marker read as '([^']+)' - taken as '([^']+)'", reason)   # listed with them too
+                if fix and f"'{fix.group(1)}' -> '{fix.group(2)}'" not in it.corrections:
+                    it.corrections.append(f"'{fix.group(1)}' -> '{fix.group(2)}'")
             if it.item_type == "Table" and it.block_uids:
                 block = next((b for b in doc.blocks if b.uid == it.block_uids[0]), None)
                 twins = []

@@ -3213,6 +3213,21 @@ def test_corrected_words_are_listed_and_marked_and_a_guess_is_still_checked():
     assert "requ1red" in find(raw, "draw no more").text and not find(raw, "draw no more").corrections
 
 
+def test_a_list_marker_with_the_wrong_capital_is_put_right_shown_and_listed():
+    """'a. b. C. d.': the scan read the third marker as a capital. It is taken as 'c.' from the sequence, said so in
+    Review Reasons, listed in OCR Corrections and shown as corrected (green) in the Word report."""
+    import docx
+    lines = make_lines(["3.2.4 Modes. The radar shall provide the following modes:", None,
+                        (60, "a.  Search mode."), (60, "b.  Track mode."), (60, "C.  Map mode."), (60, "d.  Weather mode.")])
+    doc, items = run({1: lines})
+    row = find(items, "Map mode")
+    assert (row.doc_ref, row.text) == ("3.2.4 c", "The radar shall provide the following modes: c. Map mode."), row.text
+    assert row.corrections == ["'C.' -> 'c.'"] and any("taken as 'c.'" in r for r in row.review_reasons), row.corrections
+    out = se.write_word_report(Path(tempfile.mkdtemp()) / "r.docx", doc, items, settings(word_page_images=False))
+    runs = [(r.text.strip(), str(r.font.highlight_color)) for p in docx.Document(str(out)).paragraphs for r in p.runs]
+    assert ("c.", "BRIGHT_GREEN (4)") in runs, [r for r in runs if "Map" in r[0] or r[0] == "c."]
+
+
 def test_sections_nest_by_their_numbers_and_run_in_titles_are_split():
     """Each numbered paragraph is a section at the level of its number (3 = 1, 3.1 = 2, 3.1.1.1 = 4) whatever its
     indent, a run-in title is split from its text - ended by a full stop, or by underlining when the number is
