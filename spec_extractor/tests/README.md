@@ -8,8 +8,8 @@ There are four ways to test the tool. Every command below is typed in a terminal
 | Test | What it checks | How long | Command |
 |---|---|---|---|
 | **Rule tests** | the layout, table, list, heading and export rules, on made-up page geometry (no OCR) | seconds | `python tests/test_rules.py` |
-| **Regression** | the whole tool, with the real OCR, on 12 synthetic scanned specifications with exact answers | 4-6 minutes | `python tests/run_regression.py` |
-| **Case library** | the whole tool on 160 small scanned pages, each one situation (a list on tab stops, a table without a heading row ...) | 15-20 minutes | `python tests/cases/run_cases.py` |
+| **Regression** | the whole tool, with the real OCR, on 12 scanned files (42 pages) of 7 synthetic specifications with exact answers | 4-6 minutes | `python tests/run_regression.py` |
+| **Case library** | the whole tool on 162 small scanned pages, each one situation (a list on tab stops, a table without a heading row ...) | 15-20 minutes | `python tests/cases/run_cases.py` |
 | **Your own scans** | the whole tool on pages of your own documents, checked against what you wrote down | a minute a page | `python tests/cases/run_cases.py --only MY` |
 
 The test tools need a few extra packages, once:
@@ -25,11 +25,10 @@ Nothing here uses the network: the test documents are drawn on this computer, an
 ## 1. Rule tests (`tests/test_rules.py`)
 
 ```bat
-python tests/test_rules.py                      all of them (about 240), in under a minute
+python tests/test_rules.py                      all of them (about 280), in a minute or two
 python tests/test_rules.py underline            only the tests with "underline" in their name
 python tests/test_rules.py underline doors      ... with "underline" or "doors" in their name
 python tests/test_rules.py --list               the name and first line of every test
-python -m pytest tests/test_rules.py -k doors   the same with pytest, if you prefer it
 ```
 
 Each test prints `ok` or `FAIL` (with the line that failed), and the run ends with the number passed and failed.
@@ -53,8 +52,9 @@ def test_a_heading_without_a_full_stop_keeps_its_requirement():
 
 * `make_lines` / `make_line` - text to OCR lines; `run` - lines to `(document, Excel rows)` through layout,
   clean-up and extraction; `requirements`, `texts`, `find` - pick rows out of the result.
-* Tests of tables and underlining draw a real page image (search the file for `cv2.line` or `_report_sample`
-  for examples), because those rules look at the ink.
+* Tests of tables and underlining draw a real page image, because those rules look at the ink: `_draw_words()`
+  and `_draw_table()` draw text and ruled tables, `_draw_formatted()` underlined and bold text. `_report_sample()`
+  is a small document with every part of the Word report, for tests of the report.
 * Put the new test next to the tests of the same rule, and give it a docstring that says what must happen:
   the first sentence is shown in the case catalog's appendix.
 
@@ -113,10 +113,12 @@ what an edit improved or broke - and writes:
 * `tests/cases/_results/case_results.xlsx` - one line per case;
 * `tests/cases/_results/run*/` - the tool's own Excel files for each case, to open and look at.
 
+(Your own scans, section 4, are run into `tests/cases/my_cases/_results/` instead, with reports of their own.)
+
 To look at a case's page, open `tests/cases/documents/<ID>_<name>.pdf`, or run the tool on that one file:
 
 ```bat
-python spec_extractor.py tests\cases\documents\STR-05_a_list_of_documents_under_a_title_and_a_tab_indented_sub.pdf
+python spec_extractor.py tests\cases\documents\STR-05_a_list_of_documents_under_a_title_and_a_tab_indented_sub_tit.pdf
 ```
 
 To run the cases with another Python, set `SPEC_PYTHON` to it first (`set SPEC_PYTHON=C:\Python314\python.exe`).
@@ -199,10 +201,15 @@ out but its two help files), and nothing is sent anywhere.
    python tests/cases/run_cases.py --only MY
    ```
 
-   Your cases are named `MY-<file name>` and take part in every plain `run_cases.py` run too.
+   Your cases are named `MY-<file name>` (`--only MY-PAGE12` runs one of them) and take part in every plain
+   `run_cases.py` run too.
 
-Remember that these files hold your document's text: keep the folder where such data may be kept, and delete the
-scan and its `.expected.txt` when they are no longer needed.
+Remember that these files hold your document's text. Everything the runs write for your scans stays inside
+`tests/cases/my_cases/`: the tool's workbooks, the page images and text it keeps in `_cache`, and the case reports
+(which quote the requirement text) go to `tests/cases/my_cases/_results/`, never to `tests/cases/_results/`, and
+`--record` refuses a scan that is not in `my_cases` (and deletes the tool's output once the `.expected.txt` is
+written). Keep the folder where such data may be kept, and when a scan is no longer needed delete it, its
+`.expected.txt` and the `_results` folder.
 
 ---
 

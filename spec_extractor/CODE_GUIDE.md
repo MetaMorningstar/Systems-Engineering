@@ -70,8 +70,10 @@ What happens when you run `python spec_extractor.py spec.pdf` (section numbers i
       * `RequirementExtractor.review_for_tokens()` decides *Needs Review* and the *Review Reasons*; `RequirementExtractor.quality_notes()` the INCOSE checks.
         Corrections go to the *OCR Corrections* column.
    5. **The document's structure** [9b, 9c]: `build_outline()` gives every numbered paragraph its section and level
-      (`_heading_level()`: the number of parts of the number), types the sections by their titles
-      (`section_type()`, `SPEC_SECTION_TYPES`), and stores it on the blocks (`Block.meta["outline"]`).
+      (`_heading_level()`: the number of parts of the number), files it under its number's parent (a parent the scan
+      did not show gets a part of its own, `"missing": True`), types the top-level sections by their titles
+      (`section_type()`, `SPEC_SECTION_TYPES`), and stores it on the blocks (`Block.meta["outline"]`). The writers
+      take each part's words with `_part_tokens()` [7], which splits a word the boundary cuts ("Leakage.No").
       `read_document_lists()` reads the documents of section 2 (`parse_document_entry()`), and
       `note_section_types()` adds the quality note for a requirement in section 6 (Notes).
    6. **The outputs**:
@@ -164,7 +166,9 @@ What happens when you run `python spec_extractor.py spec.pdf` (section numbers i
 | how underlining and bold are measured | `measure_text_format()` and the helpers of 6b-2 | thresholds are in line heights, explained in the comments |
 | which titles start which kind of section | `SPEC_SECTION_TYPES`, `_DOCUMENT_LIST_TITLES`, `_DOCUMENTS_FOLLOW` [9b, 9c] | a title is matched as a whole, ignoring case |
 | which document numbers are recognised (`MIL-STD-461G`, `SAE AS50881` ...) | `RE_DOC_ID` [6a] | one alternative per family of documents, with a comment; test with `tests/test_rules.py doc` |
-| how a paragraph number, title and text are split | `RequirementExtractor.parse_head()` [9], `underlined_after_number()` [9] | |
+| how a paragraph number, title and text are split | `RequirementExtractor.parse_head()` [9], `underlined_after_number()` [9] | an underlined title must end like one (no sentence end inside, no comma at the end) |
+| how the lines of a document list are told apart | `_starts_document_entry()` (tab stops, dash), `_starts_listed_document()` (single-spaced) [6f], `parse_document_entry()` [9c] | a document title never holds a requirement keyword |
+| which unnumbered titles start a top-level section | `build_outline()` [9b] (its inner function `starts_new_section`) | section numbers only go forward: a "1." inside section 3 is a note, not section 1 |
 | heading levels | `_heading_level()` [9b] and `_ReportWriter.heading()` [11e] | the level is the number of parts of the paragraph number, at most 9 |
 | a column of the Excel file | `MASTER_COLUMNS` [10] and where `write_workbook()` fills the row | find columns by name (`_COL["Content"]`), never by position |
 | a part of the Word report (a new style) | `REPORT_PARTS` [11a], `word_style/report_style.ini`, `write_starter_template()` [11f], the README's style table | `tests/test_rules.py` checks that the parts and the style file agree |
@@ -195,4 +199,7 @@ What happens when you run `python spec_extractor.py spec.pdf` (section numbers i
 * **Security** (the tool is used on sensitive data): it must never reach the network. Do not add a package without
   checking that it works offline and sends nothing (no telemetry, no model downloads), pin it in `constraints.txt`,
   and say so in the README. A Word template or report must never point outside the computer (`outside_references()`).
-  Test scans of your own go in `tests/cases/my_cases/`, which git ignores.
+  Nothing with the document's text may be written outside the output folder: the Excel file is saved with its
+  temporary files in a folder of their own there (`_temporary_files_in()` [10]). Test scans of your own go in
+  `tests/cases/my_cases/`, which git ignores; `tests/cases/run_cases.py` keeps everything it writes for them in
+  `my_cases/_results`.

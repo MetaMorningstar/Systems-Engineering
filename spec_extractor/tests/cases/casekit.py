@@ -646,6 +646,15 @@ def load_local_cases(folder: Path = LOCAL_FOLDER) -> list:
         scan = folder / expected.name[:-len(".expected.txt")]
         if scan.is_file() and scan.suffix.lower() in SCAN_TYPES:
             cases.append(read_expected(expected, scan))
+    by_id = {}
+    for c in cases:
+        by_id.setdefault(c.id, []).append(Path(c.scan).name)
+    clashes = {i: names for i, names in by_id.items() if len(names) > 1}
+    if clashes:
+        # page12.pdf and page12.tif would get one case ID, and the tool writes one page12_extracted.xlsx for both
+        raise ValueError("two of your own scans in my_cases have the same name before the extension, so their "
+                         "results would be mixed up - rename one of them: "
+                         + "; ".join(" and ".join(names) for names in clashes.values()))
     return cases
 
 

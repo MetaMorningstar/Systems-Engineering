@@ -26,6 +26,10 @@ workbook is compared with the case:
 Result of each case: PASS, FAIL, or - for a case marked as a known limitation - KNOWN (still wrong, as
 recorded) or KNOWN-PASSES (the limitation seems to be fixed: check it and remove the mark).
 
+Your own scans (tests/cases/my_cases) are run into a folder of their own under tests/cases/my_cases/_results (one
+for each outdir, named like it) instead of <outdir>, with their reports: no copy of their pages or text is left
+outside my_cases, which git ignores.
+
 The results are kept in <outdir>/case_results.json; the next run lists every case whose result changed since
 then - the quickest way to see what an edit improved or broke. The full expected-vs-actual listing is written
 to <outdir>/case_report.txt and a one-line-per-case table to <outdir>/case_results.xlsx.
@@ -54,10 +58,13 @@ except ImportError:                                   # started with a Python wi
     raise
 
 import argparse
+import contextlib
 import difflib
 import json
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -66,6 +73,11 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import casekit  # noqa: E402
 import build_cases  # noqa: E402
+
+# Everything the tool writes for your own scans - its workbooks, the page images and text it keeps in _cache, and the
+# case reports, which quote the requirement text - stays here, inside my_cases (which git ignores), and never in
+# tests/cases/_results: deleting the my_cases folder removes every copy.
+OWN_RESULTS = casekit.LOCAL_FOLDER / "_results"
 
 THRESHOLD = 0.9
 
@@ -108,9 +120,30 @@ def run_tool(spec: Path, documents: list, outdir: Path, jobs: int) -> None:
             print(f"WARNING: spec_extractor exited with status {rc} (see {target / 'tool_output.txt'})", file=sys.stderr)
 
 
+def workbooks_of(outdir: Path, document: Path) -> list:
+    """The tool's workbooks for this document under outdir (the name matched as it is: a scan may be called
+    'SRS [Rev B].pdf', which a search pattern would read as a set of letters)."""
+    name = f"{document.stem}_extracted.xlsx"
+    return sorted(p for p in outdir.glob("run*/*_extracted.xlsx") if p.name == name)    # (run_tool's folders only)
+
+
 def find_workbook(outdir: Path, document: Path):
-    hits = sorted(outdir.rglob(f"{document.stem}_extracted.xlsx"))
+    hits = workbooks_of(outdir, document)
     return hits[0] if hits else None
+
+
+@contextlib.contextmanager
+def _temporary_files_in(folder: Path):
+    """While a workbook is saved, keep its temporary files (openpyxl writes each sheet to one) in a folder of their
+    own inside `folder`, and delete it afterwards - not in the system's temp folder: the reports of your own scans
+    quote their text. (The same as spec_extractor.py's helper of this name.)"""
+    private = Path(tempfile.mkdtemp(prefix="_saving_", dir=folder))
+    before, tempfile.tempdir = tempfile.tempdir, str(private)
+    try:
+        yield
+    finally:
+        tempfile.tempdir = before
+        shutil.rmtree(private, ignore_errors=True)
 
 
 def _sheet(wb, name: str) -> list:
@@ -251,28 +284,36 @@ def evaluate(case: casekit.Case, rows: list) -> tuple:
     return (not problems), "; ".join(problems[:3]) + (" ..." if len(problems) > 3 else ""), detail
 
 
-def record(spec: Path, scan: Path, outdir: Path) -> int:
+def record(spec: Path, scan: Path) -> int:
     """Run the tool on your own scan and write <scan>.expected.txt beside it: what the tool produces NOW, one line
-    per expectation, for you to correct to what it SHOULD produce. An existing file is never overwritten."""
+    per expectation, for you to correct to what it SHOULD produce. An existing file is never overwritten. The scan
+    must be in my_cases (git ignores that folder, and only scans there are run as cases); the tool's output for it
+    is deleted once the file is written."""
     if not scan.is_file() or scan.suffix.lower() not in casekit.SCAN_TYPES:
         print(f"no scan here: {scan} (a PDF, TIFF, PNG or JPG file)")
+        return 2
+    if scan.parent != casekit.LOCAL_FOLDER.resolve():
+        print(f"{scan.name} is not in {casekit.LOCAL_FOLDER}: put it there first, not in a folder inside it (git "
+              f"ignores that folder; a file written anywhere else could be committed, and only scans directly in it "
+              f"are run as cases)")
         return 2
     expected = scan.with_name(scan.name + ".expected.txt")
     if expected.exists():
         print(f"{expected.name} already exists - correct it by hand, or delete it to record again")
         return 2
-    if casekit.LOCAL_FOLDER.resolve() not in scan.parents:
-        print(f"note: {scan.name} is not in {casekit.LOCAL_FOLDER} - only scans there are run as cases")
-    target = outdir / "record"
+    target = OWN_RESULTS / "_record"
+    shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
-    for old in target.rglob(f"{scan.stem}_extracted.xlsx"):
-        old.unlink()
-    run_tool(spec, [scan], target, 1)
-    xlsx = find_workbook(target, scan)
-    if xlsx is None:
-        print("the tool wrote no workbook - see", target / "run1" / "tool_output.txt")
-        return 2
-    rows = read_items(xlsx)
+    try:
+        run_tool(spec, [scan], target, 1)
+        xlsx = find_workbook(target, scan)
+        if xlsx is None:
+            print("the tool wrote no workbook - see", target / "run1" / "tool_output.txt")
+            return 2
+        rows = read_items(xlsx)
+    finally:
+        if (target / "run1" / f"{scan.stem}_extracted.xlsx").exists():
+            shutil.rmtree(target, ignore_errors=True)     # (kept when the tool failed: its tool_output.txt says why)
     structure = rows[0]
     lines = [f"# What spec_extractor produced for {scan.name} on {time.strftime('%Y-%m-%d')}.",
              "# CORRECT THIS FILE to what the tool SHOULD produce, then run:  python tests/cases/run_cases.py --only MY",
@@ -312,7 +353,8 @@ def write_workbook(path: Path, results: list) -> None:
         ws.column_dimensions[col].width = width
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    wb.save(path)
+    with _temporary_files_in(path.parent):
+        wb.save(path)
 
 
 def main(argv=None) -> int:
@@ -330,19 +372,24 @@ def main(argv=None) -> int:
                                                       "<SCAN>.expected.txt with what the tool produces now")
     args = ap.parse_args(argv)
     if args.record:
-        return record(Path(args.spec).resolve(), Path(args.record).resolve(), Path(args.outdir).resolve())
+        return record(Path(args.spec).resolve(), Path(args.record).resolve())
 
     spec, outdir = Path(args.spec).resolve(), Path(args.outdir).resolve()
     if not spec.is_file():
         ap.error(f"no such file: {spec}")
-    outdir.mkdir(parents=True, exist_ok=True)
-    cases = casekit.load_cases() + casekit.load_local_cases()
+    try:
+        cases = casekit.load_cases() + casekit.load_local_cases()
+    except ValueError as exc:                         # a case that cannot be read, or two scans with one name
+        print(exc)
+        return 2
     wanted = [w.strip() for w in args.only.split(",") if w.strip()]
 
     def chosen(c) -> bool:
         for w in wanted:
+            if c.id.lower() == w.lower():
+                return True                                         # a case's ID, also your own (MY-PAGE12)
             if re.fullmatch(r"[A-Za-z]{2,4}(-\d{2}[A-Za-z]?)?", w):      # an area or a case ID
-                if c.id.lower() == w.lower() or c.id.lower().startswith(w.lower() + "-"):
+                if c.id.lower().startswith(w.lower() + "-"):
                     return True
             elif w.lower() in c.title.lower():
                 return True
@@ -353,23 +400,44 @@ def main(argv=None) -> int:
         print(f"no case matches {args.only!r}")
         return 2
     docs = build_cases.build_documents(selected)
+    counts = Counter()
+    library, own = [c for c in selected if not c.scan], [c for c in selected if c.scan]
+    if library:
+        counts += check(spec, library, docs, outdir, args)
+    if own:
+        if library:
+            print()
+        # (a folder of their own for each outdir: a run of another copy of the tool into another outdir has its own)
+        own_dir = OWN_RESULTS / outdir.name
+        print(f"your own scans (their results stay in {own_dir}):")
+        counts += check(spec, own, docs, own_dir, args)
+    return 0 if counts["FAIL"] == 0 else 1
 
+
+def check(spec: Path, selected: list, docs: dict, outdir: Path, args) -> Counter:
+    """Run the tool on these cases' documents into outdir, compare its output with each case, print the result of
+    each and write the reports (case_report.txt, case_results.json / .xlsx) there. -> the count of each result."""
+    outdir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    todo = [docs[c.id] for c in selected if not (args.reuse and find_workbook(outdir, docs[c.id]))]
+    results_file = outdir / "case_results.json"
+    previous, previous_spec = {}, None
+    if results_file.exists():
+        try:
+            saved = json.loads(results_file.read_text(encoding="utf-8"))
+            previous, previous_spec = saved.get("cases", {}), saved.get("spec")
+        except (ValueError, OSError):
+            previous = {}
+    reuse = args.reuse and previous_spec == str(spec)
+    if args.reuse and not reuse:
+        print(f"(the workbooks in {outdir} were made by another copy of the tool, or by an unknown one: running it "
+              f"again instead of --reuse)", flush=True)
+    todo = [docs[c.id] for c in selected if not (reuse and find_workbook(outdir, docs[c.id]))]
     if todo:
         print(f"running {spec.name} on {len(todo)} case document(s) -> {outdir}", flush=True)
         for d in todo:                                # never compare against a stale workbook
-            for old in outdir.rglob(f"{d.stem}_extracted.xlsx"):
+            for old in workbooks_of(outdir, d):
                 old.unlink()
         run_tool(spec, todo, outdir, args.jobs)
-
-    results_file = outdir / "case_results.json"
-    previous = {}
-    if results_file.exists():
-        try:
-            previous = json.loads(results_file.read_text(encoding="utf-8")).get("cases", {})
-        except (ValueError, OSError):
-            previous = {}
     report, results, counts = [f"spec_extractor under test: {spec}", ""], [], Counter()
     for c in selected:
         xlsx = find_workbook(outdir, docs[c.id])
@@ -408,7 +476,7 @@ def main(argv=None) -> int:
     (outdir / "case_report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
     write_workbook(outdir / "case_results.xlsx", results)
     print(f"details: {outdir / 'case_report.txt'}  (table: {outdir / 'case_results.xlsx'})")
-    return 0 if counts["FAIL"] == 0 else 1
+    return counts
 
 
 if __name__ == "__main__":

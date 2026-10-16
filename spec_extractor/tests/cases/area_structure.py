@@ -46,7 +46,8 @@ CASES = [
          "...' with 'Power input' underlined and no full stop after it, and '3.2.2  Power consumption  ...' the same.",
          "Each subsection is a section of its own at level 3 under 3.2 - its underlined words are its title, the "
          "rest its text: the Title column says 'Power input' and the text starts 'The equipment ...'. In the Word "
-         "documents the title is a Heading 3 and the text a paragraph under it.",
+         "documents the title is a Heading 3 and the text a paragraph under it. (The page starts inside section 3, so "
+         "the Document Structure sheet first has '3 [heading not found in the scan]', as the DOORS file does.)",
          "User request (1.5.0): a subsection indented by a tab, its underlined title and body on one line.",
          text="""
 3.2  Electrical requirements.  The equipment shall meet the
@@ -61,7 +62,8 @@ requirements of this section.
          expect=para("3.2 | The equipment shall meet the requirements of this section. [title: Electrical requirements]",
                      "3.2.1 | The equipment shall operate from 115 V ac, 400 Hz, single phase. [title: Power input]",
                      "3.2.2 | The equipment shall draw no more than 500 W. [title: Power consumption]"),
-         outline=("2 | 3.2 Electrical requirements", "3 | 3.2.1 Power input", "3 | 3.2.2 Power consumption")),
+         outline=("1 | 3 [heading not found in the scan]", "2 | 3.2 Electrical requirements", "3 | 3.2.1 Power input",
+                  "3 | 3.2.2 Power consumption")),
     Case("STR-02", "An underlined run-in title with a full stop, proportional font",
          "STR-01 printed in a proportional (serif) font, the underlined titles ending in a full stop "
          "('Power input.').",
@@ -80,12 +82,14 @@ requirements of this section.
          expect=para("3.2 | The equipment shall meet the requirements of this section. [title: Electrical requirements]",
                      "3.2.1 | The equipment shall operate from 115 V ac, 400 Hz, single phase. [title: Power input]",
                      "3.2.2 | The equipment shall draw no more than 500 W. [title: Power consumption]"),
-         outline=("2 | 3.2 Electrical requirements", "3 | 3.2.1 Power input", "3 | 3.2.2 Power consumption")),
+         outline=("1 | 3 [heading not found in the scan]", "2 | 3.2 Electrical requirements", "3 | 3.2.1 Power input",
+                  "3 | 3.2.2 Power consumption")),
     Case("STR-03", "An underlined title on a line of its own, without a number",
          "'3.4 Environmental conditions' (underlined), a paragraph, then 'Temperature' underlined on a line of its "
          "own and a paragraph under it.",
          "Both underlined lines are titles, not text: 3.4 is a level-2 section; 'Temperature' has no number, so it is "
-         "a sub-title inside 3.4 and leaves the numbered levels alone (it is not a heading in the outline).",
+         "a sub-title inside 3.4 and leaves the numbered levels alone (it is not a heading in the outline). Section 3 "
+         "itself is not on the page: its row says '3 [heading not found in the scan]'.",
          "User request (1.5.0): underlined text is a section title.",
          text="""
 3.4  <u>Environmental conditions</u>
@@ -99,7 +103,7 @@ The equipment shall operate from -40 C to +71 C.
          expect=para(" | The equipment shall operate in the environments of this section. "
                      "[section: 3.4 Environmental conditions]",
                      " | The equipment shall operate from -40 C to +71 C. [section: Temperature]"),
-         outline=("2 | 3.4 Environmental conditions",)),
+         outline=("1 | 3 [heading not found in the scan]", "2 | 3.4 Environmental conditions",)),
     Case("STR-04", "Numbered paragraphs nest by their numbers, not by their indent or spacing",
          "3 REQUIREMENTS, then 3.1, 3.1.1, 3.1.1.1, 3.1.1.2 and 3.2 printed at different indents, some with a blank "
          "line before them and some without.",

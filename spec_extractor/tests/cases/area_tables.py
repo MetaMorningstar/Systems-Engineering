@@ -253,9 +253,7 @@ CASES = [
                     [("Min.", "22.0 VDC", "Test"), ("Nom.", "28.0 VDC", "Test"), ("Max.", "29.0 VDC", "Test")],
                     (3, 24, 55)), tables=0,
          expect=items("The input voltage shall be within the following limits:", "3.2.3 | Min. 22.0 VDC Test",
-                      "3.2.3 | Nom. 28.0 VDC Test", "3.2.3 | Max. 29.0 VDC Test") + _AFTER_ROW,
-         known="The rows and the list are right, but the OCR reads the label 'Nom.' of this page as 'Horn.' (an "
-               "ordinary word, so it is not marked or corrected)."),
+                      "3.2.3 | Nom. 28.0 VDC Test", "3.2.3 | Max. 29.0 VDC Test") + _AFTER_ROW),
     Case("TBL-16", "A table whose labels are abbreviations ('Temp.', 'Alt.', 'Vib.', 'Hum.')",
          "'3.2.1 ... the following properties:' then 'Temp.  -40 C to +71 C  Test' and three more such rows.",
          "A list, not a table (1.5.0: no heading row and no title), as TBL-15. Until 1.4.0 a Table item was "

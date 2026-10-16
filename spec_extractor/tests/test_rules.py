@@ -2,7 +2,7 @@
 """
 test_rules.py - fast checks of the layout and requirement rules (no OCR, runs in seconds).
 
-    python tests/test_rules.py                    all of them   (or:  python -m pytest tests/test_rules.py)
+    python tests/test_rules.py                    all of them
     python tests/test_rules.py underline table    only the tests with "underline" or "table" in their name
     python tests/test_rules.py --list             the name and first line of every test
 
@@ -14,6 +14,9 @@ tests/run_regression.py as well after changes to OCR, image clean-up or table de
 """
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import logging
 import re
 import sys
@@ -3398,6 +3401,804 @@ def test_the_excel_file_links_tables_and_holds_the_structure_and_the_documents()
     docs = [[c.value for c in r] for r in wb["Applicable Documents"].iter_rows(min_row=2)]
     assert any("MIL-STD-461G" in [str(v) for v in r] for r in docs), docs
     assert se.OUTPUT_FOLDER == "extraction_output_" + se.__version__
+
+
+def test_review_a_list_row_under_a_cell_merged_over_two_rows_keeps_its_own_text():
+    """Review 1.5.0: a table shown as a list whose first cell is merged down over two rows ('SRS-010' for two
+    requirements) keeps both rows - each with the merged text, its own cells and the ID as its Doc Ref."""
+    lines = make_lines(["3.2.1 General. The unit shall meet these requirements."], y0=300)
+    rows = [("SRS-010", "The unit shall operate from 28 VDC.", "Test"), ("SRS-010", "The unit shall draw less than 5 A.",
+                                                                          "Analysis"),
+            ("SRS-011", "The unit shall be cooled by forced air.", "Test")]
+    xs, cells, boxes = (0, 300, 1100), [], []
+    for k, row in enumerate(rows):
+        y = 420 + k * 64
+        boxes.append([(LEFT + x, y - 10, LEFT + x + 280 if c == 0 else LEFT + x + 780, y + 40) for c, x in enumerate(xs)])
+        cells += [make_line(t, LEFT + x, y) for c, (x, t) in enumerate(zip(xs, row)) if not (k == 1 and c == 0)]
+    boxes[0][0] = boxes[1][0] = (LEFT, 410, LEFT + 280, 524)       # the merged cell: one box over rows 0-1
+    table = se.TableData(grid=[list(r) for r in rows], conf=[[0.99] * 3 for _ in rows], merges=[(0, 0, 1, 0)],
+                         cell_boxes=boxes, header_rows=0)
+    block = se.Block("table", 1, (LEFT, 410, LEFT + 1900, 600), lines=cells, table=table)
+    out = se.table_rows_as_list(block, DPI)
+    assert [b.meta["cells"] for b in out] == [list(r) for r in rows], [b.meta["cells"] for b in out]
+    doc = se.DocResult(source="t.pdf", engine="standard", pages=[se.PageInfo(1, PAGE_W, PAGE_H, DPI, DPI)],
+                       blocks=se.analyze_page(1, blank_page(), lines, settings()) + out)
+    se.finalize_document(doc, settings())
+    got = [(it.doc_ref, it.text) for it in requirements(se.RequirementExtractor(settings()).extract(doc))]
+    assert got[1:] == [("SRS-010", "The unit shall operate from 28 VDC."), ("SRS-010", "The unit shall draw less than 5 A."),
+                       ("SRS-011", "The unit shall be cooled by forced air.")], got
+
+
+def test_review_an_underlined_line_inside_a_sentence_does_not_cut_it():
+    """Review 1.5.0: a typewriter underlines a document's title inside a sentence ('... deliver with each unit the' /
+    'Operation and Maintenance Manual.'). The underlined line is not a title: the requirement keeps all its text."""
+    for underlined in (1, 2):
+        lines = make_lines(["3.2.1 Manuals. The contractor shall deliver with each unit of the radar system the",
+                            "Operation and Maintenance Manual and the Illustrated Parts Breakdown, both",
+                            "within thirty days after the delivery of the first production unit to the field."])
+        for w in lines[underlined].words if underlined == 1 else lines[1].words[:4]:
+            w.underline = True
+        _doc, items = run({1: lines})
+        assert len(requirements(items)) == 1 and texts(items)[0].endswith("to the field."), texts(items)
+
+
+def test_review_untitled_table_pieces_on_two_pages_become_list_rows_each():
+    """Review 1.5.0: a grid with no heading row and no title at the top of page 2, going on at the top of page 3,
+    after text on page 1: neither piece continues a table, so each becomes list rows of its own page, every row
+    kept, its text its own cells."""
+    def piece(page, grid, top):
+        boxes = [[(LEFT + 400 * c, top + 60 * r, LEFT + 400 * c + 350, top + 60 * r + 40) for c in range(3)]
+                 for r in range(len(grid))]
+        lines = [make_line(t, LEFT + 400 * c, top + 60 * r) for r, row in enumerate(grid) for c, t in enumerate(row)]
+        t = se.TableData(grid=grid, conf=[[0.99] * 3 for _ in grid], cell_boxes=boxes, header_rows=0)
+        return se.Block("table", page, (LEFT, top, LEFT + 1150, top + 60 * len(grid)), lines=lines, table=t,
+                        meta={"may_continue": True})
+    s = settings()
+    doc = se.DocResult(source="t.pdf", engine="standard",
+                       pages=[se.PageInfo(n, PAGE_W, PAGE_H, DPI, DPI) for n in (1, 2, 3)])
+    doc.blocks = se.analyze_page(1, blank_page(), make_lines(["3.1 General. The unit shall be painted."], y0=1900), s)
+    doc.blocks += [piece(2, [["Clock", "5 V", "J2"], ["Reset", "5 V", "J3"]], 250),
+                   piece(3, [["Enable", "5 V", "J5"], ["Fault", "28 V", "J6"]], 250)]
+    se.finalize_document(doc, s)
+    got = [(b.page, b.text) for b in doc.blocks if b.kind == "list_item"]
+    assert got == [(2, "Clock 5 V J2"), (2, "Reset 5 V J3"), (3, "Enable 5 V J5"), (3, "Fault 28 V J6")], got
+
+
+def test_review_a_document_list_beside_a_column_of_prose_is_two_columns():
+    """Review 1.5.0: section 2's documents in the left column, section 3's prose in the right one: the gap is a
+    gutter, not the documents' tab stop - the prose is read as its own column."""
+    left = [("MIL-STD-461G", "EMI Requirements"), ("MIL-STD-704F", "Aircraft Power"), ("MIL-STD-810H", "Environmental Tests"),
+            ("MIL-STD-1275E", "Vehicle Power"), ("MIL-STD-1553B", "Data Bus"), ("MIL-STD-1472H", "Human Engineering")]
+    right = ["3.1 Power. The unit shall operate", "from the 28 VDC aircraft bus and", "shall draw no more than 150 W in",
+             "any mode of operation. The unit", "shall be cooled by the aircraft ECS", "and shall not need liquid coolant."]
+    lines = []
+    for k, ((doc_id, title), prose) in enumerate(zip(left, right)):
+        y = 300 + k * PITCH
+        lines += [make_line(doc_id, LEFT, y), make_line(title, LEFT + 220, y), make_line(prose, LEFT + 820, y)]
+    _doc, items = run({1: lines})
+    assert texts(items) == ["The unit shall operate from the 28 VDC aircraft bus and shall draw no more than 150 W in "
+                            "any mode of operation.", "The unit shall be cooled by the aircraft ECS and shall not need "
+                            "liquid coolant."], texts(items)
+
+
+def test_review_a_table_title_over_two_lines_is_seen():
+    """Review 1.5.0: 'TABLE IV. Power requirements of the line replaceable' / 'units in all operating modes.' set
+    tight above a grid is its title (the line nearest the grid is not a caption on its own)."""
+    lines = make_lines(["TABLE IV. Power requirements of the line replaceable", "units in all operating modes."], y0=300)
+    tbox = (LEFT, 420, LEFT + 1200, 700)
+    assert se._caption_next_to(tbox, lines)
+    far = make_lines(["TABLE IV. Power requirements.", None, None, None, "Some text right above the grid."], y0=200)
+    assert not se._caption_next_to((LEFT, 470, LEFT + 1200, 700), far)
+
+
+def test_review_a_document_entry_in_the_dash_layout_wraps_to_the_margin():
+    """Review 1.5.0: 'MIL-STD-810H - Environmental ... and Laboratory' / 'Tests' - in the dash layout a title wraps
+    to the margin and stays in its entry; so does a requirement that starts with a document number."""
+    rows = ["2. APPLICABLE DOCUMENTS", None,
+            "2.1 Government documents. The following documents form a part of this specification.", None,
+            "MIL-STD-810H - Environmental Engineering Considerations and Laboratory", "Tests", None,
+            "MIL-STD-461G - Requirements for the Control of Electromagnetic Interference",
+            "Characteristics of Subsystems and Equipment", None, "3. REQUIREMENTS", None,
+            "3.1 Data bus. The data bus shall conform to MIL-STD-1553B Notice 4, and each remote terminal shall",
+            "respond to a valid command within 12 microseconds."]
+    s = settings()
+    doc, items = run({1: make_lines(rows)}, s)
+    se.build_outline(doc, se.RequirementExtractor(s))
+    got = [(e["id"], e["title"]) for e in se.read_document_lists(doc)]
+    assert got == [("MIL-STD-810H", "Environmental Engineering Considerations and Laboratory Tests"),
+                   ("MIL-STD-461G", "Requirements for the Control of Electromagnetic Interference Characteristics of "
+                    "Subsystems and Equipment")], got
+    assert texts(items)[-1].endswith("within 12 microseconds."), texts(items)
+
+
+def test_review_heading_rows_by_their_names_and_not_by_values():
+    """Review 1.5.0: '#' and footnote marks ('Minimum 1/') still name columns; a row of values whose words could name
+    columns ('Power | Input voltage | Test' over more methods) or that holds numbers in capitals ('GND | 0 V | J1-A')
+    is not a heading row."""
+    def words(row):
+        return [(se.Word(t, 0.99, (0, 0, 10, 10)), 1.0) for t in " ".join(row).split()]
+    def header(grid):
+        return se._header_rows(grid, [], [words(r) for r in grid])
+    assert se._names_columns(["#", "Requirement", "Method"])
+    assert se._names_columns(["Parameter", "Minimum 1/", "Maximum (2)"])
+    assert header([["#", "Requirement", "Method"], ["1", "The unit shall operate.", "Test"]]) == (1, "column names")
+    assert header([["Power", "Input voltage", "Test"], ["Cooling", "Forced air", "Analysis"],
+                   ["Weight", "Under 20 kg", "Inspection"]]) == (0, "")
+    assert header([["GND", "0 V", "J1-A"], ["Power", "28 V", "J1-B"], ["Clock", "5 V", "J1-C"]]) == (0, "")
+
+
+def test_review_short_terms_glued_numbers_and_litres_are_not_autocorrected():
+    """Review 1.5.0: these were turned into other words or numbers by the look-alike rules ('PCIe' -> 'Pele', 'mAh'
+    -> 'man', 'Mode5' -> 'Modes', 'Note1' -> 'hotel', '20l' -> '201', 'DoS' -> 'Dos', 'defueled' -> 'refueled').
+    A term with a capital inside it, a word with its number, a short word whose letters only look alike, a litre sign
+    or a table's rule beside a number, and a twin that differs in a prefix are left as read."""
+    from collections import Counter
+    checker = se.WordChecker(Counter({"refueled": 3, "rearmed": 2, "the": 30}), settings())
+    for token in ("PCIe", "NiCd", "NaCl", "mAh", "BoM", "LiOH", "ICs", "ToC", "DoS", "SoW", "SiC", "PostScript",
+                  "Mode5", "Mode1", "Note1.", "Table5", "Pin5", "LEVEL5", "5witch", "clk", "Rcv", "Ncm", "lbm", "Nack",
+                  "Encl", "Iout", "iaw", "incl", "20l", "1.5l", "25l", "12|", "|12", "defueled", "dearmed", "halving",
+                  "leach", "theses"):
+        assert checker.correct(token, checker.issue(token, token)) == ("", ""), token
+    assert checker.correct("requ1red", "") == ("required", "word") and checker.correct("wil1", "") == ("will", "word")
+    assert checker.correct("rnodule", "") == ("module", "word") and checker.correct("l5.5", "") == ("15.5", "number")
+
+
+def test_review_a_wrapped_line_does_not_start_a_sentence_for_a_correction():
+    """Review 1.5.0: '0perate' at the start of a wrapped line is corrected to 'operate', not 'Operate' - the line
+    above did not end a sentence."""
+    lines = make_lines(["3.1 Power. The equipment shall be designed to", "0perate from the aircraft 28 V supply."])
+    _doc, items = run({1: lines})
+    assert texts(items) == ["The equipment shall be designed to operate from the aircraft 28 V supply."], texts(items)
+
+
+def _outline_doc(rows: list, s: se.Settings | None = None) -> tuple:
+    """Rows of text through the tool, then the outline, the document lists and the section notes, as process_file
+    does."""
+    return _outline_doc_from_lines(make_lines(rows), s)
+
+
+def _outline_doc_from_lines(lines: list, s: se.Settings | None = None) -> tuple:
+    """The same, from OCR lines made by the test (make_line)."""
+    s = s or settings()
+    doc, items = run({1: lines}, s)
+    se.build_outline(doc, se.RequirementExtractor(s))
+    se.read_document_lists(doc)
+    se.note_section_types(doc, items)
+    return doc, items, s
+
+
+def test_review_a_title_glued_to_its_text_keeps_every_word_in_the_word_files():
+    """Review 1.5.0: a run-in title whose full stop lost its space ('3.2.4 Leakage.No current shall ...') ends after
+    'Leakage.': the word cut in two goes half to the heading and half to the text, so 'No' stays in both Word files.
+    A one-letter word's full stop ('3.2.1 U.S. Army interface.') ends no title."""
+    import docx
+    doc, items, s = _outline_doc(["3. REQUIREMENTS", None, "3.2 Interfaces.", None,
+                                  "3.2.1 U.S. Army interface. The radar shall accept data from U.S. Army systems.", None,
+                                  "3.2.4 Leakage.No current shall flow between the case and ground."])
+    assert find(items, "current shall flow").text == "No current shall flow between the case and ground."
+    assert se.RequirementExtractor(s).parse_head("3.2.1 Detection range.:The radar shall detect it.")[:3] == \
+        ("3.2.1", "Detection range", "The radar shall detect it.")          # (two marks before the glued text)
+    folder = Path(tempfile.mkdtemp())
+    doors = [(p.style.name, p.text) for p in
+             docx.Document(str(se.write_doors_document(folder / "d.docx", doc, items, s))).paragraphs]
+    assert ("Heading 3", "3.2.4 Leakage") in doors, doors
+    assert ("Requirement Text", "No current shall flow between the case and ground.") in doors, doors
+    assert any(text.startswith("U.S. Army interface.") for _style, text in doors), doors
+    report = docx.Document(str(se.write_word_report(folder / "r.docx", doc, items, settings(word_page_images=False))))
+    assert any(p.text.startswith("No current shall flow") for p in report.paragraphs), [p.text for p in report.paragraphs]
+
+
+def test_review_underlined_lead_words_that_belong_to_the_sentence_are_not_a_title():
+    """Review 1.5.0: underlined words right after the number are a title only when they end like one - not when they
+    hold a sentence end ('Weight. The unit, with its cables,'), end in a comma ('Except as noted in 3.2.7,') or run on
+    in lower case. Then the full-stop rule decides; a typewritten underlined title still needs no full stop."""
+    ex = se.RequirementExtractor(settings())
+    assert ex.parse_head("3.2.6  Except as noted in 3.2.7, the unit shall operate continuously.",
+                         "Except as noted in 3.2.7,")[:3] == \
+        ("3.2.6", "", "Except as noted in 3.2.7, the unit shall operate continuously.")
+    assert ex.parse_head("3.2.8  Weight. The unit, with its cables, shall weigh less than 5 kg.",
+                         "Weight. The unit, with its cables,")[:3] == \
+        ("3.2.8", "Weight", "The unit, with its cables, shall weigh less than 5 kg.")
+    assert ex.parse_head("3.2.1  Power input  The equipment shall accept 28 V.", "Power input")[:3] == \
+        ("3.2.1", "Power input", "The equipment shall accept 28 V.")
+
+
+def test_review_a_single_spaced_document_list_gives_one_entry_per_document():
+    """Review 1.5.0: a document list typed single-spaced - 'MIL-STD-810H, Environmental ...', or with no comma when
+    the OCR did not split the line - is one entry per line; running text with a document number at the start of its
+    lines ('MIL-STD-810H, Method 514.8, ...' / 'MIL-STD-461G, RE102.') stays one paragraph."""
+    for sep in (", ", " "):
+        doc, items, _s = _outline_doc([
+            "2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None,
+            f"MIL-STD-810H{sep}Environmental Engineering Considerations and Laboratory Tests",
+            f"MIL-STD-461G{sep}Requirements for the Control of Electromagnetic Interference",
+            f"MIL-STD-1553B{sep}Digital Time Division Command/Response Multiplex Data Bus", None,
+            "3. REQUIREMENTS", None, "3.1 Tests. The unit shall be tested as specified in",
+            "MIL-STD-810H, Method 514.8, Procedure I, and in", "MIL-STD-461G, RE102."])
+        got = [(e["id"], e["title"]) for e in doc._documents]
+        assert got == [("MIL-STD-810H", "Environmental Engineering Considerations and Laboratory Tests"),
+                       ("MIL-STD-461G", "Requirements for the Control of Electromagnetic Interference"),
+                       ("MIL-STD-1553B", "Digital Time Division Command/Response Multiplex Data Bus")], (sep, got)
+        assert find(items, "tested as specified").text.endswith("Procedure I, and in MIL-STD-461G, RE102."), texts(items)
+
+
+def test_review_paragraphs_split_over_cells_and_a_version_number_in_a_document_title():
+    """Review 1.5.0: the paragraphs that call a document up may be read as two cells ('3.2.1,' / '3.4.5'); a number
+    after 'Revision' (Version, Issue, Notice ...) belongs to the document's title, not to its paragraphs."""
+    e = se.parse_document_entry("", ["MIL-E-5400T", "Electronic Equipment, Aerospace, General Specification for",
+                                     "3.2.1,", "3.4.5"])
+    assert (e["title"], e["paragraphs"]) == ("Electronic Equipment, Aerospace, General Specification for",
+                                             "3.2.1, 3.4.5"), e
+    e = se.parse_document_entry("IEEE Std 1394   High Performance Serial Bus, Revision 1.1")
+    assert (e["id"], e["title"], e["paragraphs"]) == ("IEEE Std 1394", "High Performance Serial Bus, Revision 1.1", ""), e
+    e = se.parse_document_entry("MIL-STD-461G  Requirements for the Control of EMI  3.2.5, 3.4.1")
+    assert e["paragraphs"] == "3.2.5, 3.4.1", e
+
+
+def test_review_numbered_notes_under_a_notes_title_inside_section_3_stay_in_section_3():
+    """Review 1.5.0: an unnumbered 'NOTES' title inside 3.2.4 with the notes '1.' and '2.' under it is a title inside
+    the section - not section 6 (Notes) - and its '1.' is not section 1 (section numbers only go forward): 3.2.5
+    after the notes is still under 3.2, and no requirement gets the 'section 6 (Notes)' quality note."""
+    doc, items, _s = _outline_doc([
+        "3. REQUIREMENTS", None, "3.2 Interfaces.", None,
+        "3.2.4 Signals. The unit shall provide the discrete signals of the interface control drawing.", None,
+        "NOTES", None, "1. Signal levels are measured at the unit connector.", None,
+        "2. The unit shall tolerate a short circuit on any output.", None,
+        "3.2.5 Cooling. The unit shall be air cooled.", None,
+        "3.2.5.1 Air flow. The air flow shall not exceed 2 m3 per minute."])
+    got = [(h["level"], h["number"], h["kind"]) for h in doc._outline]
+    assert got == [(1, "3", "heading"), (2, "3.2", "heading"), (3, "3.2.4", "heading"), (4, "", "subheading"),
+                   (4, "", "subheading"), (3, "3.2.5", "heading"), (4, "3.2.5.1", "heading")], got
+    number = {h["number"]: h for h in doc._outline}
+    assert number["3.2.5"]["parent"] == number["3.2"]["id"] and number["3.2.5"]["type"] == "requirements"
+    assert not any("section 6" in n for it in items for n in it.quality_notes), [it.quality_notes for it in items]
+
+
+def test_review_a_lost_parent_heading_has_a_row_and_is_the_parent_in_the_structure_sheet():
+    """Review 1.5.0: '3.1 General.' then '3.2.1 Range.' (the scan lost 3.2): the Document Structure sheet gets a row
+    '3.2 [heading not found in the scan]', as the DOORS file does, and it is 3.2.1's parent - not 3.1. The same for
+    a lost top-level heading (3.3, then 4.1)."""
+    import openpyxl
+    doc, items, s = _outline_doc(["3. REQUIREMENTS", None, "3.1 General. The radar shall be mounted on the mast.", None,
+                                  "3.2.1 Range. The radar shall detect targets.", None,
+                                  "3.3 Cooling. The radar shall be air cooled.", None,
+                                  "4.1 Inspection. The radar shall be inspected."])
+    out = se.write_workbook(Path(tempfile.mkdtemp()) / "x.xlsx", [(doc, items)], s)
+    rows = [r for r in openpyxl.load_workbook(out)["Document Structure"].iter_rows(min_row=2, values_only=True)
+            if r[3] == "Yes"]
+    assert [r[6] for r in rows] == ["3 REQUIREMENTS", "3.1 General", "3.2 [heading not found in the scan]",
+                                    "3.2.1 Range", "3.3 Cooling", "4 [heading not found in the scan]",
+                                    "4.1 Inspection"], [r[6] for r in rows]
+    number = {r[4]: r for r in rows}                      # ID, Parent ID, Level, Is Heading, Paragraph Number ...
+    assert number["3.2.1"][1] == number["3.2"][0] and number["3.2"][1] == number["3"][0], rows
+    assert number["4.1"][1] == number["4"][0] and number["4"][1] is None and number["4"][2] == 1, rows
+
+
+def test_review_the_combined_workbook_names_requirements_with_their_document():
+    """Review 1.5.0: in the workbook of several documents (ALL_DOCUMENTS) the Requirement IDs of the Document
+    Structure sheet and the 'Cited By' of the Applicable Documents sheet carry the D1-/D2- prefix that the rows of
+    Extracted Items have, so each one names a row of the workbook."""
+    import openpyxl
+    runs = []
+    for name in ("specA.pdf", "specB.pdf"):
+        doc, items, s = _outline_doc(["2. APPLICABLE DOCUMENTS", None,
+                                      "MIL-STD-461G    Requirements for the Control of EMI    3.1", None,
+                                      "3. REQUIREMENTS", None, "3.1 General. The radar shall meet MIL-STD-461G."])
+        doc.source = name
+        for it in items:
+            it.source_file = name
+        runs.append((doc, items))
+    wb = openpyxl.load_workbook(se.write_workbook(Path(tempfile.mkdtemp()) / "ALL.xlsx", runs, s, multi_doc=True))
+    ids = {r[0] for r in wb["Extracted Items"].iter_rows(min_row=2, values_only=True)}
+    structure = [r[8] for r in wb["Document Structure"].iter_rows(min_row=2, values_only=True) if r[8]]
+    cited = [r[5] for r in wb["Applicable Documents"].iter_rows(min_row=2, values_only=True)]
+    assert structure == ["D1-R-0001", "D2-R-0001"] and cited == ["D1-R-0001", "D2-R-0001"], (structure, cited)
+    assert set(structure) <= ids, (structure, ids)
+
+
+def test_review_a_requirement_made_from_a_list_item_is_filed_on_the_item_in_the_structure_sheet():
+    """Review 1.5.0: each Excel row of a list (lead-in + item) is filed on its item's own row of the Document
+    Structure sheet, as a Requirement with its ID - not all of them on the lead-in paragraph."""
+    import openpyxl
+    doc, items, s = _outline_doc(["3.2.2 Modes. The radar shall provide the following modes:",
+                                  (60, "a. Search mode with a 360 degree scan."), (60, "b. Track mode for 20 targets."),
+                                  (60, "c. Standby.")])
+    ws = openpyxl.load_workbook(se.write_workbook(Path(tempfile.mkdtemp()) / "x.xlsx", [(doc, items)], s))[
+        "Document Structure"]
+    got = [(r[5], r[6], r[8]) for r in ws.iter_rows(min_row=2, values_only=True) if r[3] == "No"]
+    assert got == [("Text", "The radar shall provide the following modes:", None),
+                   ("Requirement", "a. Search mode with a 360 degree scan.", "R-0001"),
+                   ("Requirement", "b. Track mode for 20 targets.", "R-0002"),
+                   ("Requirement", "c. Standby.", "R-0003")], got
+
+
+def test_review_the_report_pages_count_on_from_a_template_that_starts_at_1():
+    """Review 1.5.0: a template whose page numbering says 'Start at 1' restarts it in the first section only - not
+    on every page of the report, which has a Word section per page. The page labels count the pages of the FILE
+    ('Page 2 of 5' when only pages 1-2 of 5 were read), and the cover names this report's DOORS file."""
+    from docx.oxml import parse_xml
+    folder = Path(tempfile.mkdtemp())
+    template = _word_template(folder, extra=lambda d: d.sections[0]._sectPr.find(f"{W_NS}pgMar").addnext(
+        parse_xml(f'<w:pgNumType xmlns:w="{W_NS[1:-1]}" w:start="1"/>')))
+    doc, items, s = _report_sample()
+    doc.page_count = 5
+    doc.pages.append(se.PageInfo(number=2, width=PAGE_W, height=PAGE_H, source_dpi=DPI, dpi=DPI))
+    doc.blocks.append(se.Block("paragraph", 2, (220, 300, 900, 330), text="Second page text.", uid=99))
+    _png(folder / "page1.png", 850, 1100)
+    _png(folder / "page2.png", 850, 1100)
+    doc.cache_dir, doc.pages[0].image_file, doc.pages[1].image_file = str(folder), "page1.png", "page2.png"
+    d, _path = _write_report(folder, f"[document]\ntemplate = {template.name}\n", sample=(doc, items, s),
+                             name="SRS_verification_matrix_verification.docx")
+    starts = [sec._sectPr.find(f"{W_NS}pgNumType") for sec in d.sections]
+    assert starts[0] is not None and starts[0].get(f"{W_NS}start") == "1", starts[0]
+    assert all(pg is None or pg.get(f"{W_NS}start") is None for pg in starts[1:]), \
+        [None if pg is None else dict(pg.attrib) for pg in starts]
+    labels = [sec.header.paragraphs[-1].text for sec in d.sections[1:]]
+    assert labels == ["Page 1 of 5  -  scanned page", "Page 1 of 5  -  text read by the tool",
+                      "Page 2 of 5  -  scanned page", "Page 2 of 5  -  text read by the tool"], labels
+    text = "\n".join(p.text for p in d.paragraphs)
+    assert "use SRS_verification_matrix_for_doors.docx" in text and "Pages: 2 of the file's 5" in text, text[:900]
+
+
+def test_review_a_page_image_fits_above_a_tall_template_footer():
+    """Review 1.5.0: the scan of a page is sized to the room on ITS page: less the template's footer, which every
+    page shows from the first section (a 1.2 in logo here), and less the page's notes in its page header."""
+    import docx
+    from docx.shared import Inches
+    folder = Path(tempfile.mkdtemp())
+    t = docx.Document()
+    s0 = t.sections[0]
+    s0.top_margin = s0.bottom_margin = s0.left_margin = s0.right_margin = Inches(0.6)
+    s0.footer_distance = Inches(0.3)
+    s0.footer.paragraphs[0].text = "FOOTER MARKING "
+    s0.footer.paragraphs[0].add_run().add_picture(str(_png(folder / "logo.png", 60, 120)), height=Inches(1.2))
+    t.save(folder / "tall.docx")
+    doc, items, s = _report_sample()
+    doc.pages[0].notes = ["page turned 180 degrees", "skew fixed 1.4 degrees", "low contrast: the scan was faint and "
+                          "was darkened, so check the small print against the paper copy"]
+    _png(folder / "page1.png", 850, 1100)
+    doc.cache_dir, doc.pages[0].image_file = str(folder), "page1.png"
+    d, _path = _write_report(folder, "[document]\ntemplate = tall.docx\n", sample=(doc, items, s))
+    picture = d.inline_shapes[0].height / 914400
+    with_footer = se._usable_page(d, d.sections[0])[1]          # the cover: the footer is its own there
+    on_its_page = se._usable_page(d, d.sections[1])[1]          # the scan's page: the footer, and the notes
+    assert on_its_page < with_footer and picture <= on_its_page - 0.15, (picture, on_its_page, with_footer)
+
+
+def test_review_the_excel_file_is_written_without_temporary_files_outside_its_folder():
+    """Review 1.5.0 (security): openpyxl writes every worksheet - the requirement text - to a temporary file before
+    it zips the workbook. Those files are made in a folder of their own inside the output folder, deleted after the
+    save, and never in the system's temp folder."""
+    import openpyxl.worksheet._writer as writer
+    made, original = [], writer.NamedTemporaryFile
+
+    def spy(*args, **kwargs):
+        f = original(*args, **kwargs)
+        made.append(Path(f.name))
+        return f
+    writer.NamedTemporaryFile = spy
+    try:
+        doc, items = run({1: make_lines(["3.1 General. The radar shall be painted grey."])})
+        folder = Path(tempfile.mkdtemp())
+        se.write_workbook(folder / "x.xlsx", [(doc, items)], settings())
+    finally:
+        writer.NamedTemporaryFile = original
+    assert made and all(folder in p.parents for p in made), made
+    assert [p.name for p in folder.iterdir()] == ["x.xlsx"], list(folder.iterdir())
+
+
+def test_review_docling_column_headers_are_shown_as_heading_rows():
+    """Review 1.5.0: the rows Docling's table model marks as column headers are shown as heading rows (Excel and
+    Word); a first row that only looks like one (short words) is counted, but not shown as one."""
+    def cells(*marks):
+        return [types.SimpleNamespace(column_header=m) for m in marks]
+    grid = [["Parameter", "Value"], ["Voltage", "28 V"]]
+    for marks, shown in (((True, True), 1), ((False, False), 0)):
+        rows, how = se._docling_heading_rows([cells(*marks), cells(False, False)], grid)
+        table = se.TableData(grid=grid, conf=[[1.0] * 2] * 2, header_rows=rows, header_format=how)
+        assert se.shown_header_rows(table) == shown, (marks, rows, how)
+
+
+def test_review_the_yellow_note_explains_a_yellow_cell_in_a_first_row_of_content():
+    """Review 1.5.0: a table sheet whose only yellow cell (a word to check) is in a first row that is content - not
+    shown as a heading row - still says what the yellow means under the table."""
+    import openpyxl
+    t = se.TableData(grid=[["Vo1tage", "28 V"], ["Current", "5 A"]], conf=[[0.2, 1.0], [1.0, 1.0]], header_rows=1)
+    s = settings()
+    doc = se.DocResult(source="y.pdf", engine="standard", pages=[se.PageInfo(1, PAGE_W, PAGE_H, DPI, DPI)],
+                       blocks=[se.Block("table", 1, (100, 100, 900, 400), table=t, meta={"caption": "TABLE I. Power."})])
+    se.finalize_document(doc, s)
+    items = se.RequirementExtractor(s).extract(doc)
+    ws = openpyxl.load_workbook(se.write_workbook(Path(tempfile.mkdtemp()) / "y.xlsx", [(doc, items)], s))["T001"]
+    assert ws["A5"].fill.fgColor.rgb.endswith("FFF2CC"), ws["A5"].fill.fgColor.rgb
+    notes = [c.value for row in ws.iter_rows(min_row=6) for c in row if isinstance(c.value, str)]
+    assert any(v.startswith("Yellow cells") for v in notes), notes
+
+
+def test_review_no_autocorrect_leaves_a_list_marker_as_read():
+    """Review 1.5.0: with --no-autocorrect a list marker that does not fit the sequence ('C.' after 'a.' 'b.') is left
+    as read - the item is still filed in its list, and its review reason says what the sequence expects."""
+    rows = ["3.2.4 Modes. The radar shall provide the following modes:", None,
+            (60, "a.  Search mode."), (60, "b.  Track mode."), (60, "C.  Map mode."), (60, "d.  Weather mode.")]
+    for auto, marker in ((True, "c"), (False, "C")):
+        _doc, items = run({1: make_lines(rows)}, settings(autocorrect=auto))
+        row = find(items, "Map mode")
+        assert row.doc_ref == f"3.2.4 {marker}" and row.text.endswith(f"{marker}. Map mode."), (auto, row.doc_ref, row.text)
+        assert bool(row.corrections) == auto and any("sequence" in r for r in row.review_reasons), \
+            (auto, row.corrections, row.review_reasons)
+
+
+def test_review_an_own_scan_is_recorded_only_inside_my_cases():
+    """Review 1.5.0 (security): run_cases.py --record writes a scan's expected text only beside a scan directly in
+    tests/cases/my_cases, which git ignores - a scan anywhere else is refused before the tool runs, and nothing is
+    written. Its reports are saved with their temporary files inside their own folder, and a scan whose name holds
+    brackets ('SRS [Rev B].pdf') finds its workbook."""
+    sys.path.insert(0, str(HERE / "cases"))
+    import run_cases
+    import openpyxl.worksheet._writer as writer
+    folder = Path(tempfile.mkdtemp())
+    scan = folder / "secret.pdf"
+    scan.write_bytes(b"%PDF-1.4\n")
+    ran, saved = [], (run_cases.run_tool, run_cases.OWN_RESULTS)
+    run_cases.run_tool = lambda *args, **kwargs: ran.append(args)
+    run_cases.OWN_RESULTS = folder / "own_results"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            assert run_cases.record(HERE.parent / "spec_extractor.py", scan) == 2
+        assert "is not in" in said.getvalue(), said.getvalue()
+    finally:
+        run_cases.run_tool, run_cases.OWN_RESULTS = saved
+    assert not ran and [p.name for p in folder.iterdir()] == ["secret.pdf"], (ran, list(folder.iterdir()))
+    assert run_cases.casekit.LOCAL_FOLDER in run_cases.OWN_RESULTS.parents
+    made, original = [], writer.NamedTemporaryFile
+
+    def spy(*args, **kwargs):
+        f = original(*args, **kwargs)
+        made.append(Path(f.name))
+        return f
+    writer.NamedTemporaryFile = spy
+    try:
+        run_cases.write_workbook(folder / "case_results.xlsx", [])
+    finally:
+        writer.NamedTemporaryFile = original
+    assert made and all(folder in p.parents for p in made), made
+    (folder / "run1").mkdir()
+    (folder / "run1" / "SRS [Rev B]_extracted.xlsx").write_bytes(b"")
+    assert run_cases.find_workbook(folder, Path("SRS [Rev B].pdf")) == folder / "run1" / "SRS [Rev B]_extracted.xlsx"
+
+
+def test_review_a_heading_after_a_title_without_a_full_stop_starts_a_new_block():
+    """Review 1.5.0: on a page with a blank line after every line, the gap before '3. REQUIREMENTS' is no wider than
+    the others, and the line above it - a document's title in the dash layout - has no full stop. The heading still
+    starts a block of its own: it is not swallowed by the last document of the list, with the requirement below it."""
+    rows = [(220, "2. APPLICABLE DOCUMENTS"), (303, "2.1 Government documents."), (387, "DEPARTMENT OF DEFENSE STANDARDS"),
+            (469, "MIL-STD-810H - Environmental Engineering Considerations and Laboratory"), (511, "Tests"),
+            (591, "MIL-STD-461G - Requirements for the Control of Electromagnetic"),
+            (635, "Interference Characteristics of Subsystems and Equipment"), (721, "3. REQUIREMENTS"),
+            (802, "3.1 General. The radar shall meet the requirements of this section.")]
+    doc, items, _s = _outline_doc_from_lines([make_line(text, LEFT, y) for y, text in rows])
+    assert [b.text for b in doc.blocks if b.kind == "heading"][-1] == "3. REQUIREMENTS", [b.text for b in doc.blocks]
+    got = [(e["id"], e["title"]) for e in doc._documents]
+    assert got == [("MIL-STD-810H", "Environmental Engineering Considerations and Laboratory Tests"),
+                   ("MIL-STD-461G", "Requirements for the Control of Electromagnetic Interference Characteristics of "
+                    "Subsystems and Equipment")], got
+    assert find(items, "requirements of this section").doc_ref == "3.1"
+
+
+def test_review_an_entry_on_tab_stops_goes_on_only_in_its_own_columns():
+    """Review 1.5.0: an entry of a document list on tab stops goes on only on the tab stop of its title (or of its
+    paragraphs): a sub-title at another indent under it ('MILITARY', in capitals, where the title would not have had
+    room for the word) is a title of its own, and the documents below it are filed under it."""
+    pieces = [(387, 400, "SPECIFICATIONS"), (470, 100, "FEDERAL"), (550, 0, "QQ-A-250/4"),
+              (550, 404, "Aluminum Alloy 2024, Plate and Sheet"), (637, 100, "MILITARY"), (722, 0, "MIL-E-5400"),
+              (722, 404, "Electronic Equipment, Aerospace"), (804, 404, "STANDARDS"), (886, 100, "MILITARY"),
+              (971, 0, "MIL-STD-461"), (971, 404, "Electromagnetic Interference Characteristics"),
+              (1056, 0, "3. REQUIREMENTS"), (1139, 0, "3.1 General. The radar shall meet the requirements of this section.")]
+    head = [make_line("2. APPLICABLE DOCUMENTS", LEFT, 220), make_line("2.1 Government documents.", LEFT, 303)]
+    doc, _items, _s = _outline_doc_from_lines(head + [make_line(t, LEFT + x, y) for y, x, t in pieces])
+    got = [(e["group"], e["subgroup"], e["id"], e["title"]) for e in doc._documents]
+    assert got == [("SPECIFICATIONS", "FEDERAL", "QQ-A-250/4", "Aluminum Alloy 2024, Plate and Sheet"),
+                   ("SPECIFICATIONS", "MILITARY", "MIL-E-5400", "Electronic Equipment, Aerospace"),
+                   ("STANDARDS", "MILITARY", "MIL-STD-461", "Electromagnetic Interference Characteristics")], got
+
+
+def test_review_a_title_in_capitals_above_a_lettered_list_is_not_joined_to_its_first_item():
+    """Review 1.5.0: 'NOTES' on a line of its own, then the indented items 'a.' and 'b.' after a blank line: the
+    title is a heading of its own and 'a.' a list item, not one paragraph 'NOTES a. Signal levels ...' (a line in
+    lower case after a title carries the title on, but not one that starts with a list marker)."""
+    rows = [((214, 218, 545, 255), "3. REQUIREMENTS"), ((214, 301, 541, 338), "3.2 Interfaces."),
+            ((215, 384, 1578, 425), "3.2.4 Signals. The unit shall provide the discrete signals of the"),
+            ((214, 425, 744, 469), "interface control drawing."), ((213, 510, 326, 549), "NOTES"),
+            ((292, 589, 1375, 636), "a. Signal levels are measured at the unit connector."),
+            ((292, 633, 1472, 677), "b. The unit shall tolerate a short circuit on any output."),
+            ((214, 717, 1149, 759), "3.2.5 Cooling. The unit shall be air cooled.")]       # (as the OCR read them)
+    doc, _items, _s = _outline_doc_from_lines([_line_at(t, box) for box, t in rows])
+    got = [(b.kind, b.text) for b in doc.blocks][3:6]
+    assert got == [("heading", "NOTES"), ("list_item", "a. Signal levels are measured at the unit connector."),
+                   ("list_item", "b. The unit shall tolerate a short circuit on any output.")], got
+
+
+def _piece_lines(rows: list, y0: int = 300) -> list:
+    """OCR lines for rows given as text, (indent, text), a list of (indent, text) pieces on one row (a line on tab
+    stops, which the OCR returns as pieces), or None for a blank line."""
+    out, y = [], y0
+    for row in rows:
+        for piece in (row if isinstance(row, list) else [row] if row is not None else []):
+            indent, text = piece if isinstance(piece, tuple) else (0, piece)
+            out.append(make_line(text, LEFT + indent, y))
+        y += PITCH
+    return out
+
+
+def _documents(rows: list, s: se.Settings | None = None) -> list:
+    """(group, sub-group, number, title, paragraphs) of every document read from these rows."""
+    doc, _items, _s = _outline_doc_from_lines(_piece_lines(rows), s)
+    return [(e["group"], e["subgroup"], e["id"], e["title"], e["paragraphs"]) for e in doc._documents]
+
+
+def _entry(doc_id: str, title: str, paragraphs: str = "") -> list:
+    """A line of a document list on tab stops."""
+    return [(0, doc_id), (300, title)] + ([(1100, paragraphs)] if paragraphs else [])
+
+
+_REQUIREMENTS_TAIL = [None, "3. REQUIREMENTS", None, "3.1 General. The unit shall meet MIL-STD-461G."]
+
+
+def test_review2_running_text_whose_lines_start_with_document_numbers_stays_one_requirement():
+    """Review 1.5.0 (round 2): wrapped lines of a requirement that start with a document number and a word in
+    capitals ('MIL-STD-461G, RE102, and ...' / 'MIL-STD-461G, CE102, for ...'), or an unmarked list of standards
+    under a lead-in, are not cut into document entries: the requirement keeps all its text."""
+    _doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.1 Tests. The unit shall be tested as specified in",
+                                      "MIL-STD-461G, RE102, and the conducted emission limits of",
+                                      "MIL-STD-461G, CE102, for Navy aircraft installations."])})
+    assert texts(items) == ["The unit shall be tested as specified in MIL-STD-461G, RE102, and the conducted emission "
+                            "limits of MIL-STD-461G, CE102, for Navy aircraft installations."], texts(items)
+    _doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.3 EMI. The unit shall meet the following requirements:",
+                                      "MIL-STD-461G CE102 Conducted Emissions, Power Leads",
+                                      "MIL-STD-461G RE102 Radiated Emissions, Electric Field", None,
+                                      "3.4 Weight. The unit shall weigh less than 5 kg."])})
+    assert texts(items)[0].endswith("CE102 Conducted Emissions, Power Leads MIL-STD-461G RE102 Radiated Emissions, "
+                                    "Electric Field"), texts(items)
+
+
+def test_review2_a_dash_layout_entry_ends_at_a_group_title_or_a_note():
+    """Review 1.5.0 (round 2): in a single-spaced list in the dash layout, a group title in capitals or a note in
+    brackets after an entry is not more of its title: the next documents are filed under the new group."""
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None,
+                      "DEPARTMENT OF DEFENSE SPECIFICATIONS",
+                      "MIL-PRF-38534 - Hybrid Microcircuits, General Specification for",
+                      "DEPARTMENT OF DEFENSE STANDARDS",
+                      "MIL-STD-461G - Requirements for the Control of Electromagnetic Interference",
+                      "(Copies of these documents are available online at the ASSIST Quick Search.)"]
+                     + _REQUIREMENTS_TAIL)
+    assert got == [("DEPARTMENT OF DEFENSE SPECIFICATIONS", "", "MIL-PRF-38534",
+                    "Hybrid Microcircuits, General Specification for", ""),
+                   ("DEPARTMENT OF DEFENSE STANDARDS", "", "MIL-STD-461G",
+                    "Requirements for the Control of Electromagnetic Interference", "")], got
+
+
+def test_review2_lists_of_documents_outside_section_2_are_read_by_their_titles():
+    """Review 1.5.0 (round 2): '1.2 Applicable documents.' and an appendix's 'A.2.1 Specifications, standards, and
+    handbooks.' hold lists of documents wherever they are; a title of one plain word ('3.4 Standards.') names one
+    only in section 2 (or an appendix's A.2)."""
+    assert [d[2] for d in _documents(["1. SCOPE", None, "1.1 Purpose. This specification covers the radar.", None,
+                                      "1.2 Applicable documents.", None,
+                                      _entry("MIL-STD-461G", "Requirements for the Control of EMI")]
+                                     + _REQUIREMENTS_TAIL)] == ["MIL-STD-461G"]
+    assert [d[2] for d in _documents(["APPENDIX A", None, "A.1 SCOPE", None, "A.1.1 Scope. This appendix covers the "
+                                      "test set.", None, "A.2 APPLICABLE DOCUMENTS", None,
+                                      "A.2.1 Specifications, standards, and handbooks.", None,
+                                      _entry("MIL-STD-883K", "Test Method Standard, Microcircuits"), None,
+                                      "A.3 REQUIREMENTS", None, "A.3.1 General. The test set shall meet MIL-STD-883K."])
+            ] == ["MIL-STD-883K"]
+    assert _documents(["3. REQUIREMENTS", None, "3.4 Standards.", None,
+                       _entry("MIL-STD-461G", "Requirements for the Control of EMI"), None,
+                       "3.5 General. The unit shall meet MIL-STD-461G."]) == []
+
+
+def test_review2_issuer_titles_and_later_sub_titles_file_their_documents():
+    """Review 1.5.0 (round 2): issuers in capitals that are the groups themselves ('MILITARY', then 'FEDERAL') are
+    groups of their own, not 'FEDERAL' under 'MILITARY'; a second sub-title after documents ('Regulations' after
+    the manuals) files the documents under it."""
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None, "2.1.1 Specifications.", None,
+                      (90, "MILITARY"), None, _entry("MIL-PRF-38534", "Hybrid Microcircuits, General Specification for"),
+                      None, (90, "FEDERAL"), None, _entry("QQ-A-250/4", "Aluminum Alloy 2024, Plate and Sheet")]
+                     + _REQUIREMENTS_TAIL)
+    assert [(g, sub, n) for g, sub, n, _t, _p in got] == [("MILITARY", "", "MIL-PRF-38534"),
+                                                          ("FEDERAL", "", "QQ-A-250/4")], got
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None, (300, "OTHER PUBLICATIONS"),
+                      None, (90, "Manuals"), None, _entry("TM 9-1234-200-10", "Operator's Manual for Radar Set"), None,
+                      (90, "Regulations"), None,
+                      _entry("AR 70-38", "Research, Development, Test and Evaluation of Materiel")] + _REQUIREMENTS_TAIL)
+    assert [(sub, n) for _g, sub, n, _t, _p in got] == [("Manuals", "TM 9-1234-200-10"), ("Regulations", "AR 70-38")], got
+
+
+def test_review2_single_spaced_entries_titled_test_method_or_notice_and_the_first_under_a_lead_in():
+    """Review 1.5.0 (round 2): in a single-spaced list a title may start like a citation ('Test Method Standard',
+    'Notice 4 Digital ...') and still be an entry of its own; and the first document right under the lead-in that
+    says documents follow is an entry too."""
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None,
+                      "MIL-STD-810H, Environmental Engineering Considerations and Laboratory Tests",
+                      "MIL-STD-883K, Test Method Standard, Microcircuits",
+                      "MIL-STD-1553B Notice 4 Digital Time Division Command/Response Multiplex Data Bus"]
+                     + _REQUIREMENTS_TAIL)
+    assert [(n, t) for _g, _s, n, t, _p in got] == [
+        ("MIL-STD-810H", "Environmental Engineering Considerations and Laboratory Tests"),
+        ("MIL-STD-883K", "Test Method Standard, Microcircuits"),
+        ("MIL-STD-1553B Notice 4", "Digital Time Division Command/Response Multiplex Data Bus")], got
+    got = _documents(["2. APPLICABLE DOCUMENTS", None,
+                      "2.1 Government documents. The following documents form a part of this specification:",
+                      "MIL-STD-810H, Environmental Engineering Considerations and Laboratory Tests",
+                      "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference"] + _REQUIREMENTS_TAIL)
+    assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-810H", "MIL-STD-461G"], got
+
+
+def test_review2_document_titles_with_a_month_a_version_word_or_notice_of():
+    """Review 1.5.0 (round 2): with 'may' as a keyword, a document dated '15 May 2020' is still listed (a keyword
+    counts in small letters and outside brackets); paragraphs in their own column stay paragraphs after a title
+    ending in 'Supplement' or 'Change'; and 'Notice of Revision' is a title, not a notice number."""
+    s = settings(keywords={"shall": "Mandatory", "may": "Permissive / optional"})
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None, (300, "STANDARDS"), None,
+                      _entry("MIL-STD-461G", "Requirements for the Control of Electromagnetic Interference"),
+                      _entry("MIL-STD-1472H", "Human Engineering (15 May 2020)")] + _REQUIREMENTS_TAIL, s)
+    assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-461G", "MIL-STD-1472H"], got
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None, (300, "REGULATIONS"), None,
+                      _entry("48 CFR 252", "Defense Federal Acquisition Regulation Supplement", "3.11"),
+                      _entry("DI-CMAN-80639", "Request for Engineering Change", "3.10.1")] + _REQUIREMENTS_TAIL)
+    assert [(t, p) for _g, _s, _n, t, p in got] == [("Defense Federal Acquisition Regulation Supplement", "3.11"),
+                                                    ("Request for Engineering Change", "3.10.1")], got
+    e = se.parse_document_entry("DI-CMAN-80642 Notice of Revision 3.10.2")
+    assert (e["id"], e["title"], e["paragraphs"]) == ("DI-CMAN-80642", "Notice of Revision", "3.10.2"), e
+
+
+def test_review2_underlined_titles_with_an_abbreviation_or_a_number_after_them():
+    """Review 1.5.0 (round 2): a typewritten underlined title may hold an abbreviation's stop ('U.S. Army
+    interface', 'No. 2 diesel fuel'), and its text may start with a number, a quote, a minus sign or a list marker:
+    it is still the title. Lead words that end in the middle of a phrase ('Except as noted in') are not."""
+    ex = se.RequirementExtractor(settings())
+    for text, underlined, title, body in [
+            ("3.2.1  U.S. Army interface  The radar shall accept data.", "U.S. Army interface", "U.S. Army interface",
+             "The radar shall accept data."),
+            ("3.2.2  Input voltage  115 V ac shall be supplied.", "Input voltage", "Input voltage",
+             "115 V ac shall be supplied."),
+            ("3.2.3  No. 2 diesel fuel  The engine shall run on it.", "No. 2 diesel fuel", "No. 2 diesel fuel",
+             "The engine shall run on it."),
+            ("3.2.4  Operating temperature  -40 to +70 C shall be met.", "Operating temperature",
+             "Operating temperature", "-40 to +70 C shall be met."),
+            ("3.2.5  Modes:  a. Search mode shall be provided.", "Modes:", "Modes", "a. Search mode shall be provided."),
+            ("3.2.6  Except as noted in 3.2.7, the unit shall operate.", "Except as noted in", "",
+             "Except as noted in 3.2.7, the unit shall operate.")]:
+        got = ex.parse_head(text, underlined)[:3]
+        assert got == (text.split()[0], title, body), (text, got)
+
+
+def test_review2_a_misread_paragraph_number_adds_no_parent_headings():
+    """Review 1.5.0 (round 2): a number that does not follow on from the one before - '3.7.2' between 3.1.1 and
+    3.1.3 (a misread 1), '8.4.2' in section 3 - is filed by its level under the section open above it, in the
+    Document Structure sheet and the DOORS file alike: no '3.7' or '8' placeholder, and the rest of the section
+    stays where it is."""
+    import docx
+    doc, items, s = _outline_doc(["3. REQUIREMENTS", None, "3.1 Power.", None,
+                                  "3.1.1 Input. The unit shall accept 28 V dc.", None,
+                                  "3.7.2 Ripple. The ripple shall be less than 1 V.", None,
+                                  "3.1.3 Inrush. The inrush current shall be less than 10 A.", None,
+                                  "3.4.1 Weight. The unit shall weigh less than 5 kg.", None,
+                                  "8.4.2 Size. The unit shall fit in a 19 inch rack.", None,
+                                  "3.4.3 Color. The unit shall be painted grey."])
+    number = {h["number"]: h for h in doc._outline}
+    assert not any(h.get("missing") and h["number"] in ("3.7", "8", "8.4") for h in doc._outline), doc._outline
+    assert number["3.7.2"]["parent"] == number["3.1"]["id"] and number["3.1.3"]["parent"] == number["3.1"]["id"]
+    assert number["8.4.2"]["parent"] == number["3.4"]["id"] and number["3.4.3"]["parent"] == number["3.4"]["id"]
+    doors = [p.text for p in docx.Document(str(se.write_doors_document(Path(tempfile.mkdtemp()) / "d.docx", doc,
+                                                                       items, s))).paragraphs
+             if p.style.name.startswith("Heading")]
+    assert doors == ["3. REQUIREMENTS", "3.1 Power", "3.1.1 Input", "3.7.2 Ripple", "3.1.3 Inrush",
+                     "3.4 [heading not found in the scan]", "3.4.1 Weight", "8.4.2 Size", "3.4.3 Color"], doors
+
+
+def test_review2_a_top_level_title_whose_number_was_lost_keeps_its_sections():
+    """Review 1.5.0 (round 2): 'REQUIREMENTS' (the scan lost its '3.') followed by 3.1 and 3.2 holds them, with no
+    '3 [heading not found in the scan]' after it; 'NOTES' followed by 6.1 keeps the section 6 quality note."""
+    import docx
+    doc, items, s = _outline_doc(["2. APPLICABLE DOCUMENTS", None, "2.1 General. The documents below apply.", None,
+                                  "REQUIREMENTS", None, "3.1 Power. The radar shall accept 28 V.", None,
+                                  "3.2 Cooling. The radar shall be air cooled.", None,
+                                  "NOTES", None, "6.1 Intended use. The radar shall be used on ships only."])
+    number = {h["number"] or h["title"]: h for h in doc._outline}
+    assert not any(h.get("missing") for h in doc._outline), doc._outline
+    assert number["3.1"]["parent"] == number["REQUIREMENTS"]["id"] and number["3.1"]["type"] == "requirements"
+    assert any("section 6" in n for n in find(items, "used on ships").quality_notes)
+    doors = [p.text for p in docx.Document(str(se.write_doors_document(Path(tempfile.mkdtemp()) / "d.docx", doc,
+                                                                       items, s))).paragraphs
+             if p.style.name.startswith("Heading")]
+    assert doors == ["2. APPLICABLE DOCUMENTS", "2.1 General", "REQUIREMENTS", "3.1 Power", "3.2 Cooling", "NOTES",
+                     "6.1 Intended use"], doors
+
+
+def test_review2_a_second_document_starting_at_1_general_is_a_section_of_its_own():
+    """Review 1.5.0 (round 2): '1. GENERAL' after section 3, with its 1.1 after it (a second document in the file),
+    is section 1 - not a numbered note inside 3.1, and with no '1 [heading not found in the scan]'."""
+    doc, _items, _s = _outline_doc(["3. REQUIREMENTS", None, "3.1 Power. The unit shall accept 28 V.", None,
+                                    "1. GENERAL", None, "1.1 Purpose. This document covers the antenna.", None,
+                                    "2. INTERFACES", None, "2.1 Connector. The antenna shall use a type N connector."])
+    got = [(h["level"], h["number"], h["kind"], bool(h.get("missing"))) for h in doc._outline]
+    assert got == [(1, "3", "heading", False), (2, "3.1", "heading", False), (1, "1", "heading", False),
+                   (2, "1.1", "heading", False), (1, "2", "heading", False), (2, "2.1", "heading", False)], got
+
+
+def test_review2_titles_glued_to_their_text_after_a_digit_a_bracket_or_an_acronym():
+    """Review 1.5.0 (round 2): a run-in title glued to its text ends at its full stop also after a number, a
+    bracket or an acronym ('Data bus (MIL-STD-1553).The bus', 'Connector type 2.The unit', 'RS-422A.The port')."""
+    ex = se.RequirementExtractor(settings())
+    for text, title, body in [("3.2.1 Data bus (MIL-STD-1553).The bus shall be redundant.", "Data bus (MIL-STD-1553)",
+                               "The bus shall be redundant."),
+                              ("3.2.2 Connector type 2.The unit shall use it.", "Connector type 2",
+                               "The unit shall use it."),
+                              ("3.2.3 RS-422A.The serial port shall use it.", "RS-422A", "The serial port shall use it."),
+                              ("3.2.4 U.S. Army interface. The radar shall work.", "",
+                               "U.S. Army interface. The radar shall work.")]:
+        got = ex.parse_head(text)[:3]
+        assert got == (text.split()[0], title, body), (text, got)
+
+
+def test_review2_a_heading_word_corrected_beside_punctuation_is_corrected_in_its_title():
+    """Review 1.5.0 (round 2): '3.2 Contr0l, display and alarms' and '3.4 Display (p0wer) panel': the corrected word
+    is corrected in the heading's title as well (the Section column and the Document Structure sheet), as in the
+    Word files."""
+    doc, items, _s = _outline_doc(["3. REQUIREMENTS", None, "3.2 Contr0l, display and alarms", None,
+                                   "3.2.1 Panel. The panel shall show the alarms.", None, "3.4 Display (p0wer) panel",
+                                   None, "3.4.1 Power. The panel shall run from 28 V."])
+    titles = [h["title"] for h in doc._outline]
+    assert "Control, display and alarms" in titles and "Display (power) panel" in titles, titles
+    assert find(items, "show the alarms").section.startswith("3.2 Control,"), find(items, "show the alarms").section
+
+
+def test_review2_docling_counts_only_the_heading_rows_at_the_top():
+    """Review 1.5.0 (round 2): a Docling table that repeats its heading row lower down shows only the rows at the
+    top as heading rows, not the data rows above the repeated one."""
+    def cells(*marks):
+        return [types.SimpleNamespace(column_header=m) for m in marks]
+    grid = [["Parameter", "Min"], ["Voltage", "26 V"], ["Parameter", "Min"], ["Current", "2 A"]]
+    rows, how = se._docling_heading_rows([cells(True, True), cells(False, False), cells(True, True),
+                                          cells(False, False)], grid)
+    assert (rows, how) == (1, "column header (Docling)"), (rows, how)
+
+
+def test_review2_no_autocorrect_flags_every_word_it_leaves_as_read():
+    """Review 1.5.0 (round 2): with --no-autocorrect a look-alike the tool would have corrected ('c0ntrol', 'sCope')
+    is left as read and flagged for review with what it would have become."""
+    _doc, items = run({1: make_lines(["3.1 General. The c0ntrol unit shall start within the sCope of 3.1."])},
+                      settings(autocorrect=False))
+    row = requirements(items)[0]
+    assert "c0ntrol" in row.text and "sCope" in row.text and row.needs_review, (row.text, row.needs_review)
+    assert any("'control'" in r and "'scope'" in r for r in row.review_reasons), row.review_reasons
+
+
+def test_review2_reuse_runs_the_tool_again_for_another_copy_of_it():
+    """Review 1.5.0 (round 2): run_cases.py --reuse only re-checks workbooks that the same copy of the tool made;
+    for another copy (or results of unknown origin) it runs the tool again."""
+    sys.path.insert(0, str(HERE / "cases"))
+    import run_cases
+    import openpyxl
+    case = run_cases.casekit.load_cases()[0]
+    folder = Path(tempfile.mkdtemp())
+    document = folder / "doc.pdf"
+    (folder / "run1").mkdir()
+    ran, saved = [], run_cases.run_tool
+    run_cases.run_tool = lambda spec, documents, outdir, jobs: ran.append(spec)
+    try:
+        args = types.SimpleNamespace(reuse=True, jobs=1, verbose=False)
+        for previous_spec, runs in (("other/spec_extractor.py", 1), (str(folder / "spec_extractor.py"), 0)):
+            wb = openpyxl.Workbook()
+            wb.active.title = "Extracted Items"
+            wb.save(folder / "run1" / "doc_extracted.xlsx")
+            (folder / "case_results.json").write_text(json.dumps({"spec": previous_spec, "cases": {}}), encoding="utf-8")
+            ran.clear()
+            with contextlib.redirect_stdout(io.StringIO()):          # (its report lines)
+                run_cases.check(folder / "spec_extractor.py", [case], {case.id: document}, folder, args)
+            assert len(ran) == runs, (previous_spec, ran)
+    finally:
+        run_cases.run_tool = saved
 
 
 def test_the_commit_is_read_from_the_git_folder_also_after_git_gc():
