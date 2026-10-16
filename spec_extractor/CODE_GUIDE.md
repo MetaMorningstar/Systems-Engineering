@@ -57,8 +57,9 @@ What happens when you run `python spec_extractor.py spec.pdf` (section numbers i
         (`WordChecker.issue()`) and corrects the certain ones (`WordChecker.correct()`), see section 4 below.
       * `block_tokens()` / `word_tokens()` - each block's text as `Token`s (word, confidence, what to check, what the
         scan read before a correction, underlined). `_correct_table_cells()` corrects table cells the same way.
-      * `_mark_page_furniture()` (running headers, footers, page numbers), `_merge_across_pages()` (a paragraph cut
-        by a page break), `_merge_continued_tables()` (a table that goes on over the page, also without its heading
+      * `_mark_page_furniture()` (running headers, footers, page numbers), `_rejoin_running_text()` (a paragraph that
+        `analyze_page()` cut at a line starting with a document number is joined back, unless it is in a list of
+        documents: a page alone cannot tell), `_merge_across_pages()` (a paragraph cut by a page break), `_merge_continued_tables()` (a table that goes on over the page, also without its heading
         row: `_fit_columns()`), `_link_captions()` (each caption to its table or figure), `_tables_without_titles()`
         (a `may_continue` table that did not continue anything becomes list rows).
    4. **`RequirementExtractor.extract()`** [9] - the Excel rows (`ExtractedItem`s):
@@ -144,6 +145,7 @@ What happens when you run `python spec_extractor.py spec.pdf` (section numbers i
   | `outline` | `build_outline()` | the headings and body parts inside the block, with their levels and section types |
   | `document_entry`, `document_group` | `read_document_lists()` | a document of section 2; a group title above such documents |
   | `continued_across_pages` | `_merge_across_pages()` | text joined over a page break |
+  | `listed_split` | `analyze_page()` | the block was started only because its first line starts with a document number (`_rejoin_running_text()` joins it back outside a list of documents) |
 
 * **`DocResult`** - one document: its pages (`PageInfo`) and blocks; saved to the cache as `result.json`.
 * **`Token`** [7] - one word as the outputs show it: `text`, `conf`, `issue` (why to check it), `line_start`,
@@ -163,11 +165,12 @@ What happens when you run `python spec_extractor.py spec.pdf` (section numbers i
 | what autocorrection may change | `WordChecker.correct()` [7], `_LOOKALIKES`, `_LOOKALIKE_PAIRS`, `_SAME_SHAPE_CAPITALS`, `_NUMBER_LOOKALIKES` [7] | it changes a word only when exactly one ordinary word comes out; `Settings.autocorrect = False` or `--no-autocorrect` switches it off |
 | when a block of columns is a table | `analyze_page()` (the comment "A table needs a heading row ... or a title"), `_header_rows()`, `_names_columns()`, `_COLUMN_NAME_WORDS` [6c] | add a column name to `_COLUMN_NAME_WORDS` when a heading row in plain type is not recognised |
 | how a table going on over the page is joined | `_merge_continued_tables()`, `_fit_columns()`, `_tables_without_titles()` [7] | |
+| how lines are joined into headings, paragraphs and list items | the `new_block` conditions in `analyze_page()` [6f], each with a comment | a rule that starts a heading or a document entry must not fire inside running text: try it on a requirement typed in capitals, on lines that start with a document number, and at 1.5 and double spacing (the tests `test_review3_*` show how) |
 | how underlining and bold are measured | `measure_text_format()` and the helpers of 6b-2 | thresholds are in line heights, explained in the comments |
 | which titles start which kind of section | `SPEC_SECTION_TYPES`, `_DOCUMENT_LIST_TITLES`, `_DOCUMENTS_FOLLOW` [9b, 9c] | a title is matched as a whole, ignoring case |
 | which document numbers are recognised (`MIL-STD-461G`, `SAE AS50881` ...) | `RE_DOC_ID` [6a] | one alternative per family of documents, with a comment; test with `tests/test_rules.py doc` |
 | how a paragraph number, title and text are split | `RequirementExtractor.parse_head()` [9], `underlined_after_number()` [9] | an underlined title must end like one (no sentence end inside, no comma at the end) |
-| how the lines of a document list are told apart | `_starts_document_entry()` (tab stops, dash), `_starts_listed_document()` (single-spaced) [6f], `parse_document_entry()` [9c] | a document title never holds a requirement keyword |
+| how the lines of a document list are told apart | `_starts_document_entry()` (tab stops, dash), `_starts_listed_document()` (single-spaced), `_leaves_phrase_open()` (running text that cites documents), `_looks_like_group_title()` [6f], `_rejoin_running_text()` [7], `parse_document_entry()`, `read_document_lists()` [9c] | a document title never holds a requirement keyword; a line that starts with a document number is a new entry only where the line above does not leave a phrase open |
 | which unnumbered titles start a top-level section | `build_outline()` [9b] (its inner function `starts_new_section`) | section numbers only go forward: a "1." inside section 3 is a note, not section 1 |
 | heading levels | `_heading_level()` [9b] and `_ReportWriter.heading()` [11e] | the level is the number of parts of the paragraph number, at most 9 |
 | a column of the Excel file | `MASTER_COLUMNS` [10] and where `write_workbook()` fills the row | find columns by name (`_COL["Content"]`), never by position |

@@ -427,11 +427,13 @@ def check(spec: Path, selected: list, docs: dict, outdir: Path, args) -> Counter
             previous, previous_spec = saved.get("cases", {}), saved.get("spec")
         except (ValueError, OSError):
             previous = {}
-    reuse = args.reuse and previous_spec == str(spec)
-    if args.reuse and not reuse:
-        print(f"(the workbooks in {outdir} were made by another copy of the tool, or by an unknown one: running it "
-              f"again instead of --reuse)", flush=True)
-    todo = [docs[c.id] for c in selected if not (reuse and find_workbook(outdir, docs[c.id]))]
+    # --reuse re-checks only the workbooks this copy of the tool made (each case's result records which made it)
+    made_here = {c.id for c in selected if previous.get(c.id, {}).get("spec", previous_spec) == str(spec)}
+    if args.reuse and len(made_here) < len(selected):
+        print(f"(some workbooks in {outdir} were made by another copy of the tool, or by an unknown one: running it "
+              f"again on those instead of --reuse)", flush=True)
+    todo = [docs[c.id] for c in selected
+            if not (args.reuse and c.id in made_here and find_workbook(outdir, docs[c.id]))]
     if todo:
         print(f"running {spec.name} on {len(todo)} case document(s) -> {outdir}", flush=True)
         for d in todo:                                # never compare against a stale workbook
@@ -469,8 +471,9 @@ def check(spec: Path, selected: list, docs: dict, outdir: Path, args) -> Counter
         for cid, before, after in changes:
             print(f"   {cid}: {before} -> {after}")
             report.append(f"   {cid}: {before} -> {after}")
-    kept = {k: v for k, v in previous.items()}
-    kept.update({c.id: {"status": st, "problem": why, "title": c.title} for c, st, why in results})
+    own = any(c.scan for c in selected)           # (a folder holds the results of your own scans or of the library)
+    kept = {k: v for k, v in previous.items() if k.startswith("MY-") == own}
+    kept.update({c.id: {"status": st, "problem": why, "title": c.title, "spec": str(spec)} for c, st, why in results})
     results_file.write_text(json.dumps({"spec": str(spec), "time": time.strftime("%Y-%m-%d %H:%M"), "cases": kept},
                                        indent=1), encoding="utf-8")
     (outdir / "case_report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")

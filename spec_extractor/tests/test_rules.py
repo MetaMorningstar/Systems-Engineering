@@ -4175,8 +4175,9 @@ def test_review2_no_autocorrect_flags_every_word_it_leaves_as_read():
 
 
 def test_review2_reuse_runs_the_tool_again_for_another_copy_of_it():
-    """Review 1.5.0 (round 2): run_cases.py --reuse only re-checks workbooks that the same copy of the tool made;
-    for another copy (or results of unknown origin) it runs the tool again."""
+    """Review 1.5.0 (rounds 2 and 3): run_cases.py --reuse only re-checks workbooks that the same copy of the tool
+    made; for another copy (or results of unknown origin) it runs the tool again - also for a case that another copy
+    made before a later partial run (--only) of this one."""
     sys.path.insert(0, str(HERE / "cases"))
     import run_cases
     import openpyxl
@@ -4188,17 +4189,1163 @@ def test_review2_reuse_runs_the_tool_again_for_another_copy_of_it():
     run_cases.run_tool = lambda spec, documents, outdir, jobs: ran.append(spec)
     try:
         args = types.SimpleNamespace(reuse=True, jobs=1, verbose=False)
-        for previous_spec, runs in (("other/spec_extractor.py", 1), (str(folder / "spec_extractor.py"), 0)):
+        here = str(folder / "spec_extractor.py")
+        for previous_spec, case_spec, runs in (("other/spec_extractor.py", None, 1), (here, None, 0),
+                                               (here, "other/spec_extractor.py", 1)):
             wb = openpyxl.Workbook()
             wb.active.title = "Extracted Items"
             wb.save(folder / "run1" / "doc_extracted.xlsx")
-            (folder / "case_results.json").write_text(json.dumps({"spec": previous_spec, "cases": {}}), encoding="utf-8")
+            cases = {case.id: {"status": "PASS", "spec": case_spec}} if case_spec else {}
+            (folder / "case_results.json").write_text(json.dumps({"spec": previous_spec, "cases": cases}),
+                                                      encoding="utf-8")
             ran.clear()
             with contextlib.redirect_stdout(io.StringIO()):          # (its report lines)
                 run_cases.check(folder / "spec_extractor.py", [case], {case.id: document}, folder, args)
-            assert len(ran) == runs, (previous_spec, ran)
+            assert len(ran) == runs, (previous_spec, case_spec, ran)
     finally:
         run_cases.run_tool = saved
+
+
+def _doors_headings(doc, items, s) -> list:
+    """The heading paragraphs of the DOORS file written for this document."""
+    import docx
+    path = se.write_doors_document(Path(tempfile.mkdtemp()) / "d.docx", doc, items, s)
+    return [p.text for p in docx.Document(str(path)).paragraphs if p.style.name.startswith("Heading")]
+
+
+def test_review3_a_requirement_typed_in_capitals_is_not_cut_at_a_short_line():
+    """Review 1.5.0 (round 3): at 1.5 or double spacing, a requirement typed in capitals whose line stops short of
+    the margin ('... MAINTAIN TRACK ON 20 TARGETS' / 'AT ALL TIMES DURING ...') keeps its last line: the short line
+    of capitals after it is not a heading."""
+    rows = ["3. REQUIREMENTS", None, "3.1 GENERAL. THE EQUIPMENT DESCRIBED HEREIN SHALL BE DESIGNED TO",
+            "OPERATE CONTINUOUSLY FROM THE AIRCRAFT 28 VOLT DIRECT CURRENT", "POWER SYSTEM WITHOUT DEGRADATION OF PERFORMANCE.",
+            None, "3.2 TRACKING. THE RADAR SHALL MAINTAIN TRACK ON 20 TARGETS",
+            "AT ALL TIMES DURING THE SEARCH AND TRACK MODES.", None,
+            "3.3 WEIGHT. THE UNIT SHALL WEIGH NOT MORE THAN 5 KILOGRAMS."]
+    for pitch in (60, 72):                              # 1.5 and double spacing (the text is TEXT_H = 30 high)
+        lines = [make_line(t, LEFT, 300 + k * pitch) for k, t in enumerate(rows) if t is not None]
+        doc, items, _s = _outline_doc_from_lines(lines)
+        assert find(items, "MAINTAIN TRACK").text.endswith("ON 20 TARGETS AT ALL TIMES DURING THE SEARCH AND TRACK "
+                                                            "MODES."), (pitch, texts(items))
+        assert [h["number"] for h in doc._outline] == ["3", "3.1", "3.2", "3.3"], (pitch, doc._outline)
+
+
+_DASH_HEAD = ["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents. The following documents form a part of "
+              "this specification to the extent", "specified herein.", None]
+
+
+def test_review3_a_dash_layout_title_wraps_after_an_abbreviation_a_colon_or_onto_part_numbers():
+    """Review 1.5.0 (round 3): a title in the dash layout is not cut where its first line ends in 'U.S.' or 'Part 1:',
+    or where it wraps onto part numbers in capitals; and in a list typed in capitals, the next group title after
+    an entry whose line runs to the margin is still a group title."""
+    got = _documents(_DASH_HEAD + ["DEPARTMENT OF DEFENSE STANDARDS", None,
+                                   "MIL-STD-130N - Identification Marking of U.S. Military Property for Shipment and U.S.",
+                                   "Government Storage Facilities",
+                                   "ANSI/EIA-649 - National Consensus Standard for Configuration Management - Part 1:",
+                                   "Configuration Management Process",
+                                   "MIL-PRF-19500/255 - Semiconductor Device, Transistor, NPN, Silicon, Switching, Types",
+                                   "2N2222A, 2N2222AUA, JAN, JANTX, JANTXV AND JANS",
+                                   "MIL-STD-461G - Requirements for the Control of Electromagnetic Interference"]
+                     + _REQUIREMENTS_TAIL)
+    assert got == [
+        ("DEPARTMENT OF DEFENSE STANDARDS", "", "MIL-STD-130N",
+         "Identification Marking of U.S. Military Property for Shipment and U.S. Government Storage Facilities", ""),
+        ("DEPARTMENT OF DEFENSE STANDARDS", "", "ANSI/EIA-649",
+         "National Consensus Standard for Configuration Management - Part 1: Configuration Management Process", ""),
+        ("DEPARTMENT OF DEFENSE STANDARDS", "", "MIL-PRF-19500/255", "Semiconductor Device, Transistor, NPN, Silicon, "
+         "Switching, Types 2N2222A, 2N2222AUA, JAN, JANTX, JANTXV AND JANS", ""),
+        ("DEPARTMENT OF DEFENSE STANDARDS", "", "MIL-STD-461G",
+         "Requirements for the Control of Electromagnetic Interference", "")], got
+    got = _documents(["2. APPLICABLE DOCUMENTS", None,
+                      "2.1 GOVERNMENT DOCUMENTS. THE FOLLOWING DOCUMENTS FORM A PART OF THIS SPECIFICATION.", None,
+                      "DEPARTMENT OF DEFENSE SPECIFICATIONS",
+                      "MIL-DTL-38999 - CONNECTORS, ELECTRICAL, CIRCULAR, MINIATURE, HIGH DENSITY, QUICK",
+                      "DISCONNECT, ENVIRONMENT RESISTANT, REMOVABLE CRIMP CONTACTS, ASSOCIATED HARDWARE",
+                      "DEPARTMENT OF DEFENSE STANDARDS",
+                      "MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF ELECTROMAGNETIC INTERFERENCE", None,
+                      "3. REQUIREMENTS", None, "3.1 GENERAL. THE UNIT SHALL MEET MIL-STD-461G."])
+    assert [(g, n, t.endswith("HARDWARE")) for g, _s, n, t, _p in got] == [
+        ("DEPARTMENT OF DEFENSE SPECIFICATIONS", "MIL-DTL-38999", True),
+        ("DEPARTMENT OF DEFENSE STANDARDS", "MIL-STD-461G", False)], got
+
+
+def test_review3_a_title_on_tab_stops_wraps_a_little_right_of_its_stop():
+    """Review 1.5.0 (round 3): in a list on tab stops, a wrapped title indented a character or two past the title's
+    tab stop is more of the title - not a sub-group of the documents after it."""
+    for indent in (15, 30, 45):
+        got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Specifications, standards, and handbooks.", None,
+                          "SPECIFICATIONS", None, (60, "Military"), None,
+                          [(150, "MIL-E-5400T"), (450, "Electronic Equipment, Aerospace,")],
+                          [(450 + indent, "General Specification for")],
+                          [(150, "MIL-PRF-38534"), (450, "Hybrid Microcircuits, General")],
+                          [(450 + indent, "Specification for")],
+                          [(150, "MIL-W-22759/16"), (450, "Wire, Electric, Fluoropolymer-Insulated")]]
+                         + _REQUIREMENTS_TAIL)
+        assert [(sub, n, t) for _g, sub, n, t, _p in got] == [
+            ("Military", "MIL-E-5400T", "Electronic Equipment, Aerospace, General Specification for"),
+            ("Military", "MIL-PRF-38534", "Hybrid Microcircuits, General Specification for"),
+            ("Military", "MIL-W-22759/16", "Wire, Electric, Fluoropolymer-Insulated")], (indent, got)
+
+
+def test_review3_running_text_that_starts_with_document_numbers_at_the_top_of_a_page_stays_one_requirement():
+    """Review 1.5.0 (round 3): a requirement carried over a page break onto lines that start with document numbers
+    ('MIL-STD-461G, RE102, and ... of' / 'MIL-STD-461G, CE102, for ...') keeps its end, and so does a paragraph
+    that begins with a document number; neither is read as a list of documents."""
+    s = settings()
+    doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.1 Tests. The unit shall be tested for emissions and "
+                                     "susceptibility as specified in"], y0=1900),
+                      2: make_lines(["MIL-STD-461G, RE102, and the conducted emission limits of",
+                                     "MIL-STD-461G, CE102, for Navy aircraft installations.", None,
+                                     "3.2 Weight. The unit shall weigh less than 5 kg."])}, s)
+    assert find(items, "tested for emissions").text.endswith("limits of MIL-STD-461G, CE102, for Navy aircraft "
+                                                             "installations."), texts(items)
+    doc, items, _s = _outline_doc(["3. REQUIREMENTS", None, "3.4 Electrical power.", None,
+                                   "MIL-STD-704F Aircraft Electric Power Characteristics applies to all equipment "
+                                   "connected to the",
+                                   "MIL-STD-704F Normal, Abnormal and Emergency bus categories, and the unit shall "
+                                   "operate from them.", None, "3.5 Weight. The unit shall weigh less than 5 kg."])
+    assert find(items, "operate from them").text.startswith("MIL-STD-704F Aircraft Electric"), texts(items)
+    assert doc._documents == [], doc._documents
+
+
+def test_review3_single_spaced_lists_under_other_lead_ins_or_a_small_letter_sub_title():
+    """Review 1.5.0 (round 3): a single-spaced list right under a lead-in worded otherwise ('The documents listed
+    below are part of ...', '... are applicable ...:') or under a sub-title in small letters gives every document."""
+    entries = ["MIL-STD-810H, Environmental Engineering Considerations and Laboratory Tests",
+               "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference",
+               "MIL-STD-704F, Aircraft Electric Power Characteristics"]
+    for head in (["2.1 Government documents. The documents listed below are part of this specification:"],
+                 ["2.1 Government documents. The following documents are applicable to the extent specified herein:"],
+                 ["2.1 Government documents.", None, "Military standards"]):
+        got = _documents(["2. APPLICABLE DOCUMENTS", None] + head + entries + _REQUIREMENTS_TAIL)
+        assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-810H", "MIL-STD-461G", "MIL-STD-704F"], (head, got)
+
+
+def test_review3_single_spaced_entries_with_a_notice_or_a_date_after_the_number():
+    """Review 1.5.0 (round 3): single-spaced entries cited with a notice or change set off by commas ('MIL-HDBK-217F,
+    Notice 2, Reliability ...'), also as the first entry, or with the issue date in brackets after the number, are
+    entries of their own."""
+    head = ["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents. The following documents form a part of this",
+            "specification to the extent specified herein.", None, "DEPARTMENT OF DEFENSE STANDARDS", None]
+    got = _documents(head + ["MIL-STD-461G, Requirements for the Control of Electromagnetic Interference",
+                             "MIL-HDBK-217F, Notice 2, Reliability Prediction of Electronic Equipment",
+                             "MIL-STD-1553B, Notice 4, Digital Time Division Command/Response Multiplex Data Bus",
+                             "MIL-STD-810H, Change 1, Environmental Engineering Considerations and Laboratory Tests",
+                             "MIL-STD-704F, Aircraft Electric Power Characteristics"] + _REQUIREMENTS_TAIL)
+    assert [(n, t) for _g, _s, n, t, _p in got] == [
+        ("MIL-STD-461G", "Requirements for the Control of Electromagnetic Interference"),
+        ("MIL-HDBK-217F Notice 2", "Reliability Prediction of Electronic Equipment"),
+        ("MIL-STD-1553B Notice 4", "Digital Time Division Command/Response Multiplex Data Bus"),
+        ("MIL-STD-810H Change 1", "Environmental Engineering Considerations and Laboratory Tests"),
+        ("MIL-STD-704F", "Aircraft Electric Power Characteristics")], got
+    got = _documents(head + ["MIL-HDBK-217F, Notice 2, Reliability Prediction of Electronic Equipment",
+                             "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference"]
+                     + _REQUIREMENTS_TAIL)
+    assert [n for _g, _s, n, _t, _p in got] == ["MIL-HDBK-217F Notice 2", "MIL-STD-461G"], got
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None, "STANDARDS", None,
+                      "MIL-STD-810H (31 January 2019), Environmental Engineering Considerations and Laboratory Tests",
+                      "MIL-STD-461G (11 December 2015), Requirements for the Control of Electromagnetic Interference"]
+                     + _REQUIREMENTS_TAIL)
+    assert [(n, t) for _g, _s, n, t, _p in got] == [
+        ("MIL-STD-810H (31 January 2019)", "Environmental Engineering Considerations and Laboratory Tests"),
+        ("MIL-STD-461G (11 December 2015)", "Requirements for the Control of Electromagnetic Interference")], got
+
+
+def test_review3_a_requirement_whose_lead_in_says_its_standards_form_a_part_keeps_them():
+    """Review 1.5.0 (round 3): 'The unit shall comply with the following standards, which form a part of this
+    specification:' over a list of standards is a requirement with its list, not a list of documents."""
+    doc, items, _s = _outline_doc(["3. REQUIREMENTS", None, "3.3 EMI. The unit shall comply with the following "
+                                   "standards, which form a part of this specification:",
+                                   "MIL-STD-461G CE102 Conducted Emissions, Power Leads",
+                                   "MIL-STD-461G RE102 Radiated Emissions, Electric Field",
+                                   "MIL-STD-461G RS103 Radiated Susceptibility, Electric Field", None,
+                                   "3.4 Weight. The unit shall weigh less than 5 kg."])
+    assert find(items, "comply with").text.endswith("RS103 Radiated Susceptibility, Electric Field"), texts(items)
+    assert doc._documents == [], doc._documents
+
+
+def test_review3_a_paragraph_number_after_a_part_or_version_word_in_an_entry_read_as_one_line():
+    """Review 1.5.0 (round 3): in an entry read as one line, a number after 'Supplement' or 'Change' is the
+    paragraph that cites it; a version number stays in the title only after a version or part word set off by a
+    comma ('..., Revision 1.1', '..., Volume 2')."""
+    for text, title, paragraphs in [
+            ("48 CFR 252 Defense Federal Acquisition Regulation Supplement 3.11",
+             "Defense Federal Acquisition Regulation Supplement", "3.11"),
+            ("DI-CMAN-80639 Request for Engineering Change 3.10", "Request for Engineering Change", "3.10"),
+            ("IEEE Std 1394 High Performance Serial Bus, Revision 1.1", "High Performance Serial Bus, Revision 1.1", ""),
+            ("IEEE Std 1394 High Performance Serial Bus, Revision 1.1 3.2.1", "High Performance Serial Bus, Revision 1.1",
+             "3.2.1"),
+            ("MIL-HDBK-454B General Guidelines for Electronic Equipment, Volume 2 3.5",
+             "General Guidelines for Electronic Equipment, Volume 2", "3.5")]:
+        e = se.parse_document_entry(text)
+        assert (e["title"], e["paragraphs"]) == (title, paragraphs), (text, e)
+
+
+def test_review3_a_misread_top_level_or_parent_number_adds_no_placeholders_but_a_real_jump_does():
+    """Review 1.5.0 (round 3): '8. REQUIREMENTS' (a misread 3) before 3.1 holds section 3, and '3.7.2' (a misread
+    3.1.2) holds its own 3.1.2.1 and 3.1.2.2 - no placeholders in either file. A real jump (3.1.2 to 3.6.1) still
+    gets its '3.6 [heading not found in the scan]'."""
+    doc, items, s = _outline_doc(["2. APPLICABLE DOCUMENTS", None, "2.1 General. The documents below apply.", None,
+                                  "8. REQUIREMENTS", None, "3.1 Power. The unit shall accept 28 V.", None,
+                                  "3.2 Cooling. The unit shall be air cooled.", None,
+                                  "4. QUALITY ASSURANCE PROVISIONS", None, "4.1 General. The unit shall be inspected."])
+    number = {h["number"]: h for h in doc._outline}
+    assert not any(h.get("missing") for h in doc._outline), doc._outline
+    assert number["3.1"]["parent"] == number["8"]["id"] and number["3.2"]["type"] == "requirements", doc._outline
+    assert not any("not found" in t for t in _doors_headings(doc, items, s))
+    doc, items, s = _outline_doc(["3. REQUIREMENTS", None, "3.1 Power.", None,
+                                  "3.1.1 Input. The unit shall accept 28 V dc.", None, "3.7.2 Ripple.", None,
+                                  "3.1.2.1 Low frequency. The ripple below 1 kHz shall be less than 1 V.", None,
+                                  "3.1.2.2 High frequency. The ripple above 1 kHz shall be less than 0.1 V.", None,
+                                  "3.1.3 Inrush. The inrush current shall be less than 10 A."])
+    number = {h["number"]: h for h in doc._outline}
+    assert not any(h.get("missing") for h in doc._outline), doc._outline
+    assert number["3.1.2.1"]["parent"] == number["3.7.2"]["id"] and number["3.1.3"]["parent"] == number["3.1"]["id"]
+    assert not any("not found" in t for t in _doors_headings(doc, items, s))
+    doc, items, s = _outline_doc(["3. REQUIREMENTS", None, "3.1 Power.", None,
+                                  "3.1.1 Input. The unit shall accept 28 V dc.", None,
+                                  "3.1.2 Ripple. The ripple shall be less than 1 V.", None,
+                                  "3.6.1 Paint. The unit shall be painted grey.", None,
+                                  "3.6.2 Marking. The unit shall be marked.", None, "3.7 Safety. The unit shall be safe."])
+    assert "3.6 [heading not found in the scan]" in _doors_headings(doc, items, s)
+    assert [h["number"] for h in doc._outline if h.get("missing")] == ["3.6"], doc._outline
+
+
+def test_review3_an_appendix_letter_misread_as_a_digit_stays_in_its_appendix():
+    """Review 1.5.0 (round 3): 'B.3' read as '8.3' in APPENDIX B is filed in the appendix, and so is B.4 after it:
+    no '8' or 'B' placeholders, and both keep the type 'appendix'."""
+    doc, items, s = _outline_doc(["6. NOTES", None, "6.1 Intended use. The unit is used on ships.", None,
+                                  "APPENDIX B", None, "B.1 Scope. This appendix covers the test set.", None,
+                                  "B.2 Power. The test set shall accept 28 V.", None,
+                                  "8.3 Cooling. The test set shall be air cooled.", None,
+                                  "B.4 Weight. The test set shall weigh less than 5 kg."])
+    number = {h["number"] or h["title"]: h for h in doc._outline}
+    assert not any(h.get("missing") for h in doc._outline), doc._outline
+    assert number["8.3"]["parent"] == number["B.4"]["parent"] == number["APPENDIX B"]["id"], doc._outline
+    assert number["8.3"]["type"] == number["B.4"]["type"] == "appendix", doc._outline
+    assert not any("not found" in t for t in _doors_headings(doc, items, s))
+
+
+def test_review3_front_matter_and_a_note_numbered_1_are_not_section_1():
+    """Review 1.5.0 (round 3): FOREWORD followed by 1.1 (its '1. SCOPE' lost) does not hold section 1: both files
+    get the '1 [heading not found in the scan]' placeholder. And a note '1. Signal levels ...' inside section 1,
+    followed by 1.2, is not a new section 1."""
+    doc, items, s = _outline_doc(["FOREWORD", None, "This specification is approved for use by all departments.", None,
+                                  "1.1 Scope. This specification covers the radar.", None,
+                                  "1.2 Classification. The radar is of one type.", None,
+                                  "2. APPLICABLE DOCUMENTS", None, "2.1 General. The documents below apply."])
+    number = {h["number"] or h["title"]: h for h in doc._outline}
+    assert number["1"].get("missing") and number["1.1"]["parent"] == number["1"]["id"], doc._outline
+    assert number["1.1"]["type"] != "front matter", doc._outline
+    assert "1 [heading not found in the scan]" in _doors_headings(doc, items, s)
+    doc, _items, _s = _outline_doc(["1. SCOPE", None, "1.1 Scope. This specification covers the radar.", None,
+                                    "NOTE", None, "1. Signal levels are measured at the unit connector.", None,
+                                    "1.2 Classification. The radar is of one type.", None,
+                                    "2. APPLICABLE DOCUMENTS", None, "2.1 General. The documents below apply."])
+    assert [h["number"] for h in doc._outline if h["level"] == 1] == ["1", "2"], doc._outline
+    number = {h["number"]: h for h in doc._outline if h["number"]}
+    assert number["1.2"]["parent"] == number["1"]["id"] and number["1.2"]["type"] == "scope", doc._outline
+
+
+def test_review3_titles_that_end_in_a_letter_or_a_small_word():
+    """Review 1.5.0 (round 3): underlined titles 'Mode A', 'Power-on', 'Video In' and glued run-in titles 'Mode A.The
+    radar ...' are titles; 'Except as noted in' and 'U.S. Army interface.The ...' are still not."""
+    ex = se.RequirementExtractor(settings())
+    for text, underlined, title in [
+            ("3.2.2  Mode A  The radar shall provide Mode A interrogation.", "Mode A", "Mode A"),
+            ("3.2.4  Power-on  The unit shall run a self test at power-on.", "Power-on", "Power-on"),
+            ("3.2.7  Video In  The display shall accept composite video.", "Video In", "Video In"),
+            ("3.2.9  Receiver section  The receiver shall have a low noise figure.", "Receiver section",
+             "Receiver section"),
+            ("3.2.13  Except as noted in 3.2.7, the unit shall operate.", "Except as noted in", ""),
+            ("3.4.1 Mode A.The radar shall provide Mode A interrogation.", "", "Mode A"),
+            ("3.4.4 Port A.The port shall use RS-422 levels.", "", "Port A"),
+            ("3.4.7 U.S. Army interface.The radar shall accept data.", "", "")]:
+        assert ex.parse_head(text, underlined)[1] == title, (text, ex.parse_head(text, underlined))
+
+
+def test_review3_an_unnumbered_first_heading_and_two_line_appendix_and_section_titles():
+    """Review 1.5.0 (round 3): SCOPE as the first heading of a file (its '1.' lost) is a heading in the DOORS file
+    too, with no '1 [heading not found in the scan]' after it; 'APPENDIX A' over 'GLOSSARY OF TERMS', and 'SECTION 4'
+    over 'QUALITY ASSURANCE PROVISIONS', are one heading each, the second of type 'verification'."""
+    doc, items, s = _outline_doc(["SCOPE", None, "1.1 Scope. This specification covers the radar.", None,
+                                  "3. REQUIREMENTS", None, "3.1 Power. The radar shall accept 28 V."])
+    assert _doors_headings(doc, items, s) == ["SCOPE", "1.1 Scope", "3. REQUIREMENTS", "3.1 Power"]
+    doc, items, s = _outline_doc(["6. NOTES", None, "6.1 Intended use. The unit is intended for use in aircraft.", None,
+                                  (600, "APPENDIX A"), (480, "GLOSSARY OF TERMS"), None, "A.1 SCOPE", None,
+                                  "A.1.1 Scope. This appendix defines the terms used.", None,
+                                  "3. REQUIREMENTS", None, "3.1 General. The unit shall work.", None,
+                                  (500, "SECTION 4"), (420, "QUALITY ASSURANCE PROVISIONS"), None,
+                                  "4.1 Responsibility for inspection. The contractor shall perform all inspections."])
+    got = [(h["level"], h["number"], h["title"], h["type"]) for h in doc._outline if h["level"] == 1]
+    assert got == [(1, "6", "NOTES", "notes"), (1, "", "APPENDIX A GLOSSARY OF TERMS", "appendix"),
+                   (1, "3", "REQUIREMENTS", "requirements"),
+                   (1, "", "SECTION 4 QUALITY ASSURANCE PROVISIONS", "verification")], got
+    assert "SECTION 4 QUALITY ASSURANCE PROVISIONS" in _doors_headings(doc, items, s)
+
+
+def test_review3_no_autocorrect_flags_numbers_and_title_words_and_reports_a_repaired_keyword_once():
+    """Review 1.5.0 (round 3): with --no-autocorrect, a number the tool would have corrected ('O.5', '10.O') and a
+    look-alike in a run-in title ('M0nitor panel') are flagged with what they would have become; a garbled keyword
+    that the keyword repair puts right ('sha11') is reported once, as repaired, and stays marked in the Word
+    report."""
+    import docx
+    s = settings(autocorrect=False, word_page_images=False)
+    doc, items = run({1: make_lines(["3.1 Ripple. The ripple shall not exceed O.5 % of the output.", None,
+                                     "3.2 Current. The inrush current shall not exceed 10.O A.", None,
+                                     "3.3 M0nitor panel. The panel shall be grey.", None,
+                                     "3.4 Weight. The unit sha11 weigh less than 5 kg."])}, s)
+    for fragment, would_be in (("ripple", "'0.5'"), ("inrush", "'10.0'"), ("grey", "'Monitor'")):
+        row = find(items, fragment)
+        assert row.needs_review and any(would_be in r for r in row.review_reasons), (fragment, row.review_reasons)
+    row = find(items, "weigh less")
+    assert row.text.startswith("The unit shall") and row.review_reasons == ["OCR keyword repaired: 'sha11' -> 'shall'"]
+    path = se.write_word_report(Path(tempfile.mkdtemp()) / "r.docx", doc, items, s)
+    marked = [r.text.strip() for p in docx.Document(str(path)).paragraphs for r in p.runs if r.font.highlight_color]
+    assert "sha11" in marked, marked
+
+
+def test_review3_single_spaced_lists_with_titles_in_sentence_case_and_running_text_that_cites_documents():
+    """Review 1.5.0 (round 3): a single-spaced list whose titles are in sentence case ('ISO 9001, Quality management
+    systems - Requirements') gives every document; running text whose lines start with document numbers stays one
+    paragraph where the line above leaves a phrase open ('... as defined in' / 'MIL-STD-704F Aircraft ... and' /
+    'MIL-STD-1275E ...'), at the top of a page too."""
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.2 Non-Government publications. The following documents form a "
+                      "part of this document:", "ISO 9001, Quality management systems - Requirements",
+                      "IEC 61000-4-2, Electromagnetic compatibility (EMC) - Part 4-2: Testing and measurement",
+                      "IEC 60068-2-6, Environmental testing - Part 2-6: Tests - Test Fc: Vibration (sinusoidal)",
+                      "ISO 14644-1, Cleanrooms and associated controlled environments"] + _REQUIREMENTS_TAIL)
+    assert [n for _g, _s, n, _t, _p in got] == ["ISO 9001", "IEC 61000-4-2", "IEC 60068-2-6", "ISO 14644-1"], got
+    _doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.1 Power. The unit shall operate from electrical "
+                                      "power as defined in"], y0=1900),
+                       2: make_lines(["MIL-STD-704F Aircraft Electric Power Characteristics and",
+                                      "MIL-STD-1275E Characteristics of 28 Volt DC Input Power.", None,
+                                      "3.2 Weight. The unit shall weigh less than 5 kg."])})
+    assert find(items, "electrical power").text.endswith("and MIL-STD-1275E Characteristics of 28 Volt DC Input "
+                                                         "Power."), texts(items)
+    doc, _items, _s = _outline_doc(["6. NOTES", None, "6.1 Guidance. Guidance on the design is given in this note.",
+                                    "For guidance, see", "MIL-HDBK-454B, General Guidelines for Electronic Equipment."])
+    assert [b.text for b in doc.blocks][-1].startswith("6.1 Guidance") and doc._documents == [], \
+        [b.text for b in doc.blocks]
+
+
+def test_review3_lists_under_a_lead_in_that_says_shall_or_is_worded_otherwise():
+    """Review 1.5.0 (round 3): a lead-in that says the documents 'shall form a part' or 'will be used' (MIL-STD-490), or
+    ends 'listed below.' or '... are applicable', and a longer sub-title in small letters, are followed by a list of
+    documents; a requirement typed in capitals that calls up standards keeps them."""
+    entries = ["MIL-STD-810H, Environmental Engineering Considerations and Laboratory Tests",
+               "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference",
+               "MIL-STD-704F, Aircraft Electric Power Characteristics"]
+    for head in (["2.1 Government documents. The following documents of the issue in effect on the date of",
+                  "invitation for bids shall form a part of this specification to the extent specified herein:"],
+                 ["2.1 Government documents. The following documents will be used to the extent specified herein:"],
+                 ["2.1 Government documents. The documents referenced in this specification are listed below."],
+                 ["2.1 Government documents. The following standards are applicable"],
+                 ["2.1 Government documents.", None, "Department of Defense standards and handbooks"]):
+        got = _documents(["2. APPLICABLE DOCUMENTS", None] + head + entries + _REQUIREMENTS_TAIL)
+        assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-810H", "MIL-STD-461G", "MIL-STD-704F"], (head, got)
+    doc, items, _s = _outline_doc(["3. REQUIREMENTS", None, "3.3 EMI. THE UNIT SHALL COMPLY WITH THE FOLLOWING "
+                                   "STANDARDS, WHICH FORM A PART OF THIS SPECIFICATION:",
+                                   "MIL-STD-461G CE102 CONDUCTED EMISSIONS, POWER LEADS",
+                                   "MIL-STD-461G RE102 RADIATED EMISSIONS, ELECTRIC FIELD", None,
+                                   "3.4 WEIGHT. THE UNIT SHALL WEIGH LESS THAN 5 KG."])
+    assert find(items, "COMPLY WITH").text.endswith("RE102 RADIATED EMISSIONS, ELECTRIC FIELD"), texts(items)
+    assert doc._documents == [], doc._documents
+
+
+def test_review3_document_titles_that_wrap_before_a_part_number_a_note_or_onto_a_line_in_capitals():
+    """Review 1.5.0 (round 3): a title may wrap before its part number ('..., Part' / '3 Software Requirements'), onto
+    a line in capitals in a list typed in capitals ('... AIRCRAFT INTERNAL' / 'INTERFACE STANDARD'), or after a colon
+    onto a line indented under it; a note in brackets over two lines, a sentence after a title that ends '(Metric).',
+    and an issuer's group title after a line that ran to the margin are not more of the title."""
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.2 Non-Government publications. The following documents form a "
+                      "part of this document:",
+                      "IEC 61508-3, Functional Safety of Electrical/Electronic/Programmable Electronic Systems, Part",
+                      "3 Software Requirements",
+                      "IEC 61508-1, Functional Safety of Electrical/Electronic/Programmable Electronic Systems"]
+                     + _REQUIREMENTS_TAIL)
+    assert [(n, t.endswith("Part 3 Software Requirements")) for _g, _s, n, t, _p in got] == [
+        ("IEC 61508-3", True), ("IEC 61508-1", False)], got
+    got = _documents(_DASH_HEAD + ["DEPARTMENT OF DEFENSE STANDARDS", None,
+                                   "MIL-STD-1472H - Design Criteria Standard: Human Engineering (Metric).",
+                                   "Unless otherwise specified, the issues of these documents are those cited in the "
+                                   "solicitation.", "MIL-STD-461G - Requirements for the Control of Electromagnetic "
+                                   "Interference Characteristics", "of Subsystems and Equipment",
+                                   "(Copies of these documents are available online at https://quicksearch.dla.mil or "
+                                   "from the", "Standardization Document Order Desk, 700 Robbins Avenue, Philadelphia.)",
+                                   "MIL-STD-810H - Environmental Engineering Considerations and Laboratory Tests for "
+                                   "Aircraft", "Equipment, Ground Support Equipment, Shipboard Equipment and Ground "
+                                   "Vehicle Mounted Systems", "SAE INTERNATIONAL", "SAE AS50881 - Wiring, Aerospace "
+                                   "Vehicle", "ANSI/EIA-649 - National Consensus Standard for Configuration Management - "
+                                   "Part 1:", (450, "Configuration Management Process")] + _REQUIREMENTS_TAIL)
+    assert [(g, sub, n, t) for g, sub, n, t, _p in got] == [
+        ("DEPARTMENT OF DEFENSE STANDARDS", "", "MIL-STD-1472H", "Design Criteria Standard: Human Engineering (Metric)"),
+        ("DEPARTMENT OF DEFENSE STANDARDS", "", "MIL-STD-461G",
+         "Requirements for the Control of Electromagnetic Interference Characteristics of Subsystems and Equipment"),
+        ("DEPARTMENT OF DEFENSE STANDARDS", "", "MIL-STD-810H", "Environmental Engineering Considerations and Laboratory "
+         "Tests for Aircraft Equipment, Ground Support Equipment, Shipboard Equipment and Ground Vehicle Mounted Systems"),
+        ("SAE INTERNATIONAL", "", "SAE AS50881", "Wiring, Aerospace Vehicle"),
+        ("SAE INTERNATIONAL", "", "ANSI/EIA-649", "National Consensus Standard for Configuration Management - Part 1: "
+         "Configuration Management Process")], got
+    for title, wrapped, after, group in [
+            ("MIL-STD-1553B - DIGITAL TIME DIVISION COMMAND/RESPONSE MULTIPLEX DATA BUS, AIRCRAFT INTERNAL",
+             "INTERFACE STANDARD", "MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF EMI", ""),
+            ("MIL-STD-1916 - DOD PREFERRED METHODS FOR ACCEPTANCE OF PRODUCT, FOR USE BY ALL",
+             "DEFENSE AGENCIES AND MILITARY DEPARTMENTS", "MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF EMI", ""),
+            ("MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF ELECTROMAGNETIC INTERFERENCE CHARACTERISTICS",
+             "ASTM INTERNATIONAL", "ASTM D3951 - STANDARD PRACTICE FOR COMMERCIAL PACKAGING", "ASTM INTERNATIONAL")]:
+        got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS.", None,
+                          "DEPARTMENT OF DEFENSE SPECIFICATIONS", title, wrapped, after, None,
+                          "3. REQUIREMENTS", None, "3.1 GENERAL. THE UNIT SHALL MEET MIL-STD-461G."])
+        assert [(g, t.endswith(wrapped)) for g, _s, _n, t, _p in got] == [
+            ("DEPARTMENT OF DEFENSE SPECIFICATIONS", not group), (group or "DEPARTMENT OF DEFENSE SPECIFICATIONS",
+                                                                  False)], got
+    got = _documents(_DASH_HEAD + ["DEPARTMENT OF DEFENSE SPECIFICATIONS",
+                                   "MIL-PRF-38534 - Hybrid Microcircuits, General Specification for",
+                                   "OTHER GOVERNMENT DOCUMENTS, DRAWINGS, AND PUBLICATIONS",
+                                   "MIL-STD-1474E - Design Criteria Standard, Noise Limits"] + _REQUIREMENTS_TAIL)
+    assert [(g, n) for g, _s, n, _t, _p in got] == [("DEPARTMENT OF DEFENSE SPECIFICATIONS", "MIL-PRF-38534"),
+                                                    ("OTHER GOVERNMENT DOCUMENTS, DRAWINGS, AND PUBLICATIONS",
+                                                     "MIL-STD-1474E")], got
+
+
+def test_review3_a_centred_group_or_sub_title_in_a_list_on_tab_stops():
+    """Review 1.5.0 (round 3): in a list on tab stops, a centred group title ('STANDARDS') or sub-title ('Federal')
+    straight under an entry is not more of its title: the documents after it are filed under it."""
+    def centred(text):
+        return (int(935 - 7.5 * len(text)) - LEFT, text)
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Specifications, standards, and handbooks.", None,
+                      centred("SPECIFICATIONS"), _entry("MIL-E-5400T", "Electronic Equipment, Aerospace, General "
+                                                        "Specification for"),
+                      centred("STANDARDS"), _entry("MIL-STD-461G", "Requirements for the Control of EMI"),
+                      centred("Federal"), _entry("QQ-A-250/4", "Aluminum Alloy 2024, Plate and Sheet")]
+                     + _REQUIREMENTS_TAIL)
+    assert [(g, sub, n, t) for g, sub, n, t, _p in got] == [
+        ("SPECIFICATIONS", "", "MIL-E-5400T", "Electronic Equipment, Aerospace, General Specification for"),
+        ("STANDARDS", "", "MIL-STD-461G", "Requirements for the Control of EMI"),
+        ("STANDARDS", "Federal", "QQ-A-250/4", "Aluminum Alloy 2024, Plate and Sheet")], got
+
+
+def test_review3_version_words_without_a_comma_and_citations_of_an_entry_with_its_notice():
+    """Review 1.5.0 (round 3): a number after 'Revision', 'Version', 'Edition' or 'Release' is the document's version
+    also without a comma ('Ethernet Specification Revision 3.0'), not after 'Notice of Revision'; and a requirement
+    that cites 'MIL-STD-1553B' finds the entry 'MIL-STD-1553B Notice 4'."""
+    for text, title, paragraphs in [("IEEE 802.3 - Ethernet Specification Revision 3.0", "Ethernet Specification "
+                                     "Revision 3.0", ""),
+                                    ("ARINC 429 - Mark 33 Digital Information Transfer System Version 2.0",
+                                     "Mark 33 Digital Information Transfer System Version 2.0", ""),
+                                    ("IEC 60601-1 - Medical Electrical Equipment, General Requirements Ed. 3.1",
+                                     "Medical Electrical Equipment, General Requirements Ed. 3.1", ""),
+                                    ("DI-CMAN-80640 Notice of Revision 3.4", "Notice of Revision", "3.4")]:
+        e = se.parse_document_entry(text)
+        assert (e["title"], e["paragraphs"]) == (title, paragraphs), (text, e)
+    for doc_id in ("MIL-STD-1553B Notice 4", "MIL-STD-810H Change 1", "MIL-STD-461G Amendment 2", "MIL-STD-704F Rev F"):
+        assert se._document_base(doc_id) in ("MIL-STD-1553", "MIL-STD-810", "MIL-STD-461", "MIL-STD-704"), doc_id
+
+
+def test_review3_numbering_a_scan_starts_with_a_lost_parent_digit_or_an_appendix_misread():
+    """Review 1.5.0 (round 3): a scan that starts at 'REQUIREMENTS' (or 'SECTION 4' over it) then 4.1 holds section 4;
+    a misread last digit of a parent with sub-sections ('3.1.8 Ripple.' over 3.1.2.1) stands for that parent; and in
+    APPENDIX B, '8.3' as the last heading, '8.1' as the first, or two misreads in a row stay in the appendix - with no
+    '[heading not found in the scan]' in any of them."""
+    for rows in (["REQUIREMENTS", None, "4.1 General. The unit shall meet requirement 4.1.", None,
+                  "4.2 Power. The unit shall meet requirement 4.2."],
+                 ["SECTION 4", "REQUIREMENTS", None, "4.1 General. The unit shall meet requirement 4.1.", None,
+                  "4.2 Power. The unit shall meet requirement 4.2."],
+                 ["3. REQUIREMENTS", None, "3.1 Power.", None, "3.1.1 Input. The unit shall accept 28 V dc.", None,
+                  "3.1.8 Ripple.", None, "3.1.2.1 Low frequency. The ripple below 1 kHz shall be less than 1 V.", None,
+                  "3.1.2.2 High frequency. The ripple above 1 kHz shall be less than 0.1 V.", None,
+                  "3.1.3 Inrush. The inrush current shall be less than 10 A."],
+                 ["3. REQUIREMENTS", None, "3.1 Power. The unit shall accept 28 V.", None, "3.7 Cooling.", None,
+                  "3.2.1 Air flow. The unit shall be air cooled.", None, "3.2.2 Fans. The unit shall have two fans."],
+                 ["6. NOTES", None, "6.1 Intended use. The unit is used on ships.", None, "APPENDIX B", None,
+                  "B.1 Scope. This appendix covers the test set.", None, "B.2 Power. The test set shall accept 28 V.",
+                  None, "8.3 Cooling. The test set shall be air cooled."],
+                 ["6. NOTES", None, "6.1 Intended use. The unit is used on ships.", None, "APPENDIX B", None,
+                  "8.1 Scope. This appendix covers the test set.", None, "B.2 Power. The test set shall accept 28 V.",
+                  None, "B.3 Cooling. The test set shall be air cooled."],
+                 ["6. NOTES", None, "6.1 Intended use. The unit is used on ships.", None, "APPENDIX B", None,
+                  "B.1 Scope. This appendix covers the test set.", None, "B.2 Power. The test set shall accept 28 V.",
+                  None, "8.3 Cooling. The test set shall be air cooled.", None, "8.4 Weight. The test set shall weigh "
+                  "less than 5 kg.", None, "B.5 Size. The test set shall fit in a case."]):
+        doc, items, s = _outline_doc(rows)
+        assert not any(h.get("missing") for h in doc._outline), (rows[0], doc._outline)
+        assert not any("not found" in t for t in _doors_headings(doc, items, s)), rows[0]
+        assert all(h["type"] for h in doc._outline), (rows[0], doc._outline)
+
+
+def test_review3_more_titles_after_a_number():
+    """Review 1.5.0 (round 3): underlined titles of two words ending in a particle ('Power on', 'Data in', 'Stand by')
+    are titles; 'Except in' and 'Except as noted in' are not."""
+    ex = se.RequirementExtractor(settings())
+    for text, underlined, title in [
+            ("3.2.4  Power on  The unit shall complete its self test within 5 s.", "Power on", "Power on"),
+            ("3.2.5  Stand by  The unit shall draw less than 5 W.", "Stand by", "Stand by"),
+            ("3.2.6  Data in  The unit shall accept data.", "Data in", "Data in"),
+            ("3.2.7  Except in 3.2.9, the unit shall operate.", "Except in", ""),
+            ("3.2.8  Except as noted in 3.2.7, the unit shall operate.", "Except as noted in", "")]:
+        assert ex.parse_head(text, underlined)[1] == title, (text, ex.parse_head(text, underlined))
+
+
+def test_review3_a_heading_after_a_short_line_at_wider_spacing_and_titles_under_a_label():
+    """Review 1.5.0 (round 3): at 1.25 to 1.5 spacing, a paragraph whose full stop was lost on the scan does not run on
+    into the next section's heading ('3. REQUIREMENTS', 'APPENDIX A'); 'SECTION 3' over 'REQUIREMENTS' over '3.1 ...'
+    is a heading and a paragraph, and 'APPENDIX A' over a title of two lines is a heading and a sub-title."""
+    for pitch in (60, 66, 72):
+        for heading, number in (("3. REQUIREMENTS", "3"), ("APPENDIX A", "")):
+            rows = ["2. APPLICABLE DOCUMENTS", "2.2 Order of precedence. In the event of a conflict between the text of "
+                    "this document and the", "references cited herein, the text of this document takes precedence",
+                    heading, "3.1 General. The unit shall operate from 28 V dc." if number else
+                    "A.1 Scope. This appendix covers the test set."]
+            lines = [make_line(t, LEFT, 300 + k * pitch) for k, t in enumerate(rows)]
+            doc, _items, _s = _outline_doc_from_lines(lines)
+            got = [(h["number"], h["title"]) for h in doc._outline if h["level"] == 1]
+            assert got == [("2", "APPLICABLE DOCUMENTS"), (number, heading.split(". ")[-1])], (pitch, heading, got)
+    doc, items, s = _outline_doc(["SECTION 3", "REQUIREMENTS", "3.1 General. The unit shall operate from 28 V dc.", None,
+                                  "APPENDIX A", "INTERFACE CONTROL REQUIREMENTS", "FOR THE AIRBORNE RADAR SET", None,
+                                  "A.1 Scope. This appendix gives the interface requirements."])
+    assert [(h["level"], h["number"], h["kind"]) for h in doc._outline] == [
+        (1, "", "heading"), (2, "3.1", "heading"), (1, "", "heading"), (2, "", "subheading"), (2, "A.1", "heading")], \
+        doc._outline
+    assert texts(items) == ["The unit shall operate from 28 V dc."], texts(items)
+
+
+def test_review3_no_autocorrect_reports_a_repaired_keyword_in_quotes_once():
+    """Review 1.5.0 (round 3): with --no-autocorrect, a garbled keyword in quotes ('"sha11"') that the keyword repair
+    puts right is reported once, as repaired."""
+    _doc, items = run({1: make_lines(['3.5 Weight. The unit "sha11" weigh less than 5 kg.'])}, settings(autocorrect=False))
+    assert requirements(items)[0].review_reasons == ["OCR keyword repaired: 'sha11' -> 'shall'"], \
+        requirements(items)[0].review_reasons
+
+
+_GOV_HEAD = ["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents. The following documents form a part of this "
+             "specification to the extent", "specified herein.", None]
+
+
+def test_review3_titles_that_end_in_for_or_of_and_lead_ins_in_section_2_that_say_shall():
+    """Review 1.5.0 (round 3): MIL titles end in 'General Specification For', '..., Requirements for' or 'Methods of'
+    and are still whole entries; a section-2 lead-in may say 'shall' ('... shall apply ...:', MIL-STD-490's '... shall
+    be considered a superseding requirement.', also in capitals) and still be followed by its list; a dash entry
+    that ends in 'Requirements for' is followed by a group title."""
+    got = _documents(_GOV_HEAD + ["MIL-PRF-38534L, Hybrid Microcircuits, General Specification For",
+                                  "MIL-PRF-38535L, Integrated Circuits (Microcircuits) Manufacturing, General Specification For",
+                                  "MIL-P-116J, Preservation, Methods of", "MIL-STD-883K, Test Method Standard, Microcircuits"]
+                     + _REQUIREMENTS_TAIL)
+    assert [n for _g, _s, n, _t, _p in got] == ["MIL-PRF-38534L", "MIL-PRF-38535L", "MIL-P-116J", "MIL-STD-883K"], got
+    entries = ["MIL-E-5400T, Electronic Equipment, Aerospace, General Specification for",
+               "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference",
+               "MIL-STD-810H, Environmental Engineering Considerations and Laboratory Tests"]
+    for head in (["2.1 Government documents. The following documents shall apply to the extent specified herein:"],
+                 ["2.1 Government documents. The following documents of the exact issue shown form a part of this",
+                  "specification to the extent specified herein. In the event of conflict between the documents",
+                  "referenced herein and the contents of this specification, the contents of this specification",
+                  "shall be considered a superseding requirement."]):
+        for rows in (head + entries, [r.upper() for r in head + entries]):
+            got = _documents(["2. APPLICABLE DOCUMENTS", None] + rows + _REQUIREMENTS_TAIL)
+            assert [n for _g, _s, n, _t, _p in got] == ["MIL-E-5400T", "MIL-STD-461G", "MIL-STD-810H"], (rows, got)
+    got = _documents(_DASH_HEAD + ["DEPARTMENT OF DEFENSE SPECIFICATIONS",
+                                   "MIL-S-901D - Shock Tests, H.I. (High-Impact) Shipboard Machinery, Equipment, and "
+                                   "Systems, Requirements for", "DEPARTMENT OF DEFENSE STANDARDS",
+                                   "MIL-STD-1474E - Design Criteria Standard, Noise Limits"] + _REQUIREMENTS_TAIL)
+    assert [(g, n) for g, _s, n, _t, _p in got] == [("DEPARTMENT OF DEFENSE SPECIFICATIONS", "MIL-S-901D"),
+                                                    ("DEPARTMENT OF DEFENSE STANDARDS", "MIL-STD-1474E")], got
+
+
+def test_review3_running_text_outside_section_2_that_names_documents_stays_one_paragraph():
+    """Review 1.5.0 (round 3): outside section 2, a short line over a document number ('See also', '3.4 EMI.
+    Emission limits for the unit are'), a requirement's lead-in that says its standards 'shall be used', and a
+    paragraph at the top of a page that says 'shall ... IAW' over a document number are not lists of documents."""
+    for short in ("See also", "For wiring practices, consult", "Further guidance is available"):
+        doc, _items, _s = _outline_doc(["6. NOTES", None, "6.1 Intended use. The unit is intended for airborne use.",
+                                        None, short, "MIL-HDBK-454B, General Guidelines for Electronic Equipment.",
+                                        None, "6.2 Acquisition. None."])
+        assert any(b.text == f"{short} MIL-HDBK-454B, General Guidelines for Electronic Equipment." for b in doc.blocks), \
+            (short, [b.text for b in doc.blocks])
+    _doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.4 EMI. Emission limits for the unit are",
+                                      "MIL-STD-461G RE102 and CE102 for Navy aircraft, as tailored by Table I. The unit",
+                                      "shall be tested to these limits in the installed configuration."])})
+    assert [(it.doc_ref, it.text[:20]) for it in requirements(items)] == [("3.4", "The unit shall be te")], \
+        [(it.doc_ref, it.text) for it in requirements(items)]
+    doc, items, _s = _outline_doc(["3. REQUIREMENTS", None, "3.3 Test standards. The following standards shall be "
+                                   "used for qualification testing:",
+                                   "MIL-STD-461G CE102 Conducted Emissions, Power Leads",
+                                   "MIL-STD-461G RE102 Radiated Emissions, Electric Field", None,
+                                   "3.4 Weight. The unit shall weigh less than 5 kg."])
+    assert "RE102 Radiated Emissions" in " ".join(texts(items)) and doc._documents == [], (texts(items), doc._documents)
+    _doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.4 Electromagnetic interference. When installed in "
+                                      "Navy aircraft, the unit shall be tested IAW"], y0=1900),
+                       2: make_lines(["MIL-STD-461G RE102 and CE102 limits for Navy aircraft installations. When "
+                                      "installed in Army", "ground vehicles, the unit shall be tested for radiated and "
+                                      "conducted emissions IAW", "MIL-STD-461G RE102 and CE102 limits for Army ground "
+                                      "installations.", None, "3.5 Weight. The unit shall weigh no more than 5 kg."])})
+    assert find(items, "Army ground vehicles").text.endswith("IAW MIL-STD-461G RE102 and CE102 limits for Army ground "
+                                                             "installations."), texts(items)
+
+
+def test_review3_a_requirement_that_starts_with_an_id_or_a_document_number_keeps_its_list():
+    """Review 1.5.0 (round 3): a requirement whose lead-in starts with a requirement ID ('SYS-R-12 The radar shall
+    provide the following modes:') or a document number ('MIL-STD-810H Method 514.8 shall be applied ...:') still has
+    the unmarked, indented items under it as its list."""
+    _doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.2 Modes.", None,
+                                      "SYS-R-12 The radar shall provide the following modes:",
+                                      (100, "Long range search mode."), (100, "Track-while-scan mode."),
+                                      (100, "Built-in test mode."), None,
+                                      "SYS-R-13 The radar shall weigh no more than 50 kg."])})
+    assert len([t for t in texts(items) if "following modes" in t]) == 3, texts(items)
+    _doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.1 EMI.", None,
+                                      "MIL-STD-810H Method 514.8 shall be applied to the unit with the following test "
+                                      "conditions:", (90, "CE102, conducted emissions, power leads"),
+                                      (90, "RE102, radiated emissions, electric field"), None,
+                                      "3.2 Weight. The unit shall weigh less than 5 kg."])})
+    assert len([t for t in texts(items) if "test conditions" in t]) == 2, texts(items)
+
+
+def test_review3_group_titles_after_a_line_that_ran_to_the_margin():
+    """Review 1.5.0 (round 3): an issuer in capitals under a title in small letters is a group title ('UNDERWRITERS
+    LABORATORIES, INC. (UL)', 'NATIONAL AERONAUTICS AND SPACE ADMINISTRATION'); in a list typed in capitals, an issuer
+    or an issuer's sub-title ('MILITARY') is one, but a title's own last line is not ('SPECIFICATIONS AND STANDARDS'
+    after '... AND FEDERAL', 'PROGRAM (ASIP)', 'GOVERNMENT STORAGE FACILITIES' after '... AND U.S.', a line after
+    'PART 1:' or ';')."""
+    full = ("MIL-STD-810H - Environmental Engineering Considerations and Laboratory Tests for Aircraft Equipment, "
+            "Ground Support")
+    for issuer in ("UNDERWRITERS LABORATORIES, INC. (UL)", "ELECTRONIC INDUSTRIES ALLIANCE (EIA)",
+                   "NATIONAL AERONAUTICS AND SPACE ADMINISTRATION"):
+        got = _documents(_DASH_HEAD + ["DEPARTMENT OF DEFENSE STANDARDS", full, issuer,
+                                       "UL 94 - Tests for Flammability of Plastic Materials"] + _REQUIREMENTS_TAIL)
+        assert [g for g, _s, _n, _t, _p in got] == ["DEPARTMENT OF DEFENSE STANDARDS", issuer], (issuer, got)
+    for title, wrapped in [("SD-1 - STANDARDIZATION DIRECTORY, FSC AND AREA ASSIGNMENTS FOR DEPARTMENT OF DEFENSE AND "
+                            "FEDERAL", "SPECIFICATIONS AND STANDARDS"),
+                           ("MIL-STD-38784B - STANDARD PRACTICE FOR MANUALS, TECHNICAL: GENERAL STYLE AND FORMAT OF "
+                            "TECHNICAL", "MANUALS AND RELATED PUBLICATIONS"),
+                           ("MIL-STD-1530D - DEPARTMENT OF DEFENSE STANDARD PRACTICE: AIRCRAFT STRUCTURAL INTEGRITY "
+                            "OF ALL", "PROGRAM (ASIP)"),
+                           ("MIL-STD-130N - IDENTIFICATION MARKING OF U.S. MILITARY PROPERTY FOR SHIPMENT AND STORAGE "
+                            "AND U.S.", "GOVERNMENT STORAGE FACILITIES"),
+                           ("ANSI/EIA-649 - NATIONAL CONSENSUS STANDARD FOR CONFIGURATION MANAGEMENT OF SYSTEMS - PART "
+                            "1:", "CONFIGURATION MANAGEMENT PROCESS"),
+                           ("MIL-STD-1629A - PROCEDURES FOR PERFORMING A FAILURE MODE, EFFECTS AND CRITICALITY ANALYSIS;",
+                            "TASK DESCRIPTIONS")]:
+        got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS.", None,
+                          "DEPARTMENT OF DEFENSE STANDARDS", title, wrapped,
+                          "MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF EMI", None, "3. REQUIREMENTS", None,
+                          "3.1 GENERAL. THE UNIT SHALL MEET MIL-STD-461G."])
+        assert [(g, t.endswith(wrapped)) for g, _s, _n, t, _p in got] == [
+            ("DEPARTMENT OF DEFENSE STANDARDS", True), ("DEPARTMENT OF DEFENSE STANDARDS", False)], (wrapped, got)
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS.", None, "SPECIFICATIONS", None,
+                      "FEDERAL", "QQ-A-250/4 - ALUMINUM ALLOY 2024, PLATE AND SHEET",
+                      "TT-P-2760A - PRIMER COATING, POLYURETHANE, ELASTOMERIC, HIGH-SOLIDS, CORROSION RESISTANT, GRAY",
+                      "MILITARY", "MIL-E-5400T - ELECTRONIC EQUIPMENT, AEROSPACE, GENERAL SPECIFICATION FOR", None,
+                      "3. REQUIREMENTS", None, "3.1 GENERAL. THE UNIT SHALL MEET MIL-E-5400T."])
+    assert [(sub, n) for _g, sub, n, _t, _p in got] == [("FEDERAL", "QQ-A-250/4"), ("FEDERAL", "TT-P-2760A"),
+                                                        ("MILITARY", "MIL-E-5400T")], got
+
+
+def test_review3_where_a_document_entry_ends():
+    """Review 1.5.0 (round 3): a short note in brackets that is a sentence ends an entry, a bracket inside the title
+    does not ('(Bayonet, Threaded, and Breech Coupling), Environment ...'); a title may end '..., Volume 1.' or
+    'Rev. No.' with more of it on the next line; a title ending in 'Supplement' is followed by '3. REQUIREMENTS';
+    test methods indented under an entry ending in ':' are not its title; and 'MIL-STD-883K w/Change 2, ...' is an
+    entry of its own."""
+    got = _documents(_DASH_HEAD + ["DEPARTMENT OF DEFENSE STANDARDS",
+                                   "MIL-STD-461G - Requirements for the Control of Electromagnetic Interference "
+                                   "Characteristics", "of Subsystems and Equipment", "(Copies are available from ASSIST.)",
+                                   "MIL-DTL-38999L - Connectors, Electrical, Circular, Miniature, High Density, Quick "
+                                   "Disconnect", "(Bayonet, Threaded, and Breech Coupling), Environment Resistant, "
+                                   "Removable Crimp Contacts,", "General Specification for",
+                                   "MIL-HDBK-17-1F - Composite Materials Handbook, Volume 1.",
+                                   "Polymer Matrix Composites Guidelines for Characterization of Structural Materials",
+                                   "SAE AS5553 - Counterfeit Electronic Parts; Avoidance, Detection, Mitigation, Rev. No.",
+                                   "4 Disposition",
+                                   "48 CFR 252 - Defense Federal Acquisition Regulation Supplement"]
+                     + _REQUIREMENTS_TAIL)
+    assert [t.split()[-1] for _g, _s, _n, t, _p in got] == ["Equipment", "for", "Materials", "Disposition",
+                                                            "Supplement"], got
+    doc, _items, _s = _outline_doc(_DASH_HEAD + ["MIL-STD-810H - Environmental Engineering Considerations and "
+                                                 "Laboratory Tests:", (90, "Method 500.6 - Low Pressure (Altitude)"),
+                                                 (90, "Method 507.6 - Humidity"),
+                                                 "MIL-STD-461G - Requirements for the Control of EMI"] + _REQUIREMENTS_TAIL)
+    assert [e["title"] for e in doc._documents] == ["Environmental Engineering Considerations and Laboratory Tests",
+                                                    "Requirements for the Control of EMI"], doc._documents
+    assert any(h["number"] == "3" for h in doc._outline), doc._outline
+    got = _documents(_GOV_HEAD + ["MIL-STD-810H, Environmental Engineering Considerations and Laboratory Tests",
+                                  "MIL-STD-883K w/Change 2, Test Method Standard Microcircuits",
+                                  "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference"]
+                     + _REQUIREMENTS_TAIL)
+    assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-810H", "MIL-STD-883K w/Change 2", "MIL-STD-461G"], got
+
+
+def test_review3_more_layouts_on_tab_stops():
+    """Review 1.5.0 (round 3): on tab stops, a centred sub-title that starts near the title's tab stop ('Non-Government
+    publications') is a sub-title; a title wrapped with a hanging indent, or onto a line that starts with a bracket,
+    is one title."""
+    def centred(text):
+        return (int(935 - 7.5 * len(text)) - LEFT, text)
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Specifications, standards, and handbooks.", None,
+                      "STANDARDS", None, _entry("MIL-STD-461G", "Requirements for the Control of EMI"),
+                      centred("Non-Government publications"),
+                      _entry("ASTM D3951", "Standard Practice for Commercial Packaging"),
+                      _entry("MIL-E-5400T", "Electronic Equipment, Aerospace,"), [(388, "General Specification for")],
+                      _entry("MIL-DTL-38999L", "Connectors, Electrical, Circular, Miniature, High Density,"),
+                      [(300, "(Bayonet, Threaded, and Breech Coupling), Environment Resistant,")],
+                      [(300, "Removable Crimp Contacts, General Specification for")]] + _REQUIREMENTS_TAIL)
+    assert [(sub, n, t.split()[-1]) for _g, sub, n, t, _p in got] == [
+        ("", "MIL-STD-461G", "EMI"), ("Non-Government publications", "ASTM D3951", "Packaging"),
+        ("Non-Government publications", "MIL-E-5400T", "for"),
+        ("Non-Government publications", "MIL-DTL-38999L", "for")], got
+
+
+def test_review3_headings_after_text_whose_full_stop_was_lost():
+    """Review 1.5.0 (round 3): a paragraph whose full stop was lost does not run on into the next heading - '3.2
+    WEIGHT', '3. REQUIREMENTS', a misread '8. REQUIREMENTS', '5 DESIGN AND CONSTRUCTION' after 4.3, a title in capitals
+    under text in small letters - from single to 1.5 spacing; but a requirement typed in capitals keeps its last line
+    'DELIVERY.', and '... SEE' / 'APPENDIX A.' is a cross-reference, not an appendix."""
+    def outline_at(rows, pitch):
+        lines = [make_line(t, LEFT, 300 + k * pitch) for k, t in enumerate(rows) if t is not None]
+        return _outline_doc_from_lines(lines)
+    for pitch in (48, 60, 72):
+        for rows, heading in [
+                (["3. REQUIREMENTS", "3.1 POWER", "The unit shall operate from 28 V dc as specified in MIL-STD-704F and "
+                  "shall draw no more", "than 200 W in any operating mode", "3.2 WEIGHT",
+                  "The unit shall weigh no more than 20 kg."], "3.2"),
+                (["2. APPLICABLE DOCUMENTS", "2.2 ORDER OF PRECEDENCE", "In the event of a conflict between the text of "
+                  "this document and the references cited", "herein, the text of this document takes precedence",
+                  "3. REQUIREMENTS", "3.1 General. The unit shall operate from 28 V dc."], "3"),
+                (["2. APPLICABLE DOCUMENTS", "2.2 Order of precedence. In the event of a conflict between the text "
+                  "of this document and the", "references cited herein, the text of this document takes precedence",
+                  "8. REQUIREMENTS", "3.1 General. The unit shall operate from 28 V dc."], "8"),
+                (["4. VERIFICATION", "4.3 Inspection. The inspection shall show that the unit is free of defects that "
+                  "would impair its", "serviceability or appearance", "5 DESIGN AND CONSTRUCTION",
+                  "5.1 Materials. The materials shall be corrosion resistant."], "5")]:
+            doc, _items, _s = outline_at(rows, pitch)
+            assert heading in [h["number"] for h in doc._outline], (pitch, heading, doc._outline)
+    doc, items, _s = outline_at(["3. REQUIREMENTS", "3.1 Interfaces. The unit shall meet the interface control "
+                                 "document of the system", "for the aircraft installation", "ELECTRICAL INTERFACES",
+                                 "3.1.1 Power. The unit shall accept 28 V dc."], 60)
+    assert "ELECTRICAL INTERFACES" in [h["title"] for h in doc._outline], doc._outline
+    doc, items, _s = _outline_doc(["3. REQUIREMENTS", None,
+                                   "3.6 ACCEPTANCE. EACH UNIT SHALL PASS THE ACCEPTANCE TESTS OF 4.4",
+                                   "AND SHALL BE INSPECTED BY THE PROCURING ACTIVITY BEFORE", "DELIVERY.", None,
+                                   "3.7 WEIGHT. THE UNIT SHALL WEIGH NOT MORE THAN 5 KILOGRAMS WHEN FULLY ASSEMBLED."])
+    assert find(items, "ACCEPTANCE TESTS").text.endswith("BEFORE DELIVERY."), texts(items)
+    doc, items, _s = outline_at(["4. VERIFICATION", "4.5 TEST RECORDS. THE CONTRACTOR SHALL RECORD THE RESULTS OF EACH",
+                                 "TEST ON THE DATA SHEETS OF THE APPROVED TEST PROCEDURE; SEE", "APPENDIX A.", None,
+                                 "4.6 FAILURES. ANY FAILURE SHALL BE REPORTED TO THE PROCURING ACTIVITY."], 72)
+    assert not any("APPENDIX" in h["title"] for h in doc._outline), doc._outline
+    assert {h["type"] for h in doc._outline} == {"verification"}, doc._outline
+
+
+def test_review3_section_labels_appendix_titles_and_front_matter():
+    """Review 1.5.0 (round 3): 'SECTION 4' over 'QUALITY ASSURANCE PROVISIONS' with a blank line between gives section
+    4 its type; a caption or a sentence under 'APPENDIX A' is not part of its title; a list of acronyms before a lost
+    '1. SCOPE' does not hold section 1; and in APPENDIX D a 'D' read as '0' stays in the appendix."""
+    doc, _items, _s = _outline_doc(["3. REQUIREMENTS", None, "3.1 General. The unit shall meet requirement 3.1.", None,
+                                    (500, "SECTION 4"), None, (420, "QUALITY ASSURANCE PROVISIONS"), None,
+                                    "4.1 Responsibility for inspection. The unit shall meet requirement 4.1."])
+    assert {h["number"]: h["type"] for h in doc._outline}["4.1"] == "verification", doc._outline
+    doc, _items, _s = _outline_doc(["SECTION 3", None, "3. REQUIREMENTS", None, "3.1 General. The unit shall work."])
+    assert [(h["level"], h["number"]) for h in doc._outline if h["kind"] == "heading"] == [(1, "3"), (2, "3.1")], \
+        doc._outline
+    doc, _items, _s = _outline_doc(["6. NOTES", None, "6.1 Intended use. The unit is used on ships.", None,
+                                    "APPENDIX A", "FIGURE A-1. BLOCK DIAGRAM", None, "A.1 SCOPE", None,
+                                    "APPENDIX B", "THIS APPENDIX IS NOT A MANDATORY PART OF THIS SPECIFICATION.", None,
+                                    "B.1 SCOPE"])
+    assert [h["title"] for h in doc._outline if h["level"] == 1] == ["NOTES", "APPENDIX A", "APPENDIX B"], doc._outline
+    doc, items, s = _outline_doc(["FOREWORD", None, "This specification is approved for use by all departments.", None,
+                                  "LIST OF ACRONYMS", None, "AC     Alternating current", "DC     Direct current", None,
+                                  "1.1 Scope. This specification covers one radar.", None,
+                                  "1.2 Classification. The radar is of one type.", None,
+                                  "2. APPLICABLE DOCUMENTS", None, "2.1 General. The documents below apply."])
+    assert "1 [heading not found in the scan]" in _doors_headings(doc, items, s)
+    for rows in (["D.2 Power. The test set shall accept 28 V.", None, "0.3 Cooling. The test set shall be air cooled.",
+                  None, "The test set is described in the manual."],
+                 ["D.2 Power. The test set shall accept 28 V.", None, "0.3 Cooling. The test set shall be air cooled.",
+                  None, "0.4 Noise. The test set shall be quiet.", None, "D.5 Weight. The test set shall be light."]):
+        doc, items, s = _outline_doc(["6. NOTES", None, "6.1 Intended use. The unit is used on ships.", None,
+                                      "APPENDIX D", None, "D.1 Scope. This appendix covers the test set.", None] + rows)
+        assert not any(h.get("missing") for h in doc._outline), doc._outline
+
+
+def test_review3_titles_with_a_particle_and_sentence_lead_words():
+    """Review 1.5.0 (round 3): underlined titles of three words ending in a particle ('System power on', 'Weapon lock
+    on') are titles; underlined lead words of a sentence ('Based on', 'Depending on', 'Shown in') are not; and a
+    keyword in backticks that the keyword repair puts right is reported once."""
+    ex = se.RequirementExtractor(settings())
+    for text, underlined, title in [
+            ("3.2.1  System power on  The unit shall complete its self test within 5 s.", "System power on",
+             "System power on"),
+            ("3.2.2  Weapon lock on  The radar shall lock on within 2 s.", "Weapon lock on", "Weapon lock on"),
+            ("3.2.3  Depending on MIL-STD-1275, the unit shall ride through 50 ms drop-outs.", "Depending on", ""),
+            ("3.2.4  Shown in Figure 3, the connector shall be on the front panel.", "Shown in", ""),
+            ("3.2.6  Based on 3.2.4, the unit shall store its state.", "Based on", "")]:
+        assert ex.parse_head(text, underlined)[1] == title, (text, ex.parse_head(text, underlined))
+    _doc, items = run({1: make_lines(["3.5 Weight. The unit `sha11` weigh less than 5 kg."])}, settings(autocorrect=False))
+    assert not any("left as read" in r for r in requirements(items)[0].review_reasons), \
+        requirements(items)[0].review_reasons
+
+
+_THREE = ["MIL-STD-810H, Environmental Engineering Considerations and Laboratory Tests",
+          "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference",
+          "MIL-STD-704F, Aircraft Electric Power Characteristics"]
+
+
+def _pages(first: list, second: list) -> tuple:
+    """Two pages of rows through the tool: the first ending near the foot of its page."""
+    s = settings()
+    doc, items = run({1: make_lines(first, y0=1900), 2: make_lines(second)}, s)
+    se.build_outline(doc, se.RequirementExtractor(s))
+    se.read_document_lists(doc)
+    return doc, items
+
+
+def test_review3_lists_of_documents_in_any_section_that_holds_them_and_running_text_elsewhere():
+    """Review 1.5.0 (round 3): a single-spaced list is read in every section that holds one - '1.2 Applicable
+    documents', an appendix's '20. APPLICABLE DOCUMENTS', under an unnumbered lead-in that says 'shall be considered a
+    superseding requirement' (in small letters or capitals) - while in other sections the same kind of lines are
+    running text and stay in their paragraph: at the top of a page, after a quantity at the top of a page, and in an
+    appendix's test procedures."""
+    for rows in (["1. SCOPE", None, "1.1 Scope. This specification covers the radar receiver.", None,
+                  "1.2 Applicable documents.", None,
+                  "1.2.1 Government documents. The following documents form a part of this specification:"] + _THREE,
+                 ["APPENDIX A", None, "10. SCOPE", None, "10.1 Scope. This appendix covers the test set.", None,
+                  "20. APPLICABLE DOCUMENTS", None, "20.1 Government documents. The following documents form a part "
+                  "of this appendix to the extent specified herein:"] + _THREE,
+                 ["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None,
+                  "The following documents of the exact issue shown form a part of this specification to the extent",
+                  "specified herein. In the event of conflict between the documents referenced herein and the contents",
+                  "of this specification, the contents of this specification shall be considered a superseding "
+                  "requirement."] + _THREE):
+        for case in (rows, [r.upper() if r else r for r in rows]):
+            got = _documents(case + _REQUIREMENTS_TAIL)
+            assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-810H", "MIL-STD-461G", "MIL-STD-704F"], (case, got)
+    _doc, items = _pages(["3. REQUIREMENTS", None, "3.2 Start-up. The transponder shall be fully operational within"],
+                         ["2 seconds of the application of primary power, and shall comply with the following standards:",
+                          "MIL-STD-704F, Aircraft Electric Power Characteristics",
+                          "MIL-STD-1275E, Characteristics of 28 Volt DC Input Power", None,
+                          "3.3 Weight. The transponder shall weigh not more than 5.5 kg."])
+    assert "MIL-STD-1275E, Characteristics" in find(items, "fully operational").text, texts(items)
+    doc, _items = _pages(["6. NOTES", None, "6.1 Intended use. The unit is intended for airborne use and for the "
+                          "shipboard installations."], ["See also", "MIL-HDBK-454B, General Guidelines for Electronic "
+                                                        "Equipment.", None, "6.2 Acquisition. None."])
+    assert any(b.text.startswith("See also MIL-HDBK-454B") for b in doc.blocks), [b.text for b in doc.blocks]
+    doc, items, _s = _outline_doc(["6. NOTES", None, "6.1 Intended use. The radar is intended for aircraft.", None,
+                                   "APPENDIX A", None, "TEST PROCEDURES", None, "A.1 Scope. This appendix gives the "
+                                   "test procedures.", None, "A.2 Test methods. The qualification tests shall be "
+                                   "performed in accordance with the following standards:", _THREE[0], _THREE[1]])
+    assert find(items, "qualification tests").text.endswith("Control of Electromagnetic Interference"), texts(items)
+
+
+def test_review3_requirement_stems_and_items_that_name_standards():
+    """Review 1.5.0 (round 3): a short requirement stem typed in capitals keeps the standards under it; a requirement
+    with an ID under a dash-layout list is a requirement of its own; and in section 2 a paragraph that names test
+    methods ('MIL-STD-810H, Method 514.8 Vibration, ...') adds no documents."""
+    doc, items, _s = _outline_doc(["3. REQUIREMENTS", None, "3.3 EMI. THE UNIT SHALL MEET:",
+                                   "MIL-STD-461 Conducted Emissions, Power Leads",
+                                   "MIL-STD-461 Radiated Emissions, Electric Field",
+                                   "MIL-STD-461 Radiated Susceptibility, Electric Field", None,
+                                   "3.4 Weight. The unit shall weigh less than 5 kg."])
+    assert "Radiated Susceptibility" in " ".join(texts(items)) and doc._documents == [], texts(items)
+    _doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.4 Data bus. The transponder shall provide a data bus "
+                                      "interface in accordance with:",
+                                      "MIL-STD-1553B - Digital Time Division Command/Response Multiplex Data Bus",
+                                      "[SRS-0341] The transponder shall operate as a remote terminal on both buses.",
+                                      "[SRS-0342] The transponder shall respond to mode codes 0 through 8."])})
+    assert [it.doc_ref for it in requirements(items) if "remote terminal" in it.text] == ["SRS-0341"], \
+        [(it.doc_ref, it.text) for it in requirements(items)]
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Government documents.", None, _THREE[0], _THREE[1], None,
+                      "2.2 Tailoring. The test methods shall be tailored as given in appendix B. The methods to be used "
+                      "are:", "MIL-STD-810H, Method 514.8 Vibration, Procedure I, Category 24",
+                      "MIL-STD-810H, Method 516.8 Shock, Procedure I"] + _REQUIREMENTS_TAIL)
+    assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-810H", "MIL-STD-461G"], got
+
+
+def test_review3_more_document_titles_that_wrap():
+    """Review 1.5.0 (round 3): titles that wrap onto a date ('..., NOTICE 4,' / '15 JANUARY 1996'), after 'Part' onto
+    '1 General Requirements', after '... FORMAT OF' or '... OCCUPATIONAL' in capitals, onto a line in capitals under a
+    title in small letters ('COPPER OR COPPER ALLOY', 'JAN, JANTX, JANTXV, JANS'), or after '... CONTROL OF' on tab
+    stops in capitals, stay whole; a list of sub-parts under a title ending in ':' and a short note in brackets are
+    not more of the title."""
+    for title, wrapped in [("MIL-STD-1553B - DIGITAL TIME DIVISION COMMAND/RESPONSE MULTIPLEX DATA BUS, AIRCRAFT, NOTICE 4,",
+                            "15 JANUARY 1996"),
+                           ("MIL-STD-38784B - STANDARD PRACTICE FOR MANUALS, TECHNICAL: GENERAL STYLE AND FORMAT OF",
+                            "MILITARY TECHNICAL MANUALS AND RELATED PUBLICATIONS"),
+                           ("29 CFR 1910 - OCCUPATIONAL SAFETY AND HEALTH STANDARDS, U.S. DEPARTMENT OF LABOR, OCCUPATIONAL",
+                            "SAFETY AND HEALTH ADMINISTRATION")]:
+        got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS.", None,
+                          "DEPARTMENT OF DEFENSE STANDARDS", title, wrapped,
+                          "MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF EMI", None, "3. REQUIREMENTS", None,
+                          "3.1 GENERAL. THE UNIT SHALL MEET MIL-STD-461G."])
+        assert [(g, t.endswith(wrapped)) for g, _s, _n, t, _p in got] == [
+            ("DEPARTMENT OF DEFENSE STANDARDS", True), ("DEPARTMENT OF DEFENSE STANDARDS", False)], (wrapped, got)
+    for title, wrapped in [("IEC 61010-1 - Safety Requirements for Electrical Equipment for Measurement, Control, and "
+                            "Laboratory Use, Part", "1 General Requirements"),
+                           ("MIL-PRF-19500/116 - Semiconductor Device, Diode, Silicon, Switching, Types 1N4148-1 and "
+                            "1N4150-1", "JAN, JANTX, JANTXV, JANS")]:
+        got = _documents(_DASH_HEAD + ["DEPARTMENT OF DEFENSE STANDARDS", title, wrapped,
+                                       "IEC 60529 - Degrees of Protection Provided by Enclosures (IP Code)"]
+                         + _REQUIREMENTS_TAIL)
+        assert [(g, t.endswith(wrapped)) for g, _s, _n, t, _p in got] == [
+            ("DEPARTMENT OF DEFENSE STANDARDS", True), ("DEPARTMENT OF DEFENSE STANDARDS", False)], (wrapped, got)
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 Specifications, standards, and handbooks.", None,
+                      "SPECIFICATIONS", None, _entry("MIL-W-22759/16", "Wire, Electric, Fluoropolymer-Insulated"),
+                      [(300, "COPPER OR COPPER ALLOY")], _entry("MIL-STD-461G", "REQUIREMENTS FOR THE CONTROL OF"),
+                      [(300, "ELECTROMAGNETIC INTERFERENCE")], _entry("MIL-STD-704F", "Aircraft Electric Power")]
+                     + _REQUIREMENTS_TAIL)
+    assert [(g, t.split()[-1]) for g, _s, _n, t, _p in got] == [("SPECIFICATIONS", "ALLOY"),
+                                                                ("SPECIFICATIONS", "INTERFERENCE"),
+                                                                ("SPECIFICATIONS", "Power")], got
+    got = _documents(_DASH_HEAD + ["DEPARTMENT OF DEFENSE STANDARDS",
+                                   "MIL-STD-461G - Requirements for the Control of Electromagnetic Interference "
+                                   "Characteristics:", (90, "CE102 - Conducted Emissions, Radio Frequency Potentials"),
+                                   (90, "RE102 - Radiated Emissions, Electric Field"),
+                                   "MIL-STD-704F - Aircraft Electric Power Characteristics",
+                                   "(Copies are available from ASSIST)",
+                                   "MIL-STD-810H - Environmental Engineering Considerations and Laboratory Tests"]
+                     + _REQUIREMENTS_TAIL)
+    assert [t.split()[-1] for _g, _s, _n, t, _p in got] == ["Characteristics", "Characteristics", "Tests"], got
+
+
+def test_review3_cover_blocks_section_labels_and_more_headings():
+    """Review 1.5.0 (round 3): a cover's identifier block (number, date, SUPERSEDING, old number, old date) is one
+    paragraph, not dated headings; 'SECTION 1' over 'SCOPE' gives one heading for section 1; a scan that starts at
+    'REQUIREMENTS TRACEABILITY' then 5.1 needs no placeholder; '5 Design and construction' after a paragraph whose
+    full stop was lost, and 'QUALITY ASSURANCE PROVISIONS' under text in capitals, are headings; 'TABLE B-I. TEST
+    LEVELS' and a sentence without its full stop under 'APPENDIX C' are not part of the appendix's title."""
+    doc, items, s = _outline_doc([(1000, "MIL-PRF-12345B"), (1000, "1 June 2010"), (1000, "SUPERSEDING"),
+                                  (1000, "MIL-PRF-12345A"), (1000, "15 March 2005"), None, None,
+                                  "FOREWORD", None, "This specification is approved for use by all departments.", None,
+                                  "1. SCOPE", None, "1.1 Scope. This specification covers the radar."])
+    assert [h["title"] for h in doc._outline if h["level"] == 1] == ["FOREWORD", "SCOPE"], doc._outline
+    assert _doors_headings(doc, items, s)[:1] == ["1. SCOPE"], _doors_headings(doc, items, s)
+    doc, items, s = _outline_doc([(500, "SECTION 1"), None, (560, "SCOPE"), None,
+                                  "1.1 SCOPE. THIS SPECIFICATION COVERS ONE RADAR.", None, (500, "SECTION 2"), None,
+                                  (380, "APPLICABLE DOCUMENTS"), None, "2.1 GENERAL. THE DOCUMENTS BELOW APPLY."])
+    assert [h for h in _doors_headings(doc, items, s) if h.startswith(("SECTION", "SCOPE", "APPLICABLE"))] == \
+        ["SCOPE", "APPLICABLE DOCUMENTS"], _doors_headings(doc, items, s)
+    doc, items, s = _outline_doc(["REQUIREMENTS TRACEABILITY", None, "5.1 Traceability to system requirements. Table 5 "
+                                  "traces each requirement.", None, "6. NOTES", None, "6.1 Acronyms. None."])
+    assert not any(h.get("missing") for h in doc._outline), doc._outline
+    for rows, title in ((["4. VERIFICATION", "4.3 Inspection. The inspection shall show that the unit is free of defects "
+                          "that would impair its", "serviceability or appearance", "5 Design and construction",
+                          "5.1 Materials. The materials shall be as specified herein."], "Design and construction"),
+                        (["3. REQUIREMENTS", None, "3.1 GENERAL. THE TRANSPONDER SHALL MEET THE PERFORMANCE "
+                          "REQUIREMENTS OF THIS SPECIFICATION", "WHEN OPERATED FROM THE AIRCRAFT ELECTRICAL POWER SYSTEM",
+                          "QUALITY ASSURANCE PROVISIONS", None, "4.1 RESPONSIBILITY FOR INSPECTION. THE CONTRACTOR "
+                          "SHALL PERFORM ALL INSPECTIONS."], "QUALITY ASSURANCE PROVISIONS")):
+        doc, _items, _s = _outline_doc(rows)
+        assert title in [h["title"] for h in doc._outline], (title, doc._outline)
+    doc, _items, _s = _outline_doc(["6. NOTES", None, "6.1 Intended use. The radar is intended for aircraft.", None,
+                                    "APPENDIX B", "TABLE B-I. TEST LEVELS", None, "B.1 SCOPE", None,
+                                    "APPENDIX C", "THIS APPENDIX IS NOT A MANDATORY PART OF THE STANDARD", None,
+                                    "C.1 SCOPE"])
+    assert [h["title"] for h in doc._outline if h["level"] == 1] == ["NOTES", "APPENDIX B", "APPENDIX C"], doc._outline
+
+
+def test_review3_lead_words_of_a_sentence_that_end_in_a_particle():
+    """Review 1.5.0 (round 3): underlined lead words of a sentence that end in a particle ('Found in', 'Called out
+    in', 'Set forth in', 'Dependent on', 'Effective on', 'Once in') are not titles."""
+    ex = se.RequirementExtractor(settings())
+    for words, rest in [("Found in", "Table II are the limits the unit shall meet."),
+                        ("Called out in", "Table III are the test levels the unit shall pass."),
+                        ("Set forth in", "MIL-STD-1472 are the criteria the console shall meet."),
+                        ("Dependent on", "MIL-STD-704F power quality, the unit shall restart."),
+                        ("Effective on", "1 January 2027, the unit shall use the new code."),
+                        ("Once in", "Mode 2, the radar shall stay there.")]:
+        text = f"3.2.5  {words} {rest}"
+        assert ex.parse_head(text, words)[1] == "", (text, ex.parse_head(text, words))
+
+
+def test_review3_lists_under_a_requirement_lead_in_and_paragraphs_that_start_with_a_document_number():
+    """Review 1.5.0 (round 3): an indented list under a requirement's lead-in gives one row per item also when each
+    item starts with a document number ('MIL-STD-1553B Dual Redundant Data Bus', 'MIL-STD-461G, ...'), in section 3 or
+    4, at 1.5 spacing too, and under numbered items; a second paragraph that starts with a document number after a
+    short last line is a paragraph of its own; and document lines under a heading outside section 2 stay one per line."""
+    for lead, items in [("3.2 Interfaces. The radar set shall provide the following interfaces:",
+                         ["MIL-STD-1553B Dual Redundant Data Bus (two connectors)",
+                          "ARINC 429 Low Speed Data Bus (four channels)", "RS-422 Maintenance Port"]),
+                        ("3.2 Electromagnetic compatibility. The unit shall comply with the following standards:",
+                         ["MIL-STD-461G, Requirements for the Control of Electromagnetic Interference",
+                          "MIL-STD-464C, Electromagnetic Environmental Effects Requirements for Systems",
+                          "RTCA DO-160G, Environmental Conditions and Test Procedures for Airborne Equipment"])]:
+        for pitch in (48, 72):
+            rows = ["3. REQUIREMENTS", lead] + [(60, item) for item in items] + ["3.3 Weight. The unit shall weigh 5 kg."]
+            lines = [make_line(t if isinstance(t, str) else t[1], LEFT + (0 if isinstance(t, str) else t[0]),
+                               300 + k * pitch) for k, t in enumerate(rows)]
+            _doc, items_out = run({1: lines})
+            assert len([t for t in texts(items_out) if t.startswith(lead.split(". ", 1)[1])]) == 3, (pitch, texts(items_out))
+    _doc, items = run({1: make_lines(["3. REQUIREMENTS", None, "3.4 Compliance. The transponder shall meet the "
+                                      "following requirements:",
+                                      (60, "1.  The transponder shall comply with the following power standards:"),
+                                      (120, "MIL-STD-704F, Aircraft Electric Power Characteristics"),
+                                      (120, "MIL-STD-1275E, Characteristics of 28 Volt DC Input Power"),
+                                      (60, "2.  The transponder shall comply with the following EMI standards:"),
+                                      (120, "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference"),
+                                      (120, "MIL-STD-464C, Electromagnetic Environmental Effects Requirements"), None,
+                                      "3.5 Weight. The transponder shall weigh 5 kg."])})
+    assert len([t for t in texts(items) if "EMI standards" in t]) == 2, texts(items)
+    doc, _items, _s = _outline_doc(["3. REQUIREMENTS", None, "3.4 Power. The unit shall operate from 28 V dc power "
+                                    "supplied by the aircraft electrical system with a", "ripple of no more than 2 V.",
+                                    "MIL-STD-1275E, Characteristics of 28 Volt DC Input Power, applies to ground vehicle "
+                                    "installations; the", "unit shall meet its transient limits.", None,
+                                    "3.5 Weight. The unit shall weigh 5 kg."])
+    assert any(b.text.startswith("MIL-STD-1275E") for b in doc.blocks), [b.text for b in doc.blocks]
+    doc, _items, _s = _outline_doc(["3. REQUIREMENTS", "3.1 Interface standards", None, _THREE[1],
+                                    "MIL-STD-704F, Aircraft Electric Power Characteristics", _THREE[0]])
+    assert len([b for b in doc.blocks if b.text.startswith("MIL-STD-")]) == 3, [b.text for b in doc.blocks]
+    doc, _items, _s = _outline_doc(["MIL-STD-461G, Requirements for the Control of Electromagnetic Interference",
+                                    "MIL-STD-704F, Aircraft Electric Power Characteristics", _THREE[0], None,
+                                    "3. REQUIREMENTS", None, "3.1 General. The unit shall work."])
+    assert len([b for b in doc.blocks if b.text.startswith("MIL-STD-")]) == 3, [b.text for b in doc.blocks]
+
+
+def test_review3_section_2_of_another_kind_issuer_groups_and_titles_in_capitals_that_end_in_of():
+    """Review 1.5.0 (round 3): in a document whose section 2 holds requirements ('2. FUNCTIONAL REQUIREMENTS'), the
+    standards under a requirement stay in it; 'NAVAL SEA SYSTEMS COMMAND (NAVSEA)' after a line that ran to the margin
+    is a group; in capitals, '... INFORMATION TECHNOLOGY' / 'ASSOCIATION (GEIA)' is one title, and titles that end
+    'SELECTION AND USE OF' are entries of their own; a CFR range is a document."""
+    _doc, items = run({1: make_lines(["1. INTRODUCTION", None, "1.1 Purpose. This document gives the requirements.", None,
+                                      "2. FUNCTIONAL REQUIREMENTS", None, "2.1 Environmental. The transponder shall be "
+                                      "qualified in accordance with the following standards:", _THREE[0], _THREE[1], None,
+                                      "2.2 Weight. The transponder shall weigh 5 kg."])})
+    assert find(items, "qualified").text.endswith("Control of Electromagnetic Interference"), texts(items)
+    got = _documents(_DASH_HEAD + ["DEPARTMENT OF DEFENSE STANDARDS",
+                                   "MIL-STD-810H - Environmental Engineering Considerations and Laboratory Tests for "
+                                   "Aircraft, Missiles", "Equipment, Ground Support Equipment, Shipboard Equipment and "
+                                   "Ground Vehicle Mounted Systems", "NAVAL SEA SYSTEMS COMMAND (NAVSEA)",
+                                   "NAVSEA T9070-AL-DPC-020 - Shipboard Electrical Systems"] + _REQUIREMENTS_TAIL)
+    assert [g for g, _s, _n, _t, _p in got] == ["DEPARTMENT OF DEFENSE STANDARDS",
+                                                 "NAVAL SEA SYSTEMS COMMAND (NAVSEA)"], got
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS.", None,
+                      "DEPARTMENT OF DEFENSE STANDARDS",
+                      "EIA-632 - PROCESSES FOR ENGINEERING A SYSTEM, GOVERNMENT ELECTRONICS AND INFORMATION TECHNOLOGY",
+                      "ASSOCIATION (GEIA)", "MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF EMI", None,
+                      "3. REQUIREMENTS", None, "3.1 GENERAL. THE UNIT SHALL MEET MIL-STD-461G."])
+    assert [(g, t.endswith("(GEIA)")) for g, _s, _n, t, _p in got] == [
+        ("DEPARTMENT OF DEFENSE STANDARDS", True), ("DEPARTMENT OF DEFENSE STANDARDS", False)], got
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS. THE FOLLOWING DOCUMENTS FORM A PART OF "
+                      "THIS SPECIFICATION:", "MIL-STD-198E, CAPACITORS, SELECTION AND USE OF",
+                      "MIL-STD-199E, RESISTORS, SELECTION AND USE OF",
+                      "MIL-H-6875H, HEAT TREATMENT OF STEELS (AIRCRAFT PRACTICE), PROCESS FOR",
+                      "MIL-STD-454N, STANDARD GENERAL REQUIREMENTS FOR ELECTRONIC EQUIPMENT", None,
+                      "3. REQUIREMENTS", None, "3.1 GENERAL. THE UNIT SHALL MEET MIL-STD-454N."])
+    assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-198E", "MIL-STD-199E", "MIL-H-6875H", "MIL-STD-454N"], got
+    got = _documents(_GOV_HEAD + ["14 CFR 25.1301, Function and Installation",
+                                  "49 CFR 171-180, Hazardous Materials Regulations", _THREE[0]] + _REQUIREMENTS_TAIL)
+    assert [n for _g, _s, n, _t, _p in got] == ["14 CFR 25.1301", "49 CFR 171-180", "MIL-STD-810H"], got
+
+
+def test_review3_headings_without_their_full_stop_labels_with_point_0_and_contents_lines():
+    """Review 1.5.0 (round 3): '5 PACKAGING' after '... the part number', '5 Construction' after a paragraph whose full
+    stop was lost (also under an unnumbered paragraph) and a scan that starts at 'DEFINITIONS' then 3.1 are read as
+    their sections; 'SECTION 3.0' over '3.0 REQUIREMENTS' is only a label; and lines of a table of contents are not
+    headings."""
+    for rows, number in [(["4. VERIFICATION", None, "4.3 Marking inspection. Each radar set shall be examined for the "
+                           "marking of the nameplate, which", "shall show the manufacturer's name, the serial number and "
+                           "the part number", "5 PACKAGING", "5.1 Packaging. The unit shall be packed for shipment."], "5"),
+                         (["4. VERIFICATION", None, "4.3 Inspection", None, "The inspection shall show that the unit is "
+                           "free of defects that would impair its", "serviceability or appearance", "5 Construction",
+                           "5.1 Materials. The materials shall be as specified herein."], "5")]:
+        doc, _items, _s = _outline_doc(rows)
+        assert number in [h["number"] for h in doc._outline if not h.get("missing")], (rows[-2], doc._outline)
+    doc, _items, _s = _outline_doc(["DEFINITIONS", None, "3.1 Track. A track is a sequence of detections.", None,
+                                    "3.2 Plot. A plot is one detection.", None, "4. REQUIREMENTS", None,
+                                    "4.1 Range. The radar shall detect targets at 50 km."])
+    assert not any(h.get("missing") for h in doc._outline), doc._outline
+    doc, items, s = _outline_doc([(500, "SECTION 3.0"), None, "3.0 REQUIREMENTS", None, "3.1 General. The unit shall work."])
+    assert _doors_headings(doc, items, s) == ["3.0 REQUIREMENTS", "3.1 General"], _doors_headings(doc, items, s)
+    doc, _items, _s = _outline_doc([(560, "CONTENTS"), None, "1.     SCOPE ......................... 1",
+                                    "1.1    Scope ......................... 1", "2.     APPLICABLE DOCUMENTS .......... 2",
+                                    None, "1. SCOPE", None, "1.1 Scope. This specification covers the radar."])
+    assert [h["number"] for h in doc._outline if h["number"]] == ["1", "1.1"], doc._outline
+
+
+def test_review3_items_under_a_lead_in_that_start_with_a_document_number_and_run_over_two_lines():
+    """Review 1.5.0 (round 3): indented items under a requirement's lead-in are a row each also when they run over two
+    lines and say 'shall' there, when a title wraps onto a line of only 'for', and when they cite a test method
+    ('MIL-STD-810H Method 501.7 High Temperature, ...', 'RTCA DO-160G Section 16 ...')."""
+    for lead, items in [
+            ("3.3 EMC. The unit shall meet the following limits:",
+             [(90, "MIL-STD-461G, CE102 conducted emission limits for Navy aircraft, as tailored by table IV,"),
+              (90, "shall be met on all power leads of the unit, including the returns."),
+              (90, "MIL-STD-461G, RE102 radiated emission limits for Navy fixed-wing internal installations"),
+              (90, "shall be met with all of the units of the system operating together."),
+              (90, "MIL-STD-461G, RS103 radiated susceptibility limits of 200 V/m"),
+              (90, "shall be met in all modes.")]),
+            ("3.2 Design. The unit shall be designed and constructed in accordance with the following:",
+             [(90, "MIL-PRF-38534, Hybrid Microcircuits, General Specification"), (90, "for"),
+              (90, "MIL-PRF-38535, Integrated Circuits (Microcircuits) Manufacturing, General Specification"), (90, "for"),
+              (90, "MIL-PRF-19500, Semiconductor Devices, General Specification for")]),
+            ("4.3 Environmental tests. The following tests shall be performed on each unit:",
+             [(60, "MIL-STD-810H Method 501.7 High Temperature, Procedure II (Operation) at +71 degrees C"),
+              (60, "MIL-STD-810H Method 502.7 Low Temperature, Procedure II (Operation) at -40 degrees C"),
+              (60, "MIL-STD-810H Method 514.8 Vibration, Procedure I, Category 24 (General Minimum Integrity)")]),
+            ("4.3 Environmental qualification. The unit shall be qualified to the following:",
+             [(60, "RTCA DO-160G Section 16 Power Input (Category Z)"),
+              (60, "RTCA DO-160G Section 20 Radio Frequency Susceptibility (Category T)"),
+              (60, "RTCA DO-160G Section 21 Emission of Radio Frequency Energy (Category M)")])]:
+        section = "3. REQUIREMENTS" if lead.startswith("3") else "4. VERIFICATION"
+        _doc, items = run({1: make_lines([section, None, lead] + items + [None, "4.9 Records. Records shall be kept."])})
+        stem = lead.split(". ", 1)[1]
+        rows = [it for it in requirements(items) if it.text.startswith(stem)]
+        assert len(rows) == 3 and {it.doc_ref for it in rows} == {lead.split()[0]}, \
+            (lead, [(it.doc_ref, it.text) for it in requirements(items)])
+
+
+def test_review3_undotted_headings_and_section_2_titled_as_a_list():
+    """Review 1.5.0 (round 3): an undotted heading followed by its first sub-section is a heading also at the top of a
+    page and with a title of no known type ('5 Design and construction', '6 Production and acceptance', a MIL-STD-490
+    appendix's '20 CONSTRUCTION'); and a section 2 titled 'STANDARDS' or 'DOCUMENTS' holds a list of documents."""
+    doc, _items = _pages(["4. VERIFICATION", None, "4.1 General. Verification shall be by inspection.", None,
+                          "4.3 Inspection. The inspection shall show that the unit is free of defects that would impair "
+                          "its"], ["serviceability or appearance", "5 Design and construction",
+                                   "5.1 Materials. The materials shall be as specified herein.", None,
+                                   "5.2 Finish. The unit shall be painted."])
+    assert "Design and construction" in [h["title"] for h in doc._outline], doc._outline
+    for rows, title in [(["5 Requirements", "5.1 General. The unit shall be verified.",
+                          "5.2 Test report. The test report shall contain:", (60, "- test conditions"),
+                          (60, "- test results"), "6 Production and acceptance", "6.1 General. The unit shall be "
+                          "accepted."], "Production and acceptance"),
+                        (["APPENDIX I", "10 SCOPE", "10.1 Scope. This appendix covers the radar test set. The test set "
+                          "consists of:", (60, "- signal generator"), (60, "- power supply"), "20 CONSTRUCTION",
+                          "20.1 General. The test set shall be built to the drawings."], "CONSTRUCTION")]:
+        doc, _items, _s = _outline_doc(rows)
+        assert title in [h["title"] for h in doc._outline], (title, doc._outline)
+    for title in ("2. STANDARDS", "2. DOCUMENTS"):
+        got = _documents(["1. SCOPE", None, "1.1 Scope. This specification covers the radar receiver.", None, title, None,
+                          "The following documents form a part of this specification to the extent specified herein:"]
+                         + _THREE + _REQUIREMENTS_TAIL)
+        assert [n for _g, _s, n, _t, _p in got] == ["MIL-STD-810H", "MIL-STD-461G", "MIL-STD-704F"], (title, got)
+
+
+def test_review3_titles_in_capitals_that_end_in_for_or_of_above_more_title_or_a_group():
+    """Review 1.5.0 (round 3): in capitals, '... TEST METHODS FOR' / 'SEMICONDUCTOR DEVICES' is one title (on tab stops
+    and single-spaced), while '... INSTALLATION OF' or '... PROCESS FOR' with a centred group title right under it
+    ('STANDARDS', 'DEPARTMENT OF DEFENSE STANDARDS') ends there."""
+    def centred(text):
+        return (int(935 - 7.5 * len(text)) - LEFT, text)
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS.", None, centred("STANDARDS"),
+                      (60, "MILITARY"), _entry("MIL-STD-750F", "TEST METHODS FOR"), [(300, "SEMICONDUCTOR DEVICES")],
+                      _entry("MIL-STD-704F", "AIRCRAFT ELECTRIC POWER CHARACTERISTICS"), None, "3. REQUIREMENTS", None,
+                      "3.1 GENERAL. THE UNIT SHALL MEET MIL-STD-704F."])
+    assert [(g, sub, t) for g, sub, _n, t, _p in got] == [
+        ("STANDARDS", "MILITARY", "TEST METHODS FOR SEMICONDUCTOR DEVICES"),
+        ("STANDARDS", "MILITARY", "AIRCRAFT ELECTRIC POWER CHARACTERISTICS")], got
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS.", None, "DEPARTMENT OF DEFENSE STANDARDS",
+                      "MIL-STD-750F, TEST METHODS FOR", "SEMICONDUCTOR DEVICES",
+                      "MIL-STD-704F, AIRCRAFT ELECTRIC POWER CHARACTERISTICS", None, "3. REQUIREMENTS", None,
+                      "3.1 GENERAL. THE UNIT SHALL MEET MIL-STD-704F."])
+    assert [(g, t) for g, _s, _n, t, _p in got] == [
+        ("DEPARTMENT OF DEFENSE STANDARDS", "TEST METHODS FOR SEMICONDUCTOR DEVICES"),
+        ("DEPARTMENT OF DEFENSE STANDARDS", "AIRCRAFT ELECTRIC POWER CHARACTERISTICS")], got
+    got = _documents(["2. APPLICABLE DOCUMENTS", None, "2.1 GOVERNMENT DOCUMENTS.", None,
+                      centred("DEPARTMENT OF DEFENSE SPECIFICATIONS"),
+                      "MIL-W-5088 - WIRING, AERONAUTICAL, SELECTION AND INSTALLATION OF", centred("STANDARDS"),
+                      "MIL-STD-794F - PARTS AND EQUIPMENT, PROCEDURES FOR PACKAGING AND PACKING OF",
+                      "MIL-H-6875H - HEAT TREATMENT OF STEELS (AIRCRAFT PRACTICE), PROCESS FOR",
+                      centred("DEPARTMENT OF DEFENSE HANDBOOKS"), "MIL-HDBK-454B - GENERAL GUIDELINES FOR ELECTRONIC "
+                      "EQUIPMENT", None, "3. REQUIREMENTS", None, "3.1 GENERAL. THE UNIT SHALL MEET MIL-W-5088."])
+    assert [(g, t.split()[-1]) for g, _s, _n, t, _p in got] == [
+        ("DEPARTMENT OF DEFENSE SPECIFICATIONS", "OF"), ("STANDARDS", "OF"), ("STANDARDS", "FOR"),
+        ("DEPARTMENT OF DEFENSE HANDBOOKS", "EQUIPMENT")], got
 
 
 def test_the_commit_is_read_from_the_git_folder_also_after_git_gc():
