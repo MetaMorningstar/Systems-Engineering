@@ -1,4 +1,4 @@
-# Spec Extractor - the EXACT package versions this release was tested with (2026-09-17).
+# Spec Extractor - the EXACT package versions this release was tested with (2026-10-16).
 #
 # requirements.txt says WHICH packages the tool needs. This file fixes the VERSION of every package
 # that gets installed, so every computer gets the combination that passed both test levels

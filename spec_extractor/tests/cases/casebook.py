@@ -98,7 +98,9 @@ class PageDrawing(Flowable):
             y_top = b0 * sh.dpi                           # the band's top, in scan pixels
             for x, y, text, font, pt in sh.pieces:
                 size = pt * self.scale
-                face, ascent = ("Courier", 0.83) if font == "mono" else ("Times-Roman", 0.89)
+                face, ascent = ("Courier", 0.83) if font.startswith("mono") else ("Times-Roman", 0.89)
+                if font.endswith("-bold"):
+                    face = "Courier-Bold" if face == "Courier" else "Times-Bold"
                 c.setFont(face, size)
                 c.drawString(x * px, top - ((y - y_top) * px + ascent * size), text)   # (y: top of the text)
             c.setStrokeColor(colors.black)
@@ -152,6 +154,24 @@ def _rows_table(case, width: float) -> list:
     if extra:
         out.append(Spacer(1, 3))
         out.append(_p("Also expected: " + escape("; ".join(extra)) + ".", _SMALL))
+    # the headings of the Document Structure sheet and the documents of the Applicable Documents sheet, when checked
+    for rows, title, heads, widths in (
+            (case.outline, "The headings it must find (Document Structure sheet), in order",
+             ("Level", "Number and title"), (0.6 * inch, width - 0.6 * inch)),
+            (case.documents, "The documents it must list (Applicable Documents sheet), in order",
+             ("Document", "Title", "Paragraphs"), (1.4 * inch, width - 2.6 * inch, 1.2 * inch))):
+        if not rows:
+            continue
+        data = [[_p(f"<b>{h}</b>", _CELL) for h in heads]]
+        for row in rows:
+            cells = [c.strip() for c in row.split("|")] + [""] * len(heads)
+            data.append([_p(escape(c) or '<font color="#9a9a9a">(empty)</font>', _CELL) for c in cells[:len(heads)]])
+        t = Table(data, colWidths=list(widths), repeatRows=1)
+        t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#b5b5b5")),
+                               ("BACKGROUND", (0, 0), (-1, 0), LIGHT), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                               ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+        out += [Spacer(1, 6), _p(title, _LABEL), t]
     return out
 
 
@@ -289,7 +309,7 @@ def _appendices(width: float) -> list:
                            ("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5)]))
     docs = regression_documents()
     return [PageBreak(), _p("Appendix A - the fast rule tests", _H1),
-            _p(f"<font face='Courier'>python tests/test_rules.py</font> runs these {len(tests)} checks in seconds, "
+            _p(f"<font face='Courier'>python tests/test_rules.py</font> runs these {len(tests)} checks in a minute or two, "
                "without the OCR: each builds OCR lines with realistic page geometry and runs them through the same "
                "steps as a scanned page. They test one rule at a time; the cases in this catalog test the whole tool "
                "on real scans of whole pages.", _BODY), Spacer(1, 4), t,

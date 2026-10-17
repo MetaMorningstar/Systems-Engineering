@@ -14,16 +14,25 @@ WHAT IT DOES
      NO internet connection - the model files ship inside the pip package, and
      ONNX Runtime's usage telemetry is switched off (see section 1).
   4. Rebuilds the page layout: headings, paragraphs, lists, tables (cell by
-     cell), figures, captions, page headers/footers, in reading order.
+     cell), figures, captions, page headers/footers, in reading order. It sees
+     how text is printed (underlined, bold) and uses it: an underlined title,
+     a table's heading row. Columns with no heading row and no title are read
+     as a list. Look-alike misreads ("requ1red") are corrected where certain,
+     and every correction is shown.
   5. Finds Systems Engineering requirements written as paragraphs ("shall"
      statements), list items under a stem ("The system shall: a. ... b. ..."),
-     and rows of requirement tables. Also collects every table and caption.
+     and rows of requirement tables. Also collects every table and caption,
+     the document's sections by their paragraph numbers, and the documents
+     listed in section 2 (Applicable documents).
   6. Writes, for each input document:
        <name>_extracted.xlsx     one row per requirement, caption and table
-                                 (each table also gets its own worksheet)
+                                 (each table also gets its own worksheet),
+                                 the document's structure and its documents
        <name>_verification.docx  the document rebuilt page by page next to
                                  the scanned image, with words worth checking
                                  highlighted, to check nothing was missed
+       <name>_for_doors.docx     the document's own text only, in the form
+                                 IBM DOORS imports (README: "Importing into DOORS")
      plus ALL_DOCUMENTS_<date>.xlsx when more than one document is processed.
 
 QUICK START
@@ -38,7 +47,8 @@ QUICK START
          python spec_extractor.py "C:\\Scans\\MySpec.pdf"      (one file)
          python spec_extractor.py "C:\\Scans"                  (every file in a folder)
          python spec_extractor.py                             (opens a file picker)
-     Results appear in an "extraction_output" folder next to the input.
+     Results appear in a folder named after this version of the tool, next to
+     the input: "extraction_output_1.5.0" (see OUTPUT_FOLDER in section 2).
 
 USEFUL OPTIONS  (run  python spec_extractor.py --help  for the full list)
   -o / --output FOLDER      put results somewhere else
@@ -69,8 +79,9 @@ HOW TO CHECK THE RESULTS (recommended routine)
   * Open <name>_verification.docx. Each page shows the scan, then the text the
     tool read. Yellow highlight = a word worth checking against the scan (it
     failed a spelling / punctuation / look-alike check, or is a number the OCR
-    was unsure of); red = very unsure. Blue tags like [R-0012] show which
-    Excel row a sentence became.
+    was unsure of); red = very unsure; green = corrected by the tool (the Excel
+    column "OCR Corrections" says what was read). Blue tags like [R-0012] show
+    which Excel row a sentence became.
   * In <name>_extracted.xlsx filter "Needs Review" = Yes first. The
     "Review Reasons" column says why (suspect word or number, keyword that had
     to be repaired, text that continued across a page, list stem without items).
@@ -96,9 +107,11 @@ DESIGN NOTES (for maintainers)
     settings is fast. Delete the "_cache" folder (or use --no-cache) to force
     a fresh OCR. Editing the OCR/layout code (sections 3-6, 8) invalidates the
     cache automatically.
-  * Tests: tests/test_rules.py (seconds, layout + requirement rules) and
+  * Tests: tests/test_rules.py (seconds, layout + requirement rules),
     tests/run_regression.py (minutes, whole tool on synthetic aged scans with
-    exact ground truth). Run both after any change.
+    exact ground truth) and tests/cases/run_cases.py (the test-case library,
+    one situation per page). Run them after any change; tests/README.md says
+    how, and how to add a test of your own.
   * Verified configurations only: both test levels passed on 64-bit Python
     3.10 to 3.14 with the exact package versions in constraints.txt. Every run
     compares its own Python and package versions with that tested set and
@@ -107,13 +120,14 @@ DESIGN NOTES (for maintainers)
     maker supports it (Python 3.12 and older); 3.13 and 3.14 use the slower,
     equally accurate OCR-based orientation check.
 
-FILE LAYOUT OF THIS SCRIPT
-   1. Imports and dependency check          7. Document-level clean-up
+FILE LAYOUT OF THIS SCRIPT  (CODE_GUIDE.md explains each part and the steps of a run)
+   1. Imports and dependency check          7. Document-level clean-up, autocorrection
    2. Settings (defaults you can change)    8. Optional Docling engine
-   3. Data model                            9. Requirement / caption / table extraction
-   4. Loading pages from PDF / TIFF        10. Excel export
-   5. Image clean-up (preprocessing)       11. Word verification report
-   6. OCR + page layout analysis           12. Batch runner, caching, command line
+   3. Data model                            9. Requirement / caption / table extraction,
+   4. Loading pages from PDF / TIFF            9b the outline (sections), 9c lists of documents
+   5. Image clean-up (preprocessing)       10. Excel export
+   6. OCR + page layout analysis           11. Word verification report and DOORS document
+      (6b-2 underline/bold, 6c tables)     12. Batch runner, caching, command line
 """
 from __future__ import annotations
 
@@ -121,6 +135,7 @@ from __future__ import annotations
 # 1. IMPORTS AND DEPENDENCY CHECK
 # =============================================================================
 import argparse
+import contextlib
 import copy
 import dataclasses
 import datetime as _dt
@@ -133,18 +148,26 @@ import math
 import os
 import posixpath
 import re
+import shutil
 import statistics
 import sys
 import sysconfig
+import tempfile
 import time
 import traceback
 import unicodedata
 from collections import Counter, defaultdict, namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Iterator, NamedTuple, Optional
 
-__version__ = "1.4.0"
+# THE VERSION NUMBER. Raise it for every release and write the same number in the heading of README.md
+# ("> ## Version 1.5.0"): tests/test_rules.py checks that the two agree. It is printed by every run, written into
+# every report, names the output folder ("extraction_output_1.5.0", see OUTPUT_FOLDER) and is part of the OCR cache
+# key, so a new number makes the tool read each document again once. To mark a hand edit of your own, add to it,
+# e.g. "1.5.0-local.1" (letters, digits and . - + only). The build id printed beside it changes by itself whenever
+# this file changes (build_id) - it cannot be set by hand.
+__version__ = "1.5.0"
 
 
 @functools.lru_cache(maxsize=1)
@@ -160,21 +183,33 @@ def build_id() -> str:
         fingerprint = hashlib.sha1(Path(__file__).read_bytes()).hexdigest()[:7]
     except OSError:
         return "unknown"
-    commit = ""
-    try:                                   # read .git directly: no git command, no subprocess
-        head = (Path(__file__).resolve().parent.parent / ".git" / "HEAD").read_text(encoding="utf-8").strip()
-        if head.startswith("ref:"):
-            ref = Path(__file__).resolve().parent.parent / ".git" / head.split(" ", 1)[1].strip()
-            commit = ref.read_text(encoding="utf-8").strip()[:7] if ref.exists() else ""
-        else:
-            commit = head[:7]
-    except (OSError, IndexError):
-        commit = ""
+    commit = _git_commit(Path(__file__).resolve().parent.parent)
     return f"{fingerprint} commit {commit}" if commit else fingerprint
 
 
+def _git_commit(root: Path) -> str:
+    """The first 7 characters of the commit a git checkout at `root` is on, read straight from its .git folder (no
+    git command, no network): the branch named in .git/HEAD, in its own file or - after "git gc" - in
+    .git/packed-refs. "" when `root` is not a git checkout or the commit cannot be read."""
+    git = root / ".git"
+    try:
+        head = (git / "HEAD").read_text(encoding="utf-8").strip()
+        if not head.startswith("ref:"):
+            return head[:7]                       # a detached checkout: HEAD holds the commit itself
+        name = head.split(" ", 1)[1].strip()
+        if (git / name).exists():
+            return (git / name).read_text(encoding="utf-8").strip()[:7]
+        if (git / "packed-refs").exists():
+            for line in (git / "packed-refs").read_text(encoding="utf-8").splitlines():
+                if line.endswith(" " + name) and not line.startswith(("#", "^")):
+                    return line.split()[0][:7]
+    except (OSError, IndexError):
+        pass
+    return ""
+
+
 def version_line() -> str:
-    """'spec_extractor 1.4.0 (build a1b2c3d)' - the one string every report shows."""
+    """'spec_extractor 1.5.0 (build a1b2c3d)' - the one string every report shows."""
     return f"spec_extractor {__version__} (build {build_id()})"
 
 # The Python versions this release passed both test levels on (64-bit, standard build).
@@ -241,7 +276,7 @@ except ImportError:  # pragma: no cover
     _MISSING.append("openpyxl")
 try:
     import docx  # python-docx
-    from docx.enum.section import WD_ORIENT
+    from docx.enum.section import WD_ORIENT, WD_SECTION
     from docx.enum.style import WD_STYLE_TYPE
     from docx.enum.table import WD_TABLE_ALIGNMENT
     from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX, WD_LINE_SPACING
@@ -391,7 +426,7 @@ def configuration_status(docling_used: bool = False) -> tuple:
 class Settings:
     # ---- Input / output -----------------------------------------------------
     recursive: bool = False             # also look inside sub-folders
-    output_dir: Optional[Path] = None   # default: <input folder>/extraction_output
+    output_dir: Optional[Path] = None   # default: <input folder>/extraction_output_<version> (OUTPUT_FOLDER)
     page_selection: str = ""            # e.g. "1-3,7"; empty = all pages
     use_cache: bool = True              # reuse OCR results for unchanged files
 
@@ -419,7 +454,11 @@ class Settings:
     review_confidence: float = 0.70     # words below this OCR confidence are flagged "Needs Review"
     very_low_confidence: float = 0.50   # shown in red in the Word report
     english_text: bool = True           # documents are English: remove accent marks OCR adds (telémetry)
-    spell_check_flags: bool = True      # flag words missing from an English dictionary (never auto-corrects)
+    spell_check_flags: bool = True      # flag words missing from an English dictionary
+    # Undo the misreads that can be undone with confidence - a look-alike character ("requ1red" -> "required",
+    # "systern" -> "system", "1O0" -> "100"), a same-shape capital ("sCope"). Every correction stays visible: it is
+    # marked in the Word report and listed in the Excel column "OCR Corrections" (WordChecker.correct, section 7).
+    autocorrect: bool = True
     # your program's own words that the dictionary check should accept, e.g. {"xr7", "radome"}
     extra_dictionary_words: set = field(default_factory=set)
     ocr_threads: int = 0                # 0 = let ONNX Runtime decide
@@ -463,6 +502,9 @@ class Settings:
     # ---- Outputs ----------------------------------------------------------------------
     make_excel: bool = True
     make_word_report: bool = True
+    # <name>_for_doors.docx: the document's own text and structure only, for importing into DOORS (also switched
+    # off with  make_doors_document = no  in the style file, or --no-doors)
+    make_doors_document: bool = True
     word_page_images: bool = True       # put the scanned page image in the Word report
     word_image_dpi: int = 110           # resolution of those images (file size vs. clarity)
     # How the Word report LOOKS - fonts, sizes, spacing, page layout and your own Word template - is set in
@@ -489,6 +531,9 @@ class Settings:
 
 
 CACHE_FORMAT = "spec-extractor-cache-v1"
+# The results folder made next to the input documents when no -o / --output is given. It carries the version
+# number, so the results of two versions of the tool never mix and a folder always says which version made it.
+OUTPUT_FOLDER = "extraction_output_" + re.sub(r"[^0-9A-Za-z.+-]", "_", __version__)   # (safe in a folder name)
 
 
 def _cached_code_hash() -> str:
@@ -497,15 +542,17 @@ def _cached_code_hash() -> str:
     automatically; changes to the requirement rules and exports (sections 7, 9-12) reuse the OCR cache."""
     try:
         src = Path(__file__).read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
-        def banner(title):                # position of a section title line (not this function's text)
-            return re.search(r"^# " + re.escape(title), src, re.M).start()
-
+    def banner(title):                    # position of a section title line (not this function's text)
+        return re.search(r"^# " + re.escape(title), src, re.M).start()
+    try:
         cached = src[banner("3. DATA MODEL"):banner("7. DOCUMENT-LEVEL CLEAN-UP")]
         cached += src[banner("8. OPTIONAL ENGINE: DOCLING"):banner("9. REQUIREMENT / CAPTION / TABLE EXTRACTION")]
         return hashlib.sha1(cached.encode("utf-8")).hexdigest()[:8]
-    except (OSError, AttributeError):
-        return ""
+    except AttributeError:                # a section title above was renamed: then ANY edit reads documents again,
+        return "f" + hashlib.sha1(src.encode("utf-8")).hexdigest()[:7]   # rather than none
 SUPPORTED_EXTENSIONS = {".pdf", ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 
 
@@ -542,6 +589,7 @@ class Word:
     text: str
     conf: float
     box: Box
+    underline: bool = False     # printed with a line under it (measured on the page image, see 6b-2)
 
 
 @dataclass
@@ -551,6 +599,9 @@ class Line:
     conf: float
     box: Box
     words: list = field(default_factory=list)   # list[Word]
+    # how heavy its strokes are, against the ordinary text of its page (1.0 = as heavy; bold text is about
+    # 1.2 to 1.5; 0 = not measured). See 6b-2.
+    weight: float = 0.0
 
     @property
     def height(self) -> float:
@@ -572,6 +623,9 @@ class TableData:
     cell_boxes: list = field(default_factory=list)  # list[list[Box]] (may be empty)
     continued_pages: list = field(default_factory=list)  # extra pages merged into this table
     cell_words: list = field(default_factory=list)  # list[list[list[[word, confidence]]]] (may be empty)
+    # How the heading row(s) are set apart from the rest - "bold", "underlined", "capitals", "shaded", "rule
+    # under it" - or "" when they look like every other row (then header_rows is 0: no heading row). See 6c.
+    header_format: str = ""
 
     @property
     def n_rows(self) -> int:
@@ -649,6 +703,7 @@ class DocResult:
     warnings: list = field(default_factory=list)
     seconds: float = 0.0
     cache_dir: str = ""
+    page_count: int = 0                          # pages in the file (only some may have been read: --pages)
 
     # ---- JSON round trip (for the OCR cache) --------------------------------------
     def to_json(self) -> dict:
@@ -657,7 +712,9 @@ class DocResult:
     @staticmethod
     def from_json(d: dict) -> "DocResult":
         def line(ld):
-            return Line(ld["text"], ld["conf"], tuple(ld["box"]), [Word(w["text"], w["conf"], tuple(w["box"])) for w in ld["words"]])
+            return Line(ld["text"], ld["conf"], tuple(ld["box"]),
+                        [Word(w["text"], w["conf"], tuple(w["box"]), bool(w.get("underline", False))) for w in ld["words"]],
+                        float(ld.get("weight", 0.0)))
 
         blocks = []
         for b in d["blocks"]:
@@ -666,13 +723,15 @@ class DocResult:
             if t:
                 table = TableData(grid=t["grid"], conf=t["conf"], merges=[tuple(m) for m in t["merges"]],
                                   header_rows=t["header_rows"], cell_boxes=t.get("cell_boxes", []),
-                                  continued_pages=t.get("continued_pages", []), cell_words=t.get("cell_words", []))
+                                  continued_pages=t.get("continued_pages", []), cell_words=t.get("cell_words", []),
+                                  header_format=t.get("header_format", ""))
             blocks.append(Block(kind=b["kind"], page=b["page"], box=tuple(b["box"]),
                                 lines=[line(ld) for ld in b["lines"]], text=b["text"], table=table,
                                 meta=b["meta"], uid=b["uid"], pages=b.get("pages", [])))
         pages = [PageInfo(**p) for p in d["pages"]]
         return DocResult(source=d["source"], engine=d["engine"], pages=pages, blocks=blocks,
-                         warnings=d.get("warnings", []), seconds=d.get("seconds", 0.0), cache_dir=d.get("cache_dir", ""))
+                         warnings=d.get("warnings", []), seconds=d.get("seconds", 0.0), cache_dir=d.get("cache_dir", ""),
+                         page_count=int(d.get("page_count", 0)))
 
 
 @dataclass
@@ -695,6 +754,7 @@ class ExtractedItem:
     ocr_conf: Optional[float] = None
     review_reasons: list = field(default_factory=list)
     quality_notes: list = field(default_factory=list)
+    corrections: list = field(default_factory=list)    # misreads the tool corrected: ["'requ1red' -> 'required'"]
     table: Optional[TableData] = None
     block_uids: list = field(default_factory=list)
     item_id: str = ""
@@ -1242,6 +1302,48 @@ RE_CONTINUED = re.compile(r"\(?\s*(?:continued|cont'?d\.?|concluded)\s*\)?\s*\.?
 _ID_STOP = (r"(?:MIL|DOD|DI|NPR|NPD|NASA|ISO|IEC|IEEE|SAE|ASTM|ANSI|RTCA|STANAG|FED|JSSG|ECSS|AES|SHA|RS|DO|AS|MS|"
             r"NAS|ARINC|TIA|EIA|UL|NFPA|CFR|FAR|DFARS|IPC|ASME|AWG|UTC|GMT|CAGE|NSN|DTL|PRF-\d{5,}|TB[DRSC])")
 RE_REQ_ID = r"(?!" + _ID_STOP + r"[-_ ])[A-Z][A-Z0-9]{0,9}(?:[-_.][A-Z0-9]{1,9}){0,3}[-_.]?\d{1,6}[a-z]?"
+# The number of a standard, specification or other document, as section 2 of a specification lists them
+# ("MIL-STD-461G  Requirements for the Control of ...  3.2.5"): military (MIL-STD-461G, MIL-PRF-19500/543, MIL-E-5400T,
+# DOD-STD-2167A, DoDI 5000.02, DI-MISC-80508, JSSG-2001B), federal (FED-STD-595C, QQ-A-250/4, TT-P-2760, A-A-59588),
+# NASA, industry (SAE AS50881, AS9100, ARP4754, NAS1802, ANSI/EIA-649, EIA-STD-..., IEEE Std 1394, ISO 9001:2015,
+# IEC 60068-2-1, ASTM D3951, ASME Y14.5, IPC-A-610, RTCA DO-160G, ARINC 429, STANAG 4370) and service publications
+# (TM 9-1234-200-10, AFI 63-101, OPNAVINST 5100.23). See section 9c for how document lists are read.
+_DOC_TRAILER = (r"(?:\([A-Z0-9]{1,8}\))?(?:\s*(?:w/|W/|with\s+)?(?:INT\.\s*)?(?:CHANGE|CHG|AMENDMENT|AMEND|AMD|NOTICE|"
+                r"SUPPLEMENT|SUPP)[\s.-]*\d{1,2}[A-Z]?)*")
+RE_DOC_ID = re.compile(
+    r"(?:(?:MIL|DOD|DoD)-(?:STD|HDBK|PRF|DTL|SPEC)-\d{1,6}(?:-\d{1,3}){0,2}(?:/\d{1,4})?[A-Z]{0,2}"
+    r"|(?:MIL|DOD)-[A-Z]{1,2}-\d{1,6}(?:/\d{1,4})?[A-Z]{0,2}"               # MIL-E-5400T, MIL-W-22759/16
+    r"|FED-STD-[A-Z]?\d{1,4}[A-Z]?(?:/\d{1,3}[A-Z]?)?|FIPS(?:\s?PUB)?\s?\d{1,3}(?:-\d)?"
+    r"|AMS-(?:STD-\d{1,5}|[A-Z]{1,3}-[A-Z]-\d{1,6}|[A-Z]-\d{1,6})(?:/\d{1,4})?[A-Z]?"
+    r"|A-A-\d{1,5}(?:/\d{1,4})?[A-Z]?|[A-Z]{1,3}-[A-Z]-[1-9]\d{0,6}(?:/\d{1,4})?[A-Z]?"   # CID; federal QQ-A-250/4
+    # (not zero-padded: "SYS-R-001", "SSS-F-010" are requirement IDs)
+    r"|(?:NASA|MSFC|KSC|JSC|GSFC|NAVSEA|NAVAIR)-(?:STD|HDBK|SPEC)-\d{3,5}(?:\.\d{1,2})?[A-Z]?|NPR\s\d{4}\.\d{1,2}[A-Z]?"
+    r"|JSSG-\d{4}[A-Z]?|SD-\d{1,2}|Q[PM]L-\d{3,6}(?:-\d{1,3})?"
+    r"|(?:DI|UDI)-(?:[A-Z]{4}|[A-Z]{1,2})-\d{3,5}[A-Z]?"
+    r"|DoD[DIM]\s?\d{4}\.\d{2}(?:-V\d{1,2})?|DoD\s(?:Directive|Instruction|Manual)\s\d{4}\.\d{2}|DoD\s\d{4}\.\d{1,2}-[MR]"
+    r"|STANAG\s?\d{4}(?:\s?(?:Ed(?:ition|\.)?|ED)\s?\d{1,2})?|A[A-Z]{1,4}P-\d{1,4}(?:\.\d{1,3})*"
+    r"|(?:RTCA[/ ])?DO-\d{3}[A-Z]?|EUROCAE\sED-\d{2,3}[A-Z]?|ARINC\s\d{3}[A-Z]?"
+    r"|(?:SAE\s)?(?:AS|ARP|AIR|AMS)\s?\d{3,5}[A-Z]?(?:/\d{1,3}[A-Z]?)?|SAE\sJ\d{3,4}(?:/\d{1,2})?"
+    r"|(?:MS\s?\d{4,6}|AN\s?\d{3,6}|AND\d{4,5}|NASM?\s?\d{2,5}|NA\d{4})(?:-?[A-Z0-9]{1,8})?"
+    r"|(?:ANSI/)?(?:SAE\s)?(?:EIA|GEIA|TIA|ECA|JEDEC)(?:/[A-Z]{2,4})?[- ](?:STD-|HB-|IS-)?\d{1,5}(?:-?[A-Z])?(?:-\d{1,4}[A-Z]?)*"
+    r"|JESD\d{1,4}[A-Z]?(?:-[A-Z]?\d{1,4}[A-Z]?)?"
+    r"|(?:ANSI/)?IEEE(?:/(?:ASTM|IEC|ISO|ANSI))?\s(?:Std\.?\s)?(?:SI\s?10|C?\d{1,5}(?:\.\d{1,3})*[a-z]?)(?:-\d{4})?"
+    r"|(?:(?:BS|DIN|NF|UNE|ANSI)\s)?(?:EN\s)?(?:ISO|IEC)(?:/(?:IEC|IEEE|ISO|TS|TR|PAS|ASTM|DIS|FDIS))*\s\d{1,5}(?:-\d{1,3})*"
+    r"(?::\d{4})?"
+    r"|ASTM\s?[A-GZ]\s?\d{1,5}M?(?:/[A-GZ]\s?\d{1,5}M)?(?:\s?-\s?\d{2}[a-d]?)?"
+    r"|ASME\s(?:Y|B|NQA|BPVC|PTC)[\s.-]?\d{1,3}(?:\.\d{1,3})*M?(?:-\d{4})?"
+    r"|ANSI(?:/[A-Z]{2,6})*\s[A-Z]{0,2}\d{1,4}(?:\.\d{1,4})*M?(?:-\d{4})?"
+    r"|(?:IPC[/ ])?J-STD-\d{3}[A-Z]?|IPC(?:/WHMA)?-[A-Z]{0,2}-?\d{2,4}[A-Z]?"
+    r"|DEF\s?STAN\s?\d{2}-\d{1,4}(?:\s?(?:Part|Pt)\s?\d{1,3})?|NEMA\s[A-Z]{0,3}\s?\d{1,4}|UL\s\d{2,4}[A-Z]?"
+    r"|TM\s?\d{1,2}-\d{4}-\d{3}-\d{2}(?:&P)?|T\.?O\.?\s\d{1,2}[A-Z0-9]{0,4}(?:-[A-Z0-9]{1,6})+"
+    r"|(?:AR|DA\sPAM)\s\d{2,3}-\d{1,3}(?:-\d{1,3})?|AF(?:I|MAN|PD)\s\d{2}-\d{3,4}"
+    r"|(?:OPNAV|SECNAV|NAVSEA|NAVAIR)INST\s\d{4,5}\.\d{1,3}[A-Z]?|NAVSEA\s[ST]\d{4}-[A-Z0-9-]{4,20}|NAVAIR\s\d{2}-[0-9A-Z-]{3,20}"
+    r"|\d{1,2}\s?CFR\s?(?:Parts?\s)?\d{1,4}(?:\.\d{1,4})?(?:-\d{1,4})?"
+    r"|(?:(?:NAVAIR|NAVSEA|NAVSHIPS|USAF|ARMY|Army)\s)?(?:DWG|Dwg\.?|DRAWING|Drawing)\s?(?:NO\.?|No\.?|Number)?\s?"
+    r"(?=[A-Z0-9-]*\d)[A-Z0-9](?:[A-Z0-9-]{0,24}[A-Z0-9])?)" + _DOC_TRAILER)
+RE_DOC_ID_START = re.compile(r"^\s*(?:" + RE_DOC_ID.pattern + r")(?![\w/-])")
+
+
 RE_LEADING_ID = re.compile(r"^\s*[\[(]?(?P<id>" + RE_REQ_ID + r")[\])]?\s*(?:[:.\-–—]\s*|\s+)(?P<rest>\S.*)$", re.S)
 RE_TRAILING_ID = re.compile(r"\s*[\[(](?P<id>" + RE_REQ_ID + r")[\])]\s*\.?$")
 RE_ID_CELL = re.compile(r"^\s*[\[(]?(?:" + RE_REQ_ID + r"|(?:\d{1,2}(?:\.\d{1,3}){1,7}\.?)|[A-Z]{1,4}-?\d{1,4}[a-z]?)[\])]?\s*$")
@@ -1265,6 +1367,12 @@ LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl",
 def clean_para_number(num: str) -> str:
     """'3.2.i.4' -> '3.2.1.4' (a letter l/I/i/| inside a paragraph number is a misread 1)."""
     return re.sub(r"(?<=\.)[lIi|](?=\.|$)", "1", num)
+
+
+def _number_text(parts) -> str:
+    """(3, 2, 1) -> '3.2.1'; (-1, 2) -> 'A.2' (an appendix letter, see _number_parts)."""
+    head = chr(ord("A") - parts[0] - 1) if parts[0] < 0 else str(parts[0])
+    return ".".join([head] + [str(x) for x in parts[1:]])
 
 
 def _number_parts(number: str):
@@ -1462,11 +1570,134 @@ def _estimate_word_boxes(text: str, box: Box, conf: float) -> list:
     return words
 
 
+# ---- 6b-2. How the text is printed: underlined and bold ------------------------------------------
+# The OCR returns the letters only. How a line is printed also says what it is: typewritten specifications
+# underline their paragraph titles ("3.2.1  Power input.  The equipment shall ...") and the headings of their
+# tables and document lists, and many documents print headings and table heading rows in bold. Both are
+# measured here on the cleaned page image, once per page, and kept on the words (Word.underline) and lines
+# (Line.weight). Tested on typewriter and proportional print, clean, photocopied and faxed: an underline is
+# found reliably; boldness is only clear for a whole line (single words vary too much), so it is used together
+# with other signs, never on its own to change what a block is.
+def _ink_mask(gray: "np.ndarray", dpi: float) -> "np.ndarray":
+    """1 where there is ink. A local threshold, so faded print and uneven paper are handled alike."""
+    return cv2.adaptiveThreshold(gray, 1, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, _odd(0.14 * dpi), 15)
+
+
+def _ink_runs(row: "np.ndarray") -> list:
+    """[(start, end)] of the runs of ink in one row of a 0/1 mask."""
+    edges = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
+    return list(zip(np.nonzero(edges == 1)[0].tolist(), np.nonzero(edges == -1)[0].tolist()))
+
+
+def _strokes_under(ink: "np.ndarray", box: Box) -> list:
+    """[(y, x0, x1)] horizontal strokes at least a line high long in the lower part of the letters of a line, or
+    just below them: where an underline is printed. (Letters themselves never make a run that long - there are
+    gaps between them - and only rows at the foot of the letters or under them count, so a line struck through
+    the letters is not one.)"""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    h = max(6, y1 - y0)
+    ya, yb = max(0, y0), min(ink.shape[0], int(y1 + 0.6 * h))
+    xa, xb = max(0, x0 - 2 * h), min(ink.shape[1], x1 + 2 * h)
+    if yb - ya < 3 or xb - xa < 3 or x1 <= x0:
+        return []
+    sub = ink[ya:yb, xa:xb]
+    closed = cv2.morphologyEx(sub, cv2.MORPH_CLOSE, np.ones((1, 3), np.uint8))   # (bridges a 1-2 pixel break)
+    strokes = [(r, a + xa, b + xa) for r in range(closed.shape[0]) for a, b in _ink_runs(closed[r]) if b - a >= h]
+    if not strokes:
+        return []
+    stroke_rows = {r for r, _a, _b in strokes}
+    # the letters of THIS line (the band below it may already reach the next line's letters)
+    profile = sub[:max(1, y1 - ya), max(0, x0 - xa):max(1, x1 - xa)].sum(axis=1)
+    if profile.max() <= 0:
+        return []
+    letters = [r for r in np.nonzero(profile >= 0.25 * profile.max())[0].tolist() if r not in stroke_rows]
+    if not letters:
+        return []                                       # nothing but a line: a rule or a row of underscores
+    top, base = min(letters), max(letters)
+    out = []
+    for r, a, b in strokes:
+        if r < base - 0.12 * (base - top) or r > base + max(4, 0.6 * (base - top)):
+            continue        # in the letters (a strike-through, half way up the small letters), or as far down as the next line
+        # A printed underline is set off from the letters by a sliver of paper; the feet of serif letters on a faint
+        # copy can join into one long row of ink ON the baseline, which is not an underline. So the stroke's own
+        # band (it may be several rows thick) must have, just above it, a row with little ink along its length.
+        band_top = r
+        while band_top - 1 in stroke_rows and any(rr == band_top - 1 and min(b, bb) - max(a, aa) >= 0.8 * (b - a)
+                                                   for rr, aa, bb in strokes):
+            band_top -= 1
+        above = range(band_top - 1, max(-1, band_top - 1 - max(2, int(0.25 * h))), -1)
+        if any(sub[k, a - xa:b - xa].mean() < 0.2 for k in above):
+            out.append((r + ya, a, b))
+    return out
+
+
+def _stroke_beside(ink: "np.ndarray", y: int, x0: int, x1: int, h: float, words: list) -> bool:
+    """Does a stroke carry on at height y beside x0..x1, outside the words of the line? Then it is a ruled line
+    broken by faint print (a table's rule under a cell), not the underline of those words."""
+    spans = [(max(0, int(x0 - 2 * h)), max(0, int(x0 - 0.3 * h))), (int(x1 + 0.3 * h), min(ink.shape[1], int(x1 + 2 * h)))]
+    for a, b in spans:
+        if b - a < 2:
+            continue
+        band = ink[max(0, y - 1):y + 2, a:b].max(axis=0)
+        for s, e in _ink_runs(band):
+            if e - s >= 0.5 * h and not any(min(a + e, w.box[2]) - max(a + s, w.box[0]) > 0 for w in words):
+                return True
+    return False
+
+
+def _stroke_weight(ink: "np.ndarray", box: Box, skip_rows=()) -> float:
+    """Average stroke width (pixels) of the letters inside a box: the distance from each stroke's middle to its
+    edge, measured at twice the resolution. Rows holding an underline or a ruled line are left out."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    crop = ink[max(0, y0):max(0, y1), max(0, x0):max(0, x1)].copy()
+    for y in skip_rows:
+        crop[max(0, y - y0 - 2):max(0, y - y0 + 3), :] = 0
+    if crop.size == 0 or int(crop.sum()) < 30:
+        return 0.0
+    up = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+    dist = cv2.distanceTransform(up, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    ridge = (dist > 0.5) & (dist >= cv2.dilate(dist, np.ones((3, 3), np.uint8)) - 1e-6)
+    values = dist[ridge]
+    return float(values.mean()) if values.size >= 10 else 0.0
+
+
+def measure_text_format(gray: "np.ndarray", lines: list, dpi: float) -> None:
+    """Mark the underlined words (Word.underline) and how heavy each line is printed (Line.weight, 1.0 = the
+    ordinary text of this page) - see the top of 6b-2."""
+    if not lines:
+        return
+    ink = _ink_mask(gray, dpi)
+    raw = []
+    for ln in lines:
+        h = max(6, ln.box[3] - ln.box[1])
+        rows = []
+        for y, a, b in _strokes_under(ink, ln.box):
+            rows.append(y)          # (an underline or a table's rule: neither counts in how heavy the letters are)
+            covered = [w for w in ln.words if min(b, w.box[2]) - max(a, w.box[0]) >= 0.75 * max(1, w.box[2] - w.box[0])]
+            if not covered:
+                continue
+            cx0, cx1 = min(w.box[0] for w in covered), max(w.box[2] for w in covered)
+            if a < cx0 - 0.7 * h or b > cx1 + 0.7 * h or _stroke_beside(ink, y, cx0, cx1, h, ln.words):
+                continue                                # it runs on past the words: a ruled line, not an underline
+            for w in covered:
+                w.underline = True
+        raw.append(_stroke_weight(ink, ln.box, rows))
+    body = [wt for ln, wt in zip(lines, raw) if wt > 0 and len(ln.words) >= 3] or [wt for wt in raw if wt > 0]
+    if not body:
+        return
+    typical = float(statistics.median(body))
+    for ln, wt in zip(lines, raw):
+        ln.weight = round(float(wt) / typical, 3) if wt > 0 else 0.0     # (a plain float: it goes into the cache)
+
+
 # ---- 6c. Tables (img2table finds the grid; our OCR words fill the cells) --------------
-def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Settings, ocr=None) -> list:
+def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Settings, ocr=None, view=None) -> list:
     """Return [(TableData, table_box, set_of_line_indexes_inside, caption_lines)] for one page.
     img2table finds the table grid (ruling lines, or aligned text for borderless tables);
-    the words we already OCR'd are then placed into the cells."""
+    the words we already OCR'd are then placed into the cells. `view`: the page before its clean-up (same size),
+    on which the shading of a heading row and a hairline rule under it are measured - the clean-up flattens
+    shading away and its median filter erases a one-pixel line."""
+    look = view if view is not None and getattr(view, "shape", None) == gray.shape else gray
     try:
         from img2table.document import Image as I2TImage
         from img2table.ocr._types import OCRData, OCRInstance
@@ -1519,6 +1750,13 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
     page_area = gray.shape[0] * gray.shape[1]
     results = []
     claimed = set()
+    ink_cache = []
+
+    def ink():
+        """The page's ink mask, made once when the first table needs it (see _rules_between_rows)."""
+        if not ink_cache:
+            ink_cache.append(_ink_mask(look, dpi))
+        return ink_cache[0]
 
     def build(et, found_by: str):
         """Turn one reading of one area into a table, or return None if it is not a table at all."""
@@ -1545,7 +1783,7 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
             inside.discard(under)
             tbox = (tbox[0], min(lines[i].box[1] for i in inside), tbox[2], max(lines[i].box[3] for i in inside))
         inside_order = sorted(inside)
-        grid, conf, merges, n_unique, n_filled, words_in_cells, words_grid, row_lines = _fill_cells(
+        grid, conf, merges, n_unique, n_filled, words_in_cells, words_grid, row_lines, row_words = _fill_cells(
             cell_boxes, [lines[i] for i in inside_order])
 
         # A caption that img2table swallowed as the first/last row is given back. It may fill one merged
@@ -1568,8 +1806,38 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
             if not given_back:
                 continue                                # its lines also fill other rows: leave the table as it is
             caption_lines.extend(inside_order[li] for li in given_back)
-            del grid[edge], conf[edge], cell_boxes[edge], words_grid[edge], row_lines[edge]
+            del grid[edge], conf[edge], cell_boxes[edge], words_grid[edge], row_lines[edge], row_words[edge]
             merges = _merges_without_row(merges, row_index)
+        # A borderless reading can take in the paragraph above or below the table ("4.1 Test equipment. The test
+        # equipment is listed below." split over its columns). A first or last row that reads as a numbered
+        # paragraph with a title, or as a lead-in sentence, is given back, like a caption.
+        if found_by != "ruled" and len(grid) >= 3:
+            def row_text(row: list) -> str:
+                return " ".join(dict.fromkeys(c for c in row if c))      # (a merged cell repeats its text)
+
+            def paragraph_row(edge: int) -> bool:
+                joined = row_text(grid[edge])
+                return _is_titled_number(joined) or (edge == 0 and _introduces_list(joined) and word_count(joined) >= 5)
+            edges = [edge for edge in (0, -1) if paragraph_row(edge)]
+            # ... unless the rows between are numbered paragraphs too: then it is all running text (typewriter
+            # paragraphs whose word gaps line up), and the checks below must see it whole to reject it
+            between = grid[(1 if 0 in edges else 0):(len(grid) - 1 if -1 in edges else len(grid))]
+            if _reads_like_prose([[row_text(row)] for row in between if row_text(row)]):
+                edges = []
+            for edge in edges:
+                if len(grid) < 3:
+                    break
+                row_index = edge % len(grid)
+                elsewhere = set().union(*(row_lines[r] for r in range(len(row_lines)) if r != row_index))
+                given_back = sorted(row_lines[row_index] - elsewhere)
+                if not given_back:
+                    continue
+                inside -= {inside_order[li] for li in given_back}
+                del grid[edge], conf[edge], cell_boxes[edge], words_grid[edge], row_lines[edge], row_words[edge]
+                merges = _merges_without_row(merges, row_index)
+                remaining = [cb for row in cell_boxes for cb in row if cb]
+                if remaining:
+                    tbox = (tbox[0], min(cb[1] for cb in remaining), tbox[2], max(cb[3] for cb in remaining))
         if caption_lines:
             inside -= set(caption_lines)
             # the table now starts/ends at its first/last real row (so the caption sits next to it)
@@ -1595,11 +1863,14 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
             return None                                 # paragraphs inside a page border, not a table
         # Headers printed sideways read as nothing, or as fragments; turn that band upright and
         # read it again. The band is put back together first, in case the row inference split it.
+        sideways = []
         if settings.sideways_headers and ocr is not None:
-            merges = _collapse_header_band(grid, conf, cell_boxes, words_grid, merges)
-            _add_sideways_headers(gray, grid, cell_boxes, ocr)
+            merges = _collapse_header_band(grid, conf, cell_boxes, words_grid, merges, row_words)
+            sideways = _add_sideways_headers(gray, grid, cell_boxes, ocr)
+        shown_rows, header_format = _header_rows(grid, merges, row_words, _row_shading(look, cell_boxes, dpi),
+                                                 _rules_between_rows(ink(), cell_boxes), bool(sideways))
         table = TableData(grid=grid, conf=conf, merges=merges, cell_boxes=cell_boxes, cell_words=words_grid,
-                          header_rows=_header_row_count(grid, merges))
+                          header_rows=max(shown_rows, _header_row_count(grid, merges)), header_format=header_format)
         return table, tbox, inside, caption_lines
 
     for alternatives in candidates:
@@ -1612,7 +1883,7 @@ def detect_tables(gray: "np.ndarray", lines: list, dpi: float, settings: Setting
                 results.append(made)
                 break
     if settings.borderless_tables:
-        results += detect_aligned_tables(lines, dpi, claimed)
+        results += detect_aligned_tables(lines, dpi, claimed, ink())
     return results
 
 
@@ -1873,8 +2144,189 @@ def _is_merged_band(row: list) -> bool:
     return len(cells) > 1 and len(set(cells)) == 1
 
 
+# Words that name the columns of a table ("REQ ID | REQUIREMENT | VERIFICATION", "Parameter | Minimum | Maximum").
+# A row made only of such names is a heading row however it is printed.
+_COLUMN_NAME_WORDS = {
+    "requirement", "requirements", "req", "reqt", "id", "identifier", "paragraph", "para", "section", "title",
+    "description", "verification", "method", "methods", "parameter", "parameters", "characteristic", "value",
+    "values", "unit", "units", "min", "max", "minimum", "maximum", "nominal", "typical", "tolerance", "limit",
+    "limits", "remarks", "notes", "note", "comments", "item", "no", "no.", "number", "name", "type", "signal", "pin",
+    "reference", "references", "document", "documents", "rev", "revision", "date", "quantity", "qty", "symbol",
+    "function", "level", "phase", "mode", "condition", "conditions", "test", "inspection", "analysis",
+    "demonstration", "rationale", "source", "priority", "status", "range", "accuracy", "resolution", "rate",
+    "frequency", "voltage", "current", "power", "weight", "size", "location", "interface", "subsystem", "component",
+    "criteria", "criterion", "statement", "shall", "spec", "specification", "standard", "category", "class",
+    "nomenclature", "low", "high", "part", "designation", "model", "equipment", "unit", "units", "notes", "measure",
+    "objective", "threshold", "verified", "applicable", "paragraphs", "page", "sheet", "label", "wire", "gauge"}
+_COLUMN_NAME_CELLS = {"v&v", "i/a/d/t", "#", "no", "no.", "nr.", "ref", "ref."}
+
+
+def _is_column_name(cell: str) -> bool:
+    """'Req ID', 'Minimum', 'V&V' - a short name of a table column. A value ("28 VDC nominal") or a row's label
+    ("Voltage:") is not one, though its words could name a column."""
+    low = " ".join(cell.lower().split())
+    if low in _COLUMN_NAME_CELLS:
+        return True
+    low = re.sub(r"\s*(?:\(\d{1,2}\)|\d{1,2}/|\*+)$", "", low)        # a footnote mark: "Minimum 1/", "Max (2)"
+    if re.search(r"\d", low) or low.endswith(":"):
+        return False
+    words = [w.rstrip(".") for w in re.findall(r"[a-z]+\.?", low)]
+    return 0 < word_count(cell) <= 4 and any(w in _COLUMN_NAME_WORDS for w in words)
+
+
+def _names_columns(row: list) -> bool:
+    """Is every filled cell of this row a short column name ("Req ID", "Requirement", "Minimum")?"""
+    cells = list(dict.fromkeys((c or "").strip() for c in row if (c or "").strip()))   # (a merged cell once)
+    named = [c for c in cells if len(c) > 1 or c in _COLUMN_NAME_CELLS]        # ("#" names a column too)
+    letters = [c for c in cells if c not in named]    # I / A / D / T over the method columns of a matrix
+    return (len(named) >= 2 and all(_is_column_name(c) for c in named)
+            and all(c.isalpha() and c.isupper() for c in letters))
+
+
+# The verification methods, as they stand in the cells of a Method column - values, not names of columns
+_METHOD_VALUES = {"test", "inspection", "analysis", "demonstration", "similarity", "examination", "t", "a", "i", "d",
+                  "test.", "analysis.", "inspection.", "demonstration."}
+
+
+def _row_names_columns(grid: list, r: int) -> bool:
+    """Does row r of a table name its columns (_names_columns)? Not when a cell's text stands again under it in
+    its column, or is a verification method over a column of methods: "Power | Input voltage | Test" over
+    "Cooling | Forced air | Analysis" is a row of values whose words could also name columns."""
+    if r >= len(grid) or not _names_columns(grid[r]):
+        return False
+    below = grid[r + 1:]
+    for c, cell in enumerate(grid[r]):
+        name = " ".join((cell or "").lower().split())
+        if not name:
+            continue
+        column = [" ".join((row[c] or "").lower().split()) for row in below if c < len(row) and (row[c] or "").strip()]
+        if name in column:
+            return False
+        if name in _METHOD_VALUES and column and sum(v in _METHOD_VALUES for v in column) >= 0.5 * len(column):
+            return False
+    return True
+
+
+def _row_shading(gray: "np.ndarray", cell_boxes: list, dpi: float) -> Optional[list]:
+    """How dark the paper of each row is (0 = white): the middle of its cells, where the text does not decide
+    (the 80th percentile of brightness is the paper behind the letters). None without cell boxes."""
+    if not cell_boxes:
+        return None
+    out = []
+    for row in cell_boxes:
+        values = []
+        for cb in dict.fromkeys(cb for cb in row if cb):
+            x0, y0, x1, y1 = (int(v) for v in cb)
+            dx, dy = max(1, int(0.15 * (x1 - x0))), max(1, int(0.2 * (y1 - y0)))
+            inner = gray[y0 + dy:y1 - dy, x0 + dx:x1 - dx]
+            if inner.size >= 20:
+                values.append(255.0 - float(np.percentile(inner, 80)))
+        out.append(float(statistics.median(values)) if values else None)
+    return out
+
+
+def _rules_between_rows(ink: "np.ndarray", cell_boxes: list) -> Optional[list]:
+    """For each row but the last: is a ruled line printed across most of the table between it and the next row?"""
+    if ink is None or not cell_boxes or len(cell_boxes) < 2:
+        return None
+    spans = []
+    for row in cell_boxes:
+        boxes = [cb for cb in row if cb]
+        spans.append((min(cb[0] for cb in boxes), min(cb[1] for cb in boxes), max(cb[2] for cb in boxes),
+                      max(cb[3] for cb in boxes)) if boxes else None)
+    out = []
+    for a, b in zip(spans, spans[1:]):
+        if a is None or b is None:
+            out.append(False)
+            continue
+        h = max(4, min(a[3] - a[1], b[3] - b[1]))
+        y0, y1 = int(min(a[3], b[1]) - 0.3 * h), int(max(a[3], b[1]) + 0.3 * h)
+        x0, x1 = int(min(a[0], b[0])), int(max(a[2], b[2]))
+        band = ink[max(0, y0):max(0, y1), max(0, x0):max(0, x1)]
+        longest = max((e - st for r in band for st, e in _ink_runs(r)), default=0) if band.size else 0
+        out.append(longest >= 0.6 * max(1, x1 - x0))
+    return out
+
+
+def _row_looks(words: list) -> dict:
+    """How a table row is printed: share of its words underlined, median heaviness of its lines, and whether its
+    letters are all capitals."""
+    letters = [ch for w, _wt in words for ch in w.text if ch.isalpha()]
+    weights = [wt for _w, wt in words if wt > 0]
+    return {"underlined": sum(1 for w, _wt in words if w.underline) / len(words) if words else 0.0,
+            "weight": float(statistics.median(weights)) if weights else 0.0,
+            "capitals": len(letters) >= 3 and all(ch.isupper() for ch in letters),
+            "mixed": sum(1 for ch in letters if ch.islower()) >= 2, "n": len(words)}
+
+
+def _header_rows(grid: list, merges: list, row_words: list, shading: Optional[list] = None,
+                 rules: Optional[list] = None, sideways: bool = False) -> tuple:
+    """How many rows at the top of a table are its heading rows, and how they are set apart: (0, "") when there
+    is no heading row, else (1 or 2, "bold" / "underlined" / "capitals" / "shaded" / "rule under it" / ...).
+
+    A heading row is only taken where it is PRINTED differently from the rows under it - bolder, underlined, in
+    capitals where the other rows are not, on shaded paper, or with a rule under it where the other rows have
+    none - or where it names the columns ("REQ ID | REQUIREMENT | VERIFICATION"), or where its headers were
+    printed sideways. A first row that merely holds short words is ordinary content: deciding by the text alone
+    is what made data rows into headings. A second heading row counts under a banner across the top ("VERIFICATION
+    METHOD" over I / A / D / T, or a LEGEND), when that second row is set apart in the same way."""
+    if not grid or len(grid) < 2:
+        return 0, ""
+    looks = [_row_looks(row_words[r] if r < len(row_words) else []) for r in range(len(grid))]
+
+    def apart(head: list, body: list) -> list:
+        """The ways the rows `head` are printed differently from the rows `body`."""
+        found = []
+        hw = [w for r in head for w in (row_words[r] if r < len(row_words) else [])]
+        bw = [w for r in body for w in (row_words[r] if r < len(row_words) else [])]
+        if not hw:
+            return found
+        h, b = _row_looks(hw), _row_looks(bw)
+        if h["underlined"] >= 0.8 and b["underlined"] <= 0.2:
+            found.append("underlined")
+        if h["weight"] and b["weight"] and h["weight"] >= 1.12 * b["weight"] and h["weight"] >= 1.08:
+            found.append("bold")
+        body_cells = [c for r in body for c in grid[r] if c and re.search(r"[A-Za-z]{2}", c)]
+        values = any(re.search(r"\d", grid[r][c] or "") for r in head for c in range(len(grid[r])))
+        if (h["capitals"] and not values and body_cells
+                and sum(1 for c in body_cells if re.search(r"[a-z]{2}", c)) >= 0.5 * len(body_cells)):
+            found.append("capitals")                # ("GND | 0 V | J1-A" in capitals is a row of values)
+        if shading and body:
+            shades = [shading[r] for r in body if r < len(shading) and shading[r] is not None]
+            top = [shading[r] for r in head if r < len(shading) and shading[r] is not None]
+            if shades and top and min(top) - statistics.median(shades) >= 12 and min(top) - shades[0] >= 10:
+                # (darker than the row right under it too: a shadow across the page darkens both)
+                found.append("shaded")
+        if rules and head[-1] < len(rules) and rules[head[-1]]:
+            others = [rules[r] for r in body[:-1] if r < len(rules)]
+            if not others or sum(others) <= 0.25 * len(others):
+                found.append("rule under it")
+        return found
+
+    banner = any(r0 == 0 and r1 == 0 and c1 > c0 for r0, c0, r1, c1 in merges or []) or _is_merged_band(grid[0])
+    if banner and len(grid) > 2:
+        ways = apart([0, 1], list(range(2, len(grid)))) or apart([1], list(range(2, len(grid))))
+        if not ways and _row_names_columns(grid, 1):
+            ways = ["column names"]
+        if ways:
+            return 2, " and ".join(ways)
+    if len(grid[0]) > 1 and len({(c or "").strip() for c in grid[0] if (c or "").strip()}) < 2:
+        return 0, ""                                # one text across the top ("SPECIFICATIONS") is a title, not headings
+    ways = apart([0], list(range(1, len(grid))))
+    if not ways and _row_names_columns(grid, 0):
+        ways = ["column names"]
+    if not ways and sideways:
+        ways = ["printed sideways"]
+    if ways and len(grid) > 2 and not _is_merged_band(grid[1]) and apart([0, 1], list(range(2, len(grid)))) == ways \
+            and _row_looks(row_words[1] if len(row_words) > 1 else [])["n"] and not _looks_like_data(grid[1]):
+        return 2, " and ".join(ways)                # a heading printed over two rows ("Parameter" / "(unit)")
+    return (1, " and ".join(ways)) if ways else (0, "")
+
+
 def _header_row_count(grid: list, merges: list) -> int:
-    """How many rows at the top of a table are header rows (nearly always one).
+    """How many rows at the top of a table NAME its columns (nearly always one) - read from the text, for naming the
+    columns ("Requirement", "Req ID", "Method") when requirements are taken from the table. Whether those rows are
+    also SHOWN as a heading row in Excel and Word is decided by how they are printed (_header_rows).
 
     A second row counts when the first is a band across the whole width and the row underneath
     reads like headers: a "VERIFICATION METHOD" banner over the I / A / D / T letters, or a LEGEND
@@ -1887,6 +2339,82 @@ def _header_row_count(grid: list, merges: list) -> int:
     if (banner or _is_merged_band(grid[0])) and len(grid) > 2 and _looks_like_header(grid[1]):
         return 2
     return 1 if _looks_like_header(grid[0]) else 0
+
+
+def _looks_like_data(row: list) -> bool:
+    """A row with numbers in most of its cells holds values, not names."""
+    cells = [c for c in row if c and c.strip()]
+    return bool(cells) and sum(1 for c in cells if re.search(r"\d", c)) >= 0.5 * len(cells)
+
+
+def table_rows_as_list(block: Block, dpi: float) -> list:
+    """Show a table that has neither a heading row nor a title as a LIST: one list entry per row of the table,
+    its cells kept apart (Block.meta["cells"], their column positions in "cell_x"), so the exports can keep the
+    columns aligned. Aligned text with no heading and no "TABLE ..." title is far more often a list laid out in
+    columns - documents with their titles and paragraphs, labels and values - than a table, and is shown as one.
+    Every row of the grid gives an entry (its text is its cells, in order: see block_token_rows); a cell merged
+    down over several rows gives its text to each of them. A row whose first cell is empty is the wrapped line of
+    the entry above only when it reads as one: it states no requirement of its own, and the text it carries on
+    did not end a sentence ("Requirements for the Control of Electromagnetic" / "Interference Characteristics")."""
+    t = block.table
+    if t is None or not t.grid:
+        return [block]
+    tall = {(r, c) for r0, c0, r1, c1 in t.merges if r1 > r0                 # cells merged down over several rows
+            for r in range(r0, r1 + 1) for c in range(c0, c1 + 1)}
+    spans = []                                          # (top, bottom) of each row, from its own cells
+    for r in range(t.n_rows):
+        boxes = [(c, cb) for c, cb in enumerate(t.cell_boxes[r] if r < len(t.cell_boxes) else []) if cb]
+        own = [cb for c, cb in boxes if (r, c) not in tall] or [cb for _c, cb in boxes]
+        spans.append((min(cb[1] for cb in own), max(cb[3] for cb in own)) if own else None)
+    known = [sp for sp in spans if sp]
+    if not known:                                       # no positions at all: rows of equal height
+        h = (block.box[3] - block.box[1]) / max(1, t.n_rows)
+        spans = [(block.box[1] + r * h, block.box[1] + (r + 1) * h) for r in range(t.n_rows)]
+    else:
+        spans = [sp or known[0] for sp in spans]
+    row_lines = [[] for _ in range(t.n_rows)]
+    for ln in block.lines:                              # (the lines only place the entries on the page)
+        cy = (ln.box[1] + ln.box[3]) / 2
+        r = min(range(t.n_rows), key=lambda k: 0 if spans[k][0] <= cy <= spans[k][1]
+                else min(abs(cy - spans[k][0]), abs(cy - spans[k][1])))
+        row_lines[r].append(ln)
+    columns = []                                         # left edge of each column, from the table's left edge
+    for c in range(t.n_cols):
+        xs = [t.cell_boxes[r][c][0] for r in range(min(t.n_rows, len(t.cell_boxes)))
+              if c < len(t.cell_boxes[r]) and t.cell_boxes[r][c]]
+        columns.append(round(max(0.0, (min(xs) - block.box[0]) / max(dpi, 1)), 3) if xs else None)
+    words_grid = _row_words_grid(t)
+    out = []
+    for r in range(t.n_rows):
+        cells = [(t.grid[r][c] if c < len(t.grid[r]) else "") or "" for c in range(t.n_cols)]
+        if not any(c.strip() for c in cells):
+            continue
+        words = [list(w) for w in words_grid[r]] + [[] for _ in range(t.n_cols - len(words_grid[r]))]
+        confs = [t.conf[r][c] if r < len(t.conf) and c < len(t.conf[r]) else 1.0 for c in range(t.n_cols)]
+        lines = row_lines[r]
+        if out and not cells[0].strip() and out[-1].meta["cells"][0].strip() and t.n_cols > 1:
+            above = out[-1].meta["cells"]
+            carried = [c for c in range(t.n_cols) if cells[c].strip() and above[c].strip()]
+            if (carried and not any(re.search(r"[.;!?]$", above[c].strip()) for c in carried)
+                    and not _modal_re().search(" ".join(cells))):
+                # the row above wraps onto this line: one entry, not two
+                entry = out[-1]
+                entry.meta["cells"] = [(a + " " + b).strip() for a, b in zip(above, cells)]
+                entry.meta["cell_words"] = [list(a) + list(b) for a, b in zip(entry.meta["cell_words"], words)]
+                entry.meta["cell_conf"] = [min(a, b) for a, b in zip(entry.meta["cell_conf"], confs)]
+                entry.lines = entry.lines + lines
+                if lines:
+                    entry.box = box_union([entry.box] + [ln.box for ln in lines])
+                entry.text = " ".join(c for c in entry.meta["cells"] if c)
+                continue
+        boxes = [cb for cb in (t.cell_boxes[r] if r < len(t.cell_boxes) else []) if cb]
+        box = (box_union(ln.box for ln in lines) if lines else
+               (block.box[0], int(spans[r][0]), block.box[2], int(spans[r][1])) if not boxes else
+               box_union((cb[0], spans[r][0], cb[2], spans[r][1]) for cb in boxes))
+        meta = {"from_table": True, "cells": cells, "cell_x": columns, "cell_words": words, "cell_conf": confs}
+        out.append(Block("list_item", block.page, tuple(int(v) for v in box), lines=lines,
+                         text=" ".join(c for c in cells if c), meta=meta))
+    return out or [block]
 
 
 # ---- 6c-2. Sideways (rotated) column headers -------------------------------------------
@@ -2001,7 +2529,8 @@ def _row_height(cell_boxes_row: list) -> float:
     return max((cb[3] - cb[1] for cb in present), default=0.0)
 
 
-def _collapse_header_band(grid: list, conf: list, cell_boxes: list, words_grid: list, merges: list) -> list:
+def _collapse_header_band(grid: list, conf: list, cell_boxes: list, words_grid: list, merges: list,
+                          row_words: Optional[list] = None) -> list:
     """Put a sideways header band back together when the row inference cut it into slices.
 
     A quarter-turned header needs a tall band, and the fragments that upright reading finds in it
@@ -2028,6 +2557,9 @@ def _collapse_header_band(grid: list, conf: list, cell_boxes: list, words_grid: 
                 cell_boxes[1][c] = box_union([above, here])    # the crop must cover the whole band
             elif above is not None:
                 cell_boxes[1][c] = above
+        if row_words is not None and len(row_words) > 1:
+            row_words[1] = row_words[0] + row_words[1]
+            del row_words[0]
         del grid[0], conf[0], cell_boxes[0], words_grid[0]
         merges = _merges_without_row(merges, 0)
     return merges
@@ -2164,7 +2696,7 @@ def _reads_like_prose(grid: list) -> bool:
     return prose_rows >= max(2, 0.35 * len(grid))
 
 
-def detect_aligned_tables(lines: list, dpi: float, claimed: set) -> list:
+def detect_aligned_tables(lines: list, dpi: float, claimed: set, ink: "Optional[np.ndarray]" = None) -> list:
     """Borderless tables recognised from text alignment alone (the idea behind Camelot's
     'stream' mode): consecutive rows that break into the same columns. Works on noisy
     photocopies where image-based detection fails, because it only needs the OCR boxes."""
@@ -2243,7 +2775,7 @@ def detect_aligned_tables(lines: list, dpi: float, claimed: set) -> list:
                                   for _, ws in rows[r]["segs"]], 0.6 * char_h)
         if len(bands) < 2 or sum(1 for pos in starts if len(rows[run[pos]]["segs"]) >= 2) < 3:
             continue
-        grid, conf, words_grid, used = [], [], [], set()
+        grid, conf, words_grid, used, row_words, row_spans, boxes = [], [], [], set(), [], [], []
         for pos, r in enumerate(run):
             cells = [[] for _ in bands]
             for i, ws in rows[r]["segs"]:
@@ -2252,16 +2784,25 @@ def detect_aligned_tables(lines: list, dpi: float, claimed: set) -> list:
                 used.add(i)
             texts = [_join_words_in_reading_order(c) for c in cells]
             confs = [min((w.conf for w in c), default=1.0) for c in cells]
+            weighed = [(w, lines[i].weight) for i, ws in rows[r]["segs"] for w in ws]
             if pos not in starts and grid:                 # a wrapped line: add it to its own record
                 for c, t in enumerate(texts):
                     if t:
                         grid[-1][c] = (grid[-1][c] + " " + t).strip()
                         conf[-1][c] = min(conf[-1][c], confs[c])
                         words_grid[-1][c] += [[w.text, round(w.conf, 4)] for w in cells[c]]
+                row_words[-1] += weighed
+                row_spans[-1] = (row_spans[-1][0], rows[r]["box"][3])
+                for c, cell in enumerate(cells):
+                    if cell:
+                        boxes[-1][c] = box_union([w.box for w in cell] + ([boxes[-1][c]] if boxes[-1][c] else []))
                 continue
             grid.append(texts)
             conf.append(confs)
             words_grid.append([[[w.text, round(w.conf, 4)] for w in c] for c in cells])
+            row_words.append(weighed)
+            row_spans.append((rows[r]["box"][1], rows[r]["box"][3]))
+            boxes.append([box_union(w.box for w in c) if c else None for c in cells])
         n_cells = len(grid) * len(bands)
         filled = sum(1 for row in grid for c in row if c)
         words_per_cell = sum(word_count(c) for row in grid for c in row) / max(filled, 1)
@@ -2275,7 +2816,11 @@ def detect_aligned_tables(lines: list, dpi: float, claimed: set) -> list:
         tbox = box_union(lines[i].box for i in used)
         if _tab_list_in_context(grid, tbox, lines, dpi):
             continue                                       # a list on tab stops under its lead-in
-        table = TableData(grid=grid, conf=conf, cell_words=words_grid, header_rows=_header_row_count(grid, []))
+        row_boxes = [[(tbox[0], y0, tbox[2], y1)] for y0, y1 in row_spans]     # (one box per row: for the rules)
+        shown_rows, header_format = _header_rows(grid, [], row_words, None,
+                                                 _rules_between_rows(ink, row_boxes) if ink is not None else None)
+        table = TableData(grid=grid, conf=conf, cell_words=words_grid, cell_boxes=boxes,
+                          header_rows=max(shown_rows, _header_row_count(grid, [])), header_format=header_format)
         results.append((table, tbox, used, []))
         claimed |= used
     return results
@@ -2291,6 +2836,7 @@ def _fill_cells(cell_boxes: list, table_lines: list) -> tuple:
     cells = list(unique.keys())
     cell_words = defaultdict(list)
     cell_lines = defaultdict(set)                         # cell -> indexes of the table_lines its words came from
+    weight_of = {id(w): ln.weight for ln in table_lines for w in ln.words}
     words = [wd for ln in table_lines for wd in ln.words]
     word_line = [li for li, ln in enumerate(table_lines) for _ in ln.words]
     if cells and words:
@@ -2316,11 +2862,13 @@ def _fill_cells(cell_boxes: list, table_lines: list) -> tuple:
     conf = [[1.0 for _ in range(n_cols)] for _ in range(n_rows)]
     words_grid = [[[] for _ in range(n_cols)] for _ in range(n_rows)]
     row_lines = [set() for _ in range(n_rows)]           # grid row -> indexes of the lines placed in it
+    row_words = [[] for _ in range(n_rows)]              # grid row -> [(Word, weight of its line)] (see _header_rows)
     merges = []
     for cb, positions in unique.items():
         for r, _c in positions:
             row_lines[r] |= cell_lines.get(cb, set())
         words = cell_words.get(cb, [])
+        row_words[min(r for r, _c in positions)] += [(w, weight_of.get(id(w), 0.0)) for w in words]
         text = _join_words_in_reading_order(words)
         cmin = min((w.conf for w in words), default=1.0)
         for r, c in positions:
@@ -2330,7 +2878,8 @@ def _fill_cells(cell_boxes: list, table_lines: list) -> tuple:
             rs, cs = [p[0] for p in positions], [p[1] for p in positions]
             merges.append((min(rs), min(cs), max(rs), max(cs)))
     n_filled = sum(1 for cb in unique if cell_words.get(cb))
-    return grid, conf, merges, len(unique), n_filled, sum(len(v) for v in cell_words.values()), words_grid, row_lines
+    return (grid, conf, merges, len(unique), n_filled, sum(len(v) for v in cell_words.values()), words_grid, row_lines,
+            row_words)
 
 
 def _pages_text(pages: list) -> str:
@@ -2434,20 +2983,35 @@ def _is_caption_text(text: str) -> bool:
 def _caption_next_to(tbox, lines: list) -> bool:
     """Is the line right above a grid (a blank line may stand between them), or the line straight under
     it, a table caption ("TABLE I. Interface ...")? A caption further down, after a blank line, is more
-    often the NEXT table's or figure's than this one's."""
+    often the NEXT table's or figure's than this one's. A long title above a table wraps ("TABLE IV. Power
+    requirements of the line replaceable" / "units in all operating modes."): the lines set tight above the
+    nearest one are its first lines, up to three in all."""
     if not lines:
         return False
     h = statistics.median([ln.box[3] - ln.box[1] for ln in lines])
     centre = lambda ln: (ln.box[1] + ln.box[3]) / 2
-    for near in ([ln for ln in lines if tbox[1] - 3.5 * h <= ln.box[3] <= tbox[1] + 0.3 * h and centre(ln) < tbox[1]
-                  and ln.box[0] < tbox[2] and ln.box[2] > tbox[0]],
-                 [ln for ln in lines if tbox[3] - 0.3 * h <= ln.box[1] <= tbox[3] + 1.2 * h and centre(ln) > tbox[3]
-                  and ln.box[0] < tbox[2] and ln.box[2] > tbox[0]]):
-        if near:
-            y = centre(min(near, key=lambda ln: abs(centre(ln) - (tbox[1] + tbox[3]) / 2)))
-            row = sorted((ln for ln in near if abs(centre(ln) - y) <= 0.5 * h), key=lambda ln: ln.box[0])
+    beside = lambda ln: ln.box[0] < tbox[2] and ln.box[2] > tbox[0]
+
+    def row_at(pool, y):
+        return sorted((ln for ln in pool if abs(centre(ln) - y) <= 0.5 * h), key=lambda ln: ln.box[0])
+    above = [ln for ln in lines if ln.box[3] <= tbox[1] + 0.3 * h and centre(ln) < tbox[1] and beside(ln)]
+    near = [ln for ln in above if ln.box[3] >= tbox[1] - 3.5 * h]
+    if near:
+        row = row_at(above, centre(max(near, key=lambda ln: ln.box[3])))
+        for _ in range(3):
             if _is_caption_text(" ".join(ln.text for ln in row)):
                 return True
+            top = min(ln.box[1] for ln in row)
+            higher = [ln for ln in above if top - 0.9 * h <= ln.box[3] < top]     # the line set tight above it
+            if not higher:
+                break
+            row = row_at(above, centre(max(higher, key=lambda ln: ln.box[3])))
+    under = [ln for ln in lines if tbox[3] - 0.3 * h <= ln.box[1] <= tbox[3] + 1.2 * h and centre(ln) > tbox[3]
+             and beside(ln)]
+    if under:
+        row = row_at(under, centre(min(under, key=lambda ln: abs(centre(ln) - (tbox[1] + tbox[3]) / 2))))
+        if _is_caption_text(" ".join(ln.text for ln in row)):
+            return True
     return False
 
 
@@ -2701,6 +3265,33 @@ def _is_tab_not_gutter(left: list, right: list) -> bool:
     first, last = beside.index(True), len(beside) - 1 - beside[::-1].index(True)
     rows, beside = all_rows[first:last + 1], beside[first:last + 1]
     left_texts = [" ".join(ln.text for ln in row).strip() for row in rows]
+    right_texts = [" ".join(ln.text for ln in r).strip() for r in right_rows]
+
+    def marker_of(t):
+        m = RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t) or RE_MARKER_SHAPE.match(t)
+        return m.group("marker") if m and _marker_parts(m.group("marker")) else ""
+    right_listed = sum(1 for t in right_texts if marker_of(t)) >= 2      # list items on the right ("a.", "b.")
+    # the right-hand side reads as running text: a sentence that carries on from one line to the next, a
+    # requirement, or a numbered paragraph - a column of its own, whatever stands on its left
+    right_prose = (any(_modal_re().search(t) or _is_titled_number(t) for t in right_texts)
+                   or any(re.search(r"[a-z,]$", a) and re.match(r"[a-z]", b) for a, b in zip(right_texts, right_texts[1:])))
+    # a list of documents: their numbers on the left, their titles on a tab stop ("MIL-STD-461G   Requirements
+    # for the Control of ...") - one list, read row by row, never a column of numbers and a column of titles.
+    # (A list on the right - "a. The radar shall search." - or prose is a column of its own beside the documents.)
+    if (sum(1 for t in left_texts if RE_DOC_ID_START.match(t)) >= max(2, 0.6 * len(rows))
+            and sum(beside) >= 0.6 * len(rows) and not right_listed and not right_prose):
+        return True
+    # a few short cells in rows ("Connector   D38999/26WB35PN   Shell size 11"): a list laid out in columns, read
+    # row by row. Two columns of text hold lines of prose; these hold a few words each, every row with both sides,
+    # and no sentence. (Rows with list markers are judged by the rules below: a-c | d-f is two columns.)
+    # (Two pairs on every row - "AC  Alternating current" | "EMI  Electromagnetic interference" - are two columns of
+    # the same list, set side by side.)
+    right_short = all(word_count(t) <= 6 for t in right_texts)
+    pairs = all(len(r) == 2 for r in rows) and all(len(r) == 2 for r in right_rows)
+    if (len(rows) >= 2 and all(beside) and right_short and all(0 < word_count(t) <= 4 for t in left_texts)
+            and not pairs and not right_prose
+            and not any(_is_titled_number(t) or _modal_re().search(t) or marker_of(t) for t in left_texts + right_texts)):
+        return True
     cued = 0
     for text in left_texts:
         m = RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text) or RE_MARKER_SHAPE.match(text)
@@ -2716,7 +3307,6 @@ def _is_tab_not_gutter(left: list, right: list) -> bool:
     lone_stems = sum(1 for t, b in zip(left_texts, beside) if t.endswith(":") and not b)
     if sum(beside) < max(1, 0.6 * (n - lone_stems)) or cued < 0.5 * n:
         return False
-    right_texts = [" ".join(ln.text for ln in r).strip() for r in right_rows]
     left_y = [centre(row) for row in rows]
     all_left_y = [centre(row) for row in all_rows]
     # the left rows where an item STARTS: a marker, or a label after a complete one. A label's second
@@ -2737,9 +3327,6 @@ def _is_tab_not_gutter(left: list, right: list) -> bool:
     # a list in a second column: the right-hand markers carry on from the last left-hand one (a-c | d-f),
     # or form one list of their own, item for item beside the left-hand items (a-e | a-e). A sub-list
     # inside the values ("(1) ...", "(2) ...") starts again under each item, beside no item of its own.
-    def marker_of(t):
-        m = RE_LIST_MARKER.match(t) or RE_NUMBERED_ITEM.match(t) or RE_MARKER_SHAPE.match(t)
-        return m.group("marker") if m and _marker_parts(m.group("marker")) else ""
     left_markers = [mk for mk in map(marker_of, left_texts) if mk]
     right_marked = [(mk, y) for mk, y in zip(map(marker_of, right_texts), right_y) if mk]
     if left_markers and right_marked:
@@ -2892,6 +3479,19 @@ def _ends_sentence(text: str) -> bool:
     return bool(RE_TERMINAL.search(text))
 
 
+# abbreviations whose full stop ends no sentence ("No. 2 diesel fuel", "Fig. 3", "Para. 3.2")
+_ABBREVIATIONS = {"no", "nos", "fig", "figs", "para", "paras", "vol", "ref", "rev", "sec", "sect", "eq", "approx",
+                  "max", "min", "nom", "std", "spec", "mk", "mod", "dwg", "dept", "govt", "etc", "inc", "co", "corp",
+                  "ltd", "st", "vs", "ea", "qty", "assy"}
+
+
+def _sentence_ends_inside(text: str) -> bool:
+    """Does a sentence end inside this text - a word of two letters or more, not an abbreviation, then a full stop
+    (or ! ? : ;) and a capital: 'Weight. The unit'? 'U.S. Army' and 'No. 2' do not."""
+    return any(m.group(1).lower() not in _ABBREVIATIONS
+               for m in re.finditer(r"(?<![A-Za-z.])([A-Za-z]{2,})[.:;!?]\s+(?=[A-Z])", text))
+
+
 # Small letters that have the same shape as their capitals: the scan may read the capital of a title as one of
 # these ("3.2.7 output. The power supply ..."), as it reads the list marker 'C.' for 'c.'
 _SAME_SHAPE_LETTERS = set("cosvwxz")
@@ -2948,11 +3548,21 @@ def _introduces_list(text: str) -> bool:
     return t.endswith(":") or bool(RE_LEAD_IN.search(t))
 
 
+# a date on a line of its own ("1 June 2010", "15 JANUARY 1996", "June 1, 2010"): never a heading
+RE_DATE_LINE = re.compile(r"\s*(?:\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?,?\s+\d{4}"
+                          r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})"
+                          r"\s*[.)]?\s*$", re.I)
+
+
 def _is_heading_text(text: str) -> bool:
     """Short title-like line: '3.2 Characteristics.', '1. SCOPE', 'REQUIREMENTS'."""
     t = text.strip()
-    if not t or word_count(t) > 12 or _modal_re().search(t) or RE_LIST_MARKER.match(t):
+    if not t or word_count(t) > 12 or _modal_re().search(t) or RE_LIST_MARKER.match(t) or RE_DATE_LINE.match(t):
         return False                               # "(1) SEARCH MODE." is a list item, not a heading
+    if re.search(r"(?:\.\s?){4,}\s*[\dA-Z][\d-]{0,5}\s*$", t):
+        return False                               # "1.  SCOPE ........ 1": a line of a table of contents
+    if RE_DOC_ID_START.match(t):
+        return False                               # "MIL-STD-461G  EMI REQUIREMENTS" is a document in a list
     m = RE_PARA_NUM.match(t)
     if m:
         rest = m.group("rest").strip()
@@ -2971,8 +3581,41 @@ def _is_heading_text(text: str) -> bool:
         return True
     letters = [c for c in t if c.isalpha()]
     return (len(letters) >= 4 and all(c.isupper() for c in letters) and word_count(t) <= 10
-            and not RE_PAGE_NUMBER.match(t) and not _ENDS_MID_PHRASE.search(t)
+            and not RE_PAGE_NUMBER.match(t)
+            and (not _ENDS_MID_PHRASE.search(t) or bool(re.search(r"\b(?:APPENDIX|ANNEX)\s+[A-Z]$", t)))   # ("A")
             and not t.endswith(":"))                   # "NOTES:" introduces a list; it is not a section title
+
+
+def _section_of(number: str) -> Optional[int]:
+    """The section a paragraph number is in: '2.1.3' -> 2, 'A.2.1' -> 2 (an appendix's own section 2), '3' -> 3; None
+    for no number."""
+    parts = _number_parts(clean_para_number(number)) if number else None
+    if not parts:
+        return None
+    return parts[0] if parts[0] >= 0 else (parts[1] if len(parts) > 1 else None)
+
+
+def _next_tens(number_above: str, number: int) -> bool:
+    """Is `number` (60, 70, ...) the next section of a document numbered in tens (MIL-STD-490: 10, 20, ... 50.2), up
+    to 90?"""
+    above = _section_of(number_above) if number_above else None
+    return bool(above) and above % 10 == 0 and number % 10 == 0 and number <= 90 and 0 < number - above <= 20
+
+
+# the words a document's title may wrap after, before the number of its part: "... Electronic Systems, Part" / "3
+# Software Requirements"
+_ENDS_IN_PART_NAME = re.compile(r"\b(?:Part|Volume|Vol|No|Number|Section|Chapter|Book|Table|Figure|Category|Class|Type|"
+                                r"Method|Procedure|Note|Sheet|Paragraph|Para|Clause|Subclause|Appendix|Annex|Level|"
+                                r"Grade)\.?\s*$", re.I)
+# ... and words that also end titles on their own ("Seventh Edition", "Specification Change Notice", "Adaptation to
+# climate change"): only with a comma straight after the number ("..., Notice" / "2, Parts Count Method")
+_ENDS_IN_REVISION_NAME = re.compile(r"\b(?:Notice|Change|Amendment|Supplement|Revision|Issue|Edition|Curve|Mode|"
+                                    r"Step)\.?\s*$", re.I)
+# ... and those of them whose number may have several levels: "..., Paragraph" / "5.4.1 Control Movement"
+_ENDS_IN_DOTTED_PART_NAME = re.compile(r"\b(?:Paragraph|Para|Section|Clause|Subclause|Chapter|Appendix|Annex|Table|"
+                                       r"Figure)\.?\s*$", re.I)
+# a section's label on a line of its own, its title on the next: "APPENDIX A" / "GLOSSARY OF TERMS"
+_SECTION_LABEL = re.compile(r"(?:APPENDIX|ANNEX)\s+(?:[A-Z]|[IVX]{1,4}|\d{1,2})\.?|SECTION\s+\d{1,2}(?:\.0)?\.?")
 
 
 _QUANTITY_FOLLOWERS = {"to", "and", "or", "max", "min", "maximum", "minimum", "nominal", "dc", "ac", "rms", "peak",
@@ -3017,6 +3660,205 @@ def _starts_new_item(text: str) -> bool:
     if m and m.group("rest")[:1].isupper():
         return True
     return _starts_with_delimited_id(t)
+
+
+def _all_underlined(lines: list) -> bool:
+    """Is every word of these lines printed underlined (see measure_text_format)?"""
+    words = [w for ln in lines for w in ln.words]
+    return bool(words) and all(w.underline for w in words)
+
+
+# a line that names an issuer of documents: a word such an organisation is named with, or its acronym in brackets
+# ("SOCIETY OF AUTOMOTIVE ENGINEERS (SAE)", "NATO STANDARDIZATION AGREEMENTS")
+_ISSUER_NAME = re.compile(r"\((?:[A-Z][A-Z0-9&/.-]{1,9})\)\s*$|\b(?:SOCIETY|COMMISSION|INSTITUTE|ASSOCIATION|ALLIANCE|"
+                          r"LABORATORIES|AGREEMENTS|ORGANI[SZ]ATION|COUNCIL|AGENCY|BUREAU|FEDERATION|CONSORTIUM|"
+                          r"COMMITTEE|ADMINISTRATION|CORPORATION|INC)\b\.?")
+
+
+def _title_x_after_dash(row: list) -> Optional[float]:
+    """Where the title starts on the first line of an entry in the dash layout ('MIL-STD-461G - Requirements ...'):
+    the left edge of the word after the dash, which is where a title with a hanging indent wraps to. None when the
+    line has no dash among its first words, or no word boxes."""
+    words = [w for ln in sorted(row, key=lambda ln: ln.box[0]) for w in (ln.words or [])]
+    for i, w in enumerate(words[:6]):
+        if w.text in ("-", "\u2013", "\u2014") and i + 1 < len(words):
+            return float(words[i + 1].box[0])
+    return None
+
+
+def _starts_document_entry(row: list, line_h: float, tab_stops_only: bool = False) -> bool:
+    """A line of a document list: it starts with a document number ("MIL-STD-461G", "QQ-A-250/4") followed by a
+    wide gap before the title, or by a dash ("MIL-STD-461G - Requirements for ...") - the layouts of section 2 of a
+    specification. Each such line starts a new entry; a document number inside running text ("... as specified in" /
+    "MIL-STD-810H, Method 514.8") has neither after it. tab_stops_only: only the layout on tab stops counts."""
+    pieces = sorted(row, key=lambda ln: ln.box[0])
+    if not pieces or not RE_DOC_ID_START.match(pieces[0].text):
+        return False
+    if _says_requirement(" ".join(ln.text for ln in pieces)):
+        return False                             # a document's title never says "shall": a requirement ("SD-12 - The ...")
+    if not tab_stops_only and re.match(r"\s*(?:" + RE_DOC_ID.pattern + r")\s+[-–—]\s+\S", " ".join(ln.text for ln in pieces)):
+        return True
+    return len(pieces) >= 2 and pieces[1].box[0] - pieces[0].box[2] >= 0.6 * line_h   # (the OCR splits only at wide gaps)
+
+
+_LISTED_DOCUMENT = re.compile(r"\s*(?:" + RE_DOC_ID.pattern + r")(?![\w/-])(?:\s+w/\s*(?:Change|CHANGE|Notice|NOTICE|"
+                              r"Amendment|AMENDMENT)\s+\d{1,3})?(?:\s*\([^)]{1,30}\))?,?(?:\s+[-–—])?"
+                              r"\s+(?P<title>[A-Z].*)$")     # (an issue date may follow the number: "(31 Jan 2019)")
+# What follows a document number in running text instead of a title: a part of the document cited by its number
+# ("MIL-STD-810H, Method 514.8, ...", "Table II lists ...", "Class 3 equipment"). A title may start with the same
+# words: "Test Method Standard, Microcircuits", "Notice 4 Digital Time ...", "Notice 2, Reliability Prediction ...".
+_CITED_PART = re.compile(r"(?P<word>Method|Procedure|Notice|Change|Revision|Amendment|Table|Figure|Appendix|"
+                         r"Paragraph|Section|Part|Volume|Vol|Class|Type|Category|Grade|Level|Test|Condition)\.?"
+                         r"(?:\s+(?P<number>\d[\w.\-/]*|[IVXL]+\b|[A-Z]\b))?\s*(?P<mark>[,;:)]?)\s*(?P<after>.*)$")
+
+
+def _cites_a_part(title: str) -> bool:
+    """Does the text after a document number cite a part of it rather than give its title ('Method 514.8,
+    Procedure I, ...', 'Table II lists ...')? A revision before the title ('Notice 2, Reliability Prediction of
+    Electronic Equipment') is not a citation."""
+    m = _CITED_PART.match(title)
+    if not m:
+        return False
+    after = m.group("after")
+    if not m.group("number"):
+        return bool(m.group("mark"))                    # "Method, ..." - "Test Method Standard" is a title
+    if not after or after[:1].islower() or re.match(r"(?:and|or|Method|Procedure)\b", after):
+        return True                                     # "Table II", "Class 3 equipment", "Method 514.8, Procedure I"
+    if m.group("word") in ("Notice", "Change", "Revision", "Amendment"):
+        return False                                    # "Notice 4 Digital ...", "Notice 2, Reliability ..."
+    return bool(m.group("mark"))
+
+
+def _reads_as_title(text: str) -> bool:
+    """Is a line worded like the rest of a document's title - no full stop at its end, and no word in small letters
+    but small linking words ('Polymer Matrix Composites Guidelines for Characterization of Structural Materials')?"""
+    t = (text or "").strip()
+    small = {"a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "at", "by", "with", "from", "as", "per", "vs"}
+    return bool(t) and not t.endswith(".") and not any(
+        w[:1].islower() and w.lower() not in small for w in (x.strip("(),;:'\"") for x in t.split()) if w[:1].isalpha())
+
+
+def _ends_real_sentence(text: str) -> bool:
+    """Does the text end a sentence: '.', '!' or '?' after a word that is not an abbreviation or a single letter, or
+    after a number or a bracket ('... Laboratory Tests.', '... (Metric).', '... Revision 1.1.' do; '... and U.S.',
+    '... Part 1:' and '... No.' do not)?"""
+    m = re.search(r"([A-Za-z]+|\d+)[)\]'\"]*[.!?]['\")]?\s*$", text or "")
+    return bool(m) and (m.group(1).isdigit() or (len(m.group(1)) > 1 and m.group(1).lower() not in _ABBREVIATIONS))
+
+
+# ... and in a list typed in capitals, after a line that ran to the margin, what a group title looks like: the
+# documents of an issuer ("DEPARTMENT OF DEFENSE STANDARDS", "OTHER GOVERNMENT DOCUMENTS, DRAWINGS, AND
+# PUBLICATIONS"), an issuer ("ASTM INTERNATIONAL", "SOCIETY OF AUTOMOTIVE ENGINEERS (SAE)", "RTCA, INC."), or an issuer
+# as a sub-title ("MILITARY", "DEPARTMENT OF THE NAVY"). "... FOR DEPARTMENT OF DEFENSE AND FEDERAL" / "SPECIFICATIONS
+# AND STANDARDS" is more of the title.
+_KINDS = r"SPECIFICATIONS|STANDARDS|HANDBOOKS|PUBLICATIONS|DRAWINGS|DOCUMENTS|REGULATIONS|MANUALS|BULLETINS|DESCRIPTIONS"
+_GROUP_TITLE_IN_CAPITALS = re.compile(
+    r"(?:DEPARTMENT OF (?:THE )?(?:DEFENSE|NAVY|ARMY|AIR FORCE)|DOD|OTHER GOVERNMENT|NON-GOVERNMENT|COMMERCIAL ITEM)\b.*\b"
+    r"(?:" + _KINDS + r")"
+    r"|(?:MILITARY|FEDERAL|INDUSTRY|GOVERNMENT|COMMERCIAL|OTHER) (?:" + _KINDS + r")"
+    r"|[A-Z]{2,6} INTERNATIONAL"
+    r"|MILITARY|FEDERAL|INDUSTRY|COMMERCIAL|NON-GOVERNMENT|GOVERNMENT|NAVY|ARMY|AIR FORCE|NASA|"
+    r"DEPARTMENT OF (?:THE )?(?:NAVY|ARMY|AIR FORCE|DEFENSE)|SPECIFICATIONS|STANDARDS|HANDBOOKS|PUBLICATIONS|DRAWINGS|"
+    r"REGULATIONS|MANUALS")
+# ... and under a title in small letters, after a line that ran to the margin: a line that names a kind or an issuer
+# ("SAE INTERNATIONAL", "NATIONAL AERONAUTICS AND SPACE ADMINISTRATION"), not "COPPER OR COPPER ALLOY" or "JAN, JANTX"
+_GROUP_TITLE_WORDS = re.compile(r"\b(?:" + _KINDS + r"|SPECIFICATION|STANDARD|HANDBOOK|MILITARY|FEDERAL|INDUSTRY|"
+                                r"GOVERNMENT|NON-GOVERNMENT|COMMERCIAL|DEPARTMENT|DEFENSE|NAVY|ARMY|AIR FORCE|NASA|OTHER|"
+                                r"INTERNATIONAL|INSTITUTE|SOCIETY|ASSOCIATION|ENGINEERS|ORGANI[SZ]ATION|COMMISSION|"
+                                r"COUNCIL|ADMINISTRATION|ALLIANCE|LABORATORIES|INC|CORPORATION|BUREAU|AGENCY|COMMAND|"
+                                r"NAVAL|CENTER|OFFICE)\b")
+
+
+def _looks_like_group_title(text: str, after_wrapped_line: bool, prev_text: str = "", entry_in_capitals: bool = False
+                            ) -> bool:
+    """Is a line in capitals under a document entry a group title ("DEPARTMENT OF DEFENSE STANDARDS", "OTHER
+    GOVERNMENT DOCUMENTS, DRAWINGS, AND PUBLICATIONS", "SAE INTERNATIONAL"), not more of the entry's title? A group
+    title has no digits ("2N2222A, JANTX AND JANS" is more of the title), and never comes after a line that stops in
+    the middle of a phrase. After a line that stops short, any such line in capitals is one; in a list typed in
+    capitals, after a line that ran to the margin, where the title may go on in capitals, it must look like one
+    (_GROUP_TITLE_IN_CAPITALS: "... AIRCRAFT INTERNAL" / "INTERFACE STANDARD" is more of the title), and under a title
+    in small letters it must name a kind or an issuer of documents (_GROUP_TITLE_WORDS)."""
+    t = (text or "").strip()
+    if not t.isupper() or re.search(r"\d", t) or word_count(t) > 10 or not _is_heading_text(re.sub(r"[,.]", " ", t)):
+        return False
+    if re.search(r"\b(?:for|of)$", (prev_text or "").rstrip(), re.I):
+        # ("... TEST METHODS FOR" / "SEMICONDUCTOR DEVICES" is more of the title; "... PACKAGING OF" / "DEPARTMENT OF
+        # DEFENSE STANDARDS" is a group)
+        return bool(_GROUP_TITLE_IN_CAPITALS.fullmatch(t.rstrip(".")))
+    if _leaves_phrase_open(prev_text):
+        return False
+    if not after_wrapped_line:
+        return True
+    return (bool(_GROUP_TITLE_IN_CAPITALS.fullmatch(t.rstrip("."))) if entry_in_capitals
+            else bool(_GROUP_TITLE_WORDS.search(t)))
+
+
+# a title that ends "... General Specification for", "..., Requirements for", "Preservation, Methods of" (as MIL titles
+# do: a capitalised word, then "for" or "of"; in capitals only these words: "... FORMAT OF" goes on) leaves no phrase
+# open; running text that ends "... as specified in" or "... limits of" does
+_TITLE_ENDS_IN_FOR = re.compile(r"\b[A-Z][a-z][\w/-]*\s+(?:for|of|For|Of)$|\b(?:SPECIFICATIONS?|STANDARDS?|HANDBOOKS?|"
+                                r"REQUIREMENTS|METHODS|PROCEDURES|PRACTICES?|GUIDELINES|CRITERIA)\s+(?:FOR|OF)$")
+
+
+# "Class A", "Level A", "Appendix A", "DAL A" at the end of a line: a designator, not the article "a" (in small letters an
+# article at the end of a line is "a")
+_ENDS_IN_DESIGNATOR = re.compile(r"\b(?:[A-Z][a-z]+|CLASS|LEVEL|TYPE|CATEGORY|OPTION|APPENDIX|ANNEX|GRADE|GROUP|DAL|PART"
+                                 r"|SECTION|TABLE|FIGURE|ZONE|MODE|METHOD|PROCEDURE|PHASE|TIER|CONDITION|CURVE)\s+A$")
+
+
+def _ends_list_item(text: str, starts_with_document: bool = False) -> bool:
+    """Does a line that leaves a phrase open still end an item of a list: '...; and', '...; or' - or, in an item that
+    starts with a document number, '...,' and '... and' ('MIL-STD-461G, RE102 ... in each of their modes, and' /
+    'MIL-STD-461G, RS103 ...')? Only a word that needs more after it ('in', 'of', 'the') carries such an item on."""
+    t = (text or "").rstrip()
+    return bool(re.search(r";\s*(?:and|or)$", t, re.I)) or (
+        starts_with_document and bool(re.search(r"(?:,|\b(?:and|or))$", t, re.I)))
+
+
+def _leaves_phrase_open(text: str, in_entry: bool = False) -> bool:
+    """Does a line stop in the middle of a phrase, so that the next line carries on the same sentence ('... as
+    specified in', '... emission limits of', '... Interference,', 'For guidance, see')? `in_entry`: the line is part
+    of a document's entry, where a title in capitals may end so too ('CAPACITORS, SELECTION AND USE OF')."""
+    t = (text or "").rstrip()
+    return (bool(_ENDS_MID_PHRASE.search(t) or re.search(r"(?:,|\bsee)$", t, re.I))
+            and not _TITLE_ENDS_IN_FOR.search(t) and not _ENDS_IN_DESIGNATOR.search(t)
+            and not (in_entry and re.search(r"(?:\b[A-Z][A-Z/-]+\s+(?:FOR|OF)|^(?:for|of|FOR|OF))$", t)))
+
+
+# "The following documents ... shall form a part of this specification" (MIL-STD-490) says which documents apply: a
+# lead-in to a list of documents, not a requirement
+_DOCUMENTS_APPLY = re.compile(r"\b(?:documents|specifications|standards|handbooks|publications|drawings)\b[^.:;]{0,150}?"
+                              r"\b(?:shall|will)\s+form\s+(?:a\s+)?part\b", re.I)
+
+
+# what a MIL-STD-490 / 961C lead-in says about its documents with "shall", naming no tests: "... the contents of this
+# specification shall be considered a superseding requirement", "the issues of these documents shall be those listed in
+# the DoDISS", "this specification shall govern"
+_LEAD_IN_BOILERPLATE = re.compile(r"superseding requirement|issues? of (?:these|the) documents shall be"
+                                  r"|shall (?:govern|take precedence)|in the event of (?:a )?conflict", re.I)
+
+
+def _says_requirement(text: str, capitals: bool = True) -> bool:
+    """Does text of a document list hold a requirement keyword used as one - in small letters, outside brackets, or
+    (`capitals`) in capitals among capitals ('THE UNIT SHALL COMPLY ...')? A document's title never says 'shall';
+    'Human Engineering (15 May 2020)' and '... 15 MAY 2020' only name a month."""
+    plain = _DOCUMENTS_APPLY.sub(" ", re.sub(r"\([^()]*\)", " ", text or ""))
+    return any(m.group(0)[:1].islower()
+               or (capitals and m.group(0).isupper() and m.group(0).lower() != "may"
+                   and not re.search(r"[a-z]", plain[max(0, m.start() - 25):m.end() + 25]))
+               for m in _modal_re().finditer(plain))
+
+
+def _starts_listed_document(text: str) -> bool:
+    """'MIL-STD-810H, Environmental Engineering Considerations ...', 'ISO 9001, Quality management systems' (or with
+    no comma, when the reading did not split the line at its gap): a document number, then a title - a line of a
+    single-spaced document list. analyze_page takes it as a new entry only in a block that began with one, or under a
+    lead-in or a sub-title, and never where the line above leaves a phrase open: a line of running text may also
+    start with a document number ('... as specified in' / 'MIL-STD-461G, RE102, and ...')."""
+    m = _LISTED_DOCUMENT.match(text)
+    # (in small letters only: "MIL-STD-461C, PART 2, CE03 LIMITS SHALL BE MET ..." under a lead-in is an item that
+    # starts with a document number, a line of its own)
+    return bool(m) and not _cites_a_part(m.group("title")) and not _says_requirement(text, capitals=False)
 
 
 def _rows_of(lines: list) -> list:
@@ -3146,8 +3988,16 @@ def _item_columns(row: list) -> tuple:
     return label_x, [x for x in values if label_x is None or x > label_x + 1]
 
 
-def classify_text_block(text: str, n_rows: int) -> tuple:
-    """-> (kind, meta) for a block of text lines."""
+def _underlined_title(text: str) -> bool:
+    """Could this wholly underlined text be a title? Short, no requirement keyword (an underlined "shall not" is
+    emphasis), not a list item and not a sentence that runs on ("... as follows:" introduces a list)."""
+    t = (text or "").strip()
+    return (0 < word_count(t) <= 12 and not _modal_re().search(t) and not RE_LIST_MARKER.match(t)
+            and not t.endswith((":", ",", ";")) and not RE_PAGE_NUMBER.match(t))
+
+
+def classify_text_block(text: str, n_rows: int, underlined: bool = False) -> tuple:
+    """-> (kind, meta) for a block of text lines. `underlined`: every word of it is printed underlined."""
     t = text.strip()
     meta = {}
     cap = RE_CAPTION.match(t)
@@ -3159,7 +4009,9 @@ def classify_text_block(text: str, n_rows: int) -> tuple:
             meta.update({"caption_kind": kind, "caption_label": f"{cap.group('kind').upper().rstrip('.')} {cap.group('num')}",
                          "continued": bool(RE_CONTINUED.search(title))})
             return "caption", meta
-    if n_rows <= 2 and _is_heading_text(t):
+    # an underlined line is a title, as a typewritten specification marks its paragraph titles - also in lower
+    # case ("Power input"), which _is_heading_text alone would not accept
+    if n_rows <= 2 and (_is_heading_text(t) or (underlined and _underlined_title(t))):
         m = RE_PARA_NUM.match(t)
         if m:
             meta["number"] = clean_para_number(m.group("num"))
@@ -3210,21 +4062,39 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
     # tiny OCR 'lines' in the outer side margins (specks, binder holes, revision bars) are noise
     lines = [ln for ln in lines if not (len(ln.text.strip()) <= 2 and not ln.text.strip().isdigit()
                                         and (ln.box[2] < 0.09 * page_w or ln.box[0] > 0.91 * page_w))]
+    # underlined words, bold lines (6b-2) - measured on the page before its clean-up, whose 3x3 median filter
+    # removes a thin underline altogether (both images have the same size and geometry)
+    measure_text_format(prep.view_image, lines, dpi)
     free = list(lines)
 
     # tables first: their words are removed from the running text
     table_captions = []       # (table box, caption lines taken out of that table's grid)
+    shown_as_list = []        # boxes of the tables shown as lists
     if settings.detect_tables and lines:
         used = set()
-        for table, tbox, inside, caption_lines in detect_tables(prep.ocr_image, lines, dpi, settings, ocr=ocr):
-            blocks.append(Block("table", page_no, tbox, lines=[lines[i] for i in sorted(inside)], table=table))
+        found = detect_tables(prep.ocr_image, lines, dpi, settings, ocr=ocr, view=prep.view_image)
+        for table, tbox, inside, caption_lines in found:
+            block = Block("table", page_no, tbox, lines=[lines[i] for i in sorted(inside)], table=table)
             used |= inside
             if caption_lines:
                 table_captions.append((tbox, {id(lines[i]) for i in caption_lines}))
+            # A table needs a heading row printed as one, or a title ("TABLE I. ..."); otherwise its rows are a
+            # list (table_rows_as_list). At the top of a page it may be the rest of a table from the page before,
+            # which repeats neither: that is decided once the whole document is read (_tables_without_titles).
+            if not (caption_lines or table.header_format or _caption_next_to(tbox, lines)):
+                above = [ln for i, ln in enumerate(lines) if i not in inside and ln.box[3] <= tbox[1]
+                         and ln.box[1] > 0.085 * page_h and not any(i in other[2] for other in found)]
+                if above:
+                    blocks.extend(table_rows_as_list(block, dpi))
+                    shown_as_list.append(tbox)           # (its ruling lines are not a figure)
+                    continue
+                block.meta["may_continue"] = True
+            blocks.append(block)
         free = [ln for i, ln in enumerate(lines) if i not in used]
 
     # figures: graphics that are not text; labels inside a figure belong to the figure
-    for fbox in detect_figures(prep, free, [b.box for b in blocks if b.kind == "table"]):
+    for fbox in detect_figures(prep, free, [b.box for b in blocks if b.kind == "table" or b.meta.get("from_table")]
+                               + shown_as_list):
         inside = [ln for ln in free if box_center_inside(ln.box, fbox)]
         if _figure_is_really_text(fbox, inside):
             continue
@@ -3277,15 +4147,17 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
     current_leaf = None
     item_by_position = False   # the block being built starts a list item found by its indent, not its marker
     current_right = None  # right edge of the column of the block being built
+    weak_start = ""       # the block being built was started only by a line that starts with a document number
+    item_x = None         # where the block being built starts, when it is an item of a list under a lead-in
 
     def flush():
-        nonlocal current, current_right, item_by_position
+        nonlocal current, current_right, item_by_position, weak_start
         current_right = None
         if not current:
             return
         all_lines = [ln for row in current for ln in row]
         text = " ".join(" ".join(ln.text for ln in row) for row in current)
-        kind, meta = classify_text_block(text, len(current))
+        kind, meta = classify_text_block(text, len(current), _all_underlined(all_lines))
         if kind == "paragraph" and _starts_list_item(text, current[0]) and not RE_PARA_NUM.match(text):
             shape = RE_MARKER_SHAPE.match(text)
             kind, meta = "list_item", {"marker": shape.group("marker") if shape else ""}
@@ -3298,17 +4170,25 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             label_rows = _wrapped_label_rows(current, stats.line_h)
             if label_rows:
                 meta["value_x"], meta["label_rows"] = label_rows       # see _block_rows
+        if weak_start:
+            meta["listed_split"] = weak_start          # "lead" or "next" (see listed_split)
+        weak_start = ""
         out.append(Block(kind, page_no, box_union(ln.box for ln in all_lines), lines=all_lines, text=text, meta=meta))
         current = []
 
-    for leaf_idx, what, obj in ordered_rows:
+    for row_idx, (leaf_idx, what, obj) in enumerate(ordered_rows):
         if what == "block":
             flush()
             out.append(obj)
             current_leaf = None
+            item_x = None
             continue
         row = obj
         row_box = box_union(ln.box for ln in row)
+        # (the text of the row after this one, for a heading whose first sub-section follows: "20 CONSTRUCTION" /
+        # "20.1 General. ...")
+        next_row_text = next((" ".join(ln.text for ln in o) for _l, w, o in ordered_rows[row_idx + 1:row_idx + 2]
+                              if w != "block"), "")
         row_text = " ".join(ln.text for ln in row)
         if current:
             prev = current[-1]
@@ -3407,6 +4287,202 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             lost_marker = (at_label and sentence_ended and not opens_sub_list and _is_item_label(row_text)
                            and bool(RE_ITEM_LABEL.match(first_text.split(None, 1)[-1])))
             new_requirement = row_text[:1].isupper() and bool(_modal_re().search(row_text))
+            # an underlined title on a line of its own ("Power input" / "The unit shall ...") ends where the
+            # underlining ends, and an underlined title under text starts a block of its own - but only where the
+            # sentence around it ended: a typewriter underlines a document's title or a word it stresses INSIDE a
+            # sentence ("... shall deliver with each unit the" / "Operation and Maintenance Manual."), and that
+            # sentence carries on through the underlined line
+            prev_title = (len(current) == 1 and _all_underlined(prev) and _underlined_title(prev_text)
+                          and not continues and not mid_phrase)
+            row_title = (_all_underlined(row) and _underlined_title(row_text) and not _all_underlined(prev)
+                         and row_text[:1].isupper() and not continues and not mid_phrase
+                         and (sentence_ended or not wrapped) and not _ENDS_MID_PHRASE.search(prev_text))
+            title_edge = (prev_title and not _all_underlined(row)) or row_title
+            document_entry = _starts_document_entry(row, stats.line_h)
+            # what is under a document entry: more of its title, or something new - a group title in capitals
+            # ("SAE INTERNATIONAL", not "... AIRCRAFT INTERNAL" / "INTERFACE STANDARD" in a list typed in capitals), or
+            # a note in brackets ("(Copies of these documents are available ...)"; a short "(Metric)" is more of the
+            # title)
+            entry_text = " ".join(ln.text for ln in sorted(current[0], key=lambda ln: ln.box[0])[1:]) or first_text
+            # (whether the line above ran to the margin - also when it ends in "U.S." or "PART 1:", which end no
+            # sentence)
+            ran_on = wrapped or (not next_word_fits and not _ends_real_sentence(prev_text))
+            group_under_entry = _looks_like_group_title(row_text, ran_on, prev_text,
+                                                        entry_in_capitals=not re.search(r"[a-z]", entry_text))
+            note_under_entry = row_text.startswith("(") and (
+                (bool(re.fullmatch(r"\(.*\)\.?", row_text))
+                 and (row_text.endswith((".)", ").")) or word_count(row_text) >= 6
+                      or (word_count(row_text) >= 3 and not RE_DATE_LINE.search(row_text)
+                          and not _reads_as_title(row_text.strip("().")))))
+                or (")" not in row_text and word_count(row_text) >= 6))
+            # an entry of a document list on tab stops carries on only in its own columns after the number - its
+            # title wrapping on the title's tab stop or a few characters right of it, or its paragraphs on theirs: a
+            # line back at the margin ("3.  REQUIREMENTS" after the last document), at another indent (a sub-title,
+            # "MILITARY") or centred ("STANDARDS") is something new. (In the dash layout, "MIL-STD-810H -
+            # Environmental ... and Laboratory" / "Tests", the title wraps to the margin: there the next entry starts
+            # with its own document number.)
+            if _starts_document_entry(current[0], stats.line_h, tab_stops_only=True):
+                stops = sorted(ln.box[0] for ln in current[0])
+                in_its_columns = (stops[1] - 0.6 * stats.line_h <= row_box[0] <= stops[1] + 4 * stats.line_h
+                                  or any(abs(row_box[0] - x) <= 0.6 * stats.line_h for x in stops[2:]))
+                # (a centred sub-title, "Non-Government publications", may start near the title's tab stop: it is one
+                # when the title above it is finished)
+                centred = (abs((row_box[0] + row_box[2]) / 2 - (text_x0 + text_w / 2)) < 1.5 * stats.line_h
+                           and abs(row_box[0] - stops[1]) > 0.6 * stats.line_h and row_box[2] - row_box[0] < 0.6 * text_w
+                           and not _leaves_phrase_open(prev_text) and not _leaves_phrase_open(row_text))
+                document_entry = (document_entry or not in_its_columns or centred or group_under_entry
+                                  or note_under_entry)
+            # a single-spaced list, "MIL-STD-810H, Environmental ..." / "MIL-STD-461G, Requirements ...": a line like
+            # that (a document number, then a title - _starts_listed_document) starts the next entry in a block that
+            # began with one, or under a line like it, a lead-in or a short title. Never inside a block that says
+            # "shall": there a document number at the start of a line is running text ("... as specified in" /
+            # "MIL-STD-461G, RE102, and ...") or an unmarked list of the standards the requirement calls up.
+            # Never where the line above leaves a phrase open ("... as specified in" / "MIL-STD-461G, RE102, and ...").
+            # A page cannot tell whether it is in a list of documents: such a line may also be running text ("3.4 EMI.
+            # Emission limits for the unit are" / "MIL-STD-461G RE102 ...", "See also" / "MIL-HDBK-454B ..."), so the
+            # block it starts is marked ("listed_split"), and finalize_document joins it back to the text above it
+            # outside a list of documents (_rejoin_running_text).
+            block_so_far = " ".join(" ".join(ln.text for ln in r) for r in current)
+            # (a line that ends "; and" may end an item of a list, and so may one that ends "," or "and" in a block
+            # that starts with a document number and says "shall": "MIL-STD-461G, RE102 ... shall be met in each of
+            # their modes, and" / "MIL-STD-461G, RS103 ..." is two items under a lead-in - _ends_list_item. Such a cut
+            # is marked "item": see below. In a list of documents, "RTCA DO-178C AND" / "EUROCAE ED-12C, ..." is one
+            # entry.)
+            doc_led = bool(RE_DOC_ID_START.match(first_text))
+            phrase_open = _leaves_phrase_open(prev_text, in_entry=_starts_listed_document(first_text))
+            item_end = _ends_list_item(prev_text, doc_led and _says_requirement(block_so_far))
+            listed_row = _starts_listed_document(row_text) and (item_end or not phrase_open)
+            listed_next = listed_row and (_starts_listed_document(first_text) or _starts_listed_document(prev_text))
+            listed_lead = listed_row and not listed_next and (
+                _introduces_list(prev_text) or bool(_DOCUMENTS_FOLLOW.search(block_so_far))
+                or (len(current) == 1 and 0 < word_count(prev_text) <= 8 and not _ends_sentence(prev_text)
+                    and not RE_PARA_NUM.match(prev_text)))
+            listed_split = listed_next or listed_lead
+            # (the paragraph number of this block, or else of the last numbered block on the page - not the number a
+            # document's own number starts with: "48 CFR 252, ...")
+            number_above = clean_para_number(first_num.group("num")) if first_num and not doc_led else next(
+                (clean_para_number(m.group("num")) for blk in reversed(out) for m in [RE_PARA_NUM.match(blk.text or "")]
+                 if m and ("." in m.group("num") or m.group("dot"))), "")
+            # an entry in the dash layout wraps to the margin, but only with more of its title: a group title after it
+            # ("DEPARTMENT OF DEFENSE STANDARDS"), a note in brackets, a list marker, or any line after a title that
+            # ended a sentence is something new ("... U.S." or "Part 1:" ends no sentence; a wrapped line of part
+            # numbers in capitals is more of the title)
+            # a document's title never runs on into a numbered heading or paragraph ("3.  REQUIREMENTS", "3.1 General.
+            # The ..."), also when the list is single-spaced and the last title has no full stop - but a title may
+            # wrap before the number of its part ("... Electronic Systems, Part" / "3 Software Requirements")
+            # (a number of several levels only after a word that takes one, "..., Paragraph" / "5.4.1 Control
+            # Movement", as a short title with no sentence after it, and only where the paragraph number above is
+            # known and this is not the paragraph that comes after it ("2.2 Non-Government publications" after 2.1);
+            # never the next top-level section: "..., AN Type" / "3 REQUIREMENTS", or any "30 ..." after 20.1)
+            row_number = clean_para_number(row_num.group("num")) if row_num else ""
+            part_number = (doc_led and bool(row_num) and not row_num.group("dot")
+                           and ((bool(_ENDS_IN_PART_NAME.search(prev_text)) and "." not in row_number)
+                                or (bool(_ENDS_IN_REVISION_NAME.search(prev_text)) and "." not in row_number
+                                    and bool(re.match(r"\d{1,3},", row_text)))
+                                or (bool(_ENDS_IN_DOTTED_PART_NAME.search(prev_text)) and "." in row_number
+                                    and bool(number_above) and word_count(row_num.group("rest")) <= 8
+                                    and not re.search(r"[.:]\s+\S", row_num.group("rest"))
+                                    and (row_number == number_above       # (its own number: "Clause" / "4.2" in 4.2)
+                                         or not plausible_next_number(number_above, row_number, max_skip=1))))
+                           and not ("." not in row_number
+                                    and ((section_type(row_num.group("rest")) in TOP_LEVEL_TYPES
+                                          and plausible_next_number(number_above, row_number))
+                                         or (row_number.isdigit() and _next_tens(number_above, int(row_number))))))
+            document_entry = document_entry or (bool(RE_DOC_ID_START.match(first_text)) and bool(RE_PARA_NUM.match(row_text))
+                                                and (_is_heading_text(row_text) or _is_titled_number(row_text))
+                                                and not part_number)
+            in_dash_entry = (bool(RE_DOC_ID_START.match(first_text)) and _starts_document_entry(current[0], stats.line_h)
+                             and not _starts_document_entry(current[0], stats.line_h, tab_stops_only=True))
+            if not document_entry and in_dash_entry:
+                # (a title may end "..., Volume 1." with more of it on the next line: "Polymer Matrix Composites ...")
+                ends = _ends_real_sentence(prev_text) and not (re.search(r"\b(?:Volume|Vol|Part|Section|No|Book)\.?\s+"
+                                                                         r"\d+\.$", prev_text, re.I)
+                                                               and _reads_as_title(row_text))
+                # (and a list under a title ending in ":" - the test methods it names, "Method 500.6 - Low Pressure")
+                cited_list = (prev_text.rstrip().endswith(":") and row_box[0] > first_box[0] + 0.6 * stats.line_h
+                              and bool(re.match(r"(?:Method|Procedure|Test|Part|Section|Table|Volume)\s+\d"
+                                                r"|\S+(?:\s+\S+)?\s+[-–—]\s+\S", row_text)))
+                # (in a list typed in capitals, a line that starts where the title starts on the entry's first line -
+                # or where a wrapped line of this entry or of an entry above starts - after a line that ran to the
+                # margin, is the title wrapping with a hanging indent, although it may be near the middle of the page:
+                # "MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF ELECTROMAGNETIC INTERFERENCE" / "CHARACTERISTICS OF
+                # SUBSYSTEMS AND EQUIPMENT" - unless it names an issuer, "SOCIETY OF AUTOMOTIVE ENGINEERS (SAE)", or is
+                # centred within half a line height. And no group title comes after a title left unfinished: "...,
+                # SECTION 300B," / "ELECTRIC POWER, ...")
+                hanging_x = [x for x in [_title_x_after_dash(current[0])] if x is not None] + [
+                    min(ln.box[0] for ln in r) for r in current[1:]]
+                for blk in out[-8:]:
+                    if blk.lines and RE_DOC_ID_START.match(blk.text or ""):
+                        top = min(ln.box[1] for ln in blk.lines)
+                        hanging_x += [ln.box[0] for ln in blk.lines if ln.box[1] > top + 0.5 * stats.line_h]
+                at_hanging_indent = (ran_on and not re.search(r"[a-z]", first_text)
+                                     and any(abs(row_box[0] - x) <= stats.line_h for x in hanging_x))
+                off_centre = abs((row_box[0] + row_box[2]) / 2 - (text_x0 + text_w / 2))
+                centred_title = (row_text.isupper() and _is_heading_text(row_text)
+                                 and row_text.count("(") == row_text.count(")")
+                                 and off_centre < 1.5 * stats.line_h
+                                 and (not at_hanging_indent or bool(_ISSUER_NAME.search(row_text))
+                                      or off_centre < 0.5 * stats.line_h)
+                                 and not _leaves_phrase_open(prev_text, in_entry=True)
+                                 and row_box[2] - row_box[0] < 0.6 * text_w
+                                 and row_box[0] > first_box[0] + 4 * stats.line_h)         # ("STANDARDS", centred)
+                document_entry = (ends or note_under_entry or bool(RE_LIST_MARKER.match(row_text)) or group_under_entry
+                                  or cited_list or _says_requirement(row_text) or _starts_with_delimited_id(row_text)
+                                  or centred_title)
+            # a heading after an entry of a document list or an item without a full stop, with a blank line between -
+            # also on a page where a blank line follows every line, so that the gap is not "wider" than usual: the
+            # entry must not swallow "3. REQUIREMENTS". Only there: in running text a short line of capitals may be
+            # the end of a sentence typed in capitals ("... AT ALL TIMES" / "DURING FLIGHT.")
+            # "APPENDIX A" or "SECTION 4" on a line of its own, its title in capitals on the next line ("GLOSSARY OF
+            # TERMS"): one heading, "APPENDIX A GLOSSARY OF TERMS" (a blank line between still makes two)
+            title_under_label = (len(current) == 1 and bool(_SECTION_LABEL.fullmatch(prev_text.strip()))
+                                 and _is_heading_text(row_text) and not RE_PARA_NUM.match(row_text)
+                                 and not _SECTION_LABEL.match(row_text) and not RE_CAPTION.match(row_text)
+                                 and not re.match(r"(?:TABLE|FIGURE|EXHIBIT)\b", row_text, re.I)
+                                 and not _ends_sentence(row_text)
+                                 and not re.search(r"^\(?(?:THIS|THE|THESE|IT)\b|\b(?:IS|ARE|WAS|WERE|BE)\b", row_text))
+            # (or the heading of a new section, its full stop lost on the scan, at 1.5 spacing: a numbered heading -
+            # "3. REQUIREMENTS", "3.2 WEIGHT", "5 DESIGN AND CONSTRUCTION" after 4.3 - "APPENDIX A", or a title in
+            # capitals under text in small letters. A line in capitals under text in capitals may be the end of a
+            # sentence typed in capitals: "... BEFORE" / "DELIVERY.")
+            heading_follows = _is_heading_text(row_text) and not part_number and (
+                bool(row_num and (not first_num
+                                  or clean_para_number(row_num.group("num")) != clean_para_number(first_num.group("num")))
+                     and ("." in row_num.group("num") + row_num.group("dot")
+                          or section_type(row_num.group("rest")) in TOP_LEVEL_TYPES
+                          or (number_above and row_num.group("rest")[:1].isupper()
+                              and word_count(row_num.group("rest")) <= 8 and not _starts_with_unit(row_num.group("rest"))
+                              and plausible_next_number(number_above, clean_para_number(row_num.group("num"))))))
+                or bool(row_num and "." not in row_num.group("num") + row_num.group("dot")
+                        and row_num.group("rest")[:1].isupper() and word_count(row_num.group("rest")) <= 10
+                        and re.match(re.escape(clean_para_number(row_num.group("num"))) + r"\.1\b", next_row_text))
+                # (an undotted number and a title, "6 Production and acceptance", with no full stop after it - up to
+                # 50, or the next tens in MIL-STD-490 numbering on a line of its own or in capitals: "60 TEST
+                # EQUIPMENT" or "60 Test equipment" after 50.2, not "60 Minutes" in the first column of a table)
+                or bool(row_num and "." not in row_num.group("num") + row_num.group("dot")
+                        and row_num.group("rest")[:1].isupper() and word_count(row_num.group("rest")) <= 10
+                        and not row_text.rstrip().endswith(".") and not _starts_with_unit(row_num.group("rest"))
+                        and clean_para_number(row_num.group("num")).isdigit()
+                        and (int(clean_para_number(row_num.group("num"))) <= 50
+                             or (_next_tens(number_above, int(clean_para_number(row_num.group("num"))))
+                                 and (row_num.group("rest").isupper() or len(row) == 1
+                                      or section_type(row_num.group("rest")) in TOP_LEVEL_TYPES))))
+                or (not row_num and bool(_SECTION_LABEL.fullmatch(row_text.strip())) and not row_text.endswith("."))
+                or (not row_num and row_text.isupper() and bool(re.search(r"[a-z]", block_so_far)))
+                # (under text in capitals, only a top-level title of its own: "QUALITY ASSURANCE PROVISIONS", not
+                # "DELIVERY.")
+                or (not row_num and row_text.isupper() and word_count(row_text) >= 2 and not row_text.endswith(".")
+                    and section_type(row_text) in TOP_LEVEL_TYPES - {"front matter"}))
+            heading_after_short_line = (_is_heading_text(row_text) and not ran_on and gap > 0.5 * stats.line_h
+                                        and not _leaves_phrase_open(prev_text) and not RE_CAPTION.match(prev_text)
+                                        and (in_list or heading_follows
+                                             or (bool(RE_DOC_ID_START.match(first_text))
+                                                 and (_starts_listed_document(first_text)
+                                                      or _starts_document_entry(current[0], stats.line_h))))
+                                        and not title_under_label and not part_number
+                                        # ("... TEST METHODS FOR" / "SEMICONDUCTOR DEVICES" is more of the title)
+                                        and not (re.search(r"\b(?:for|of)$", prev_text.rstrip(), re.I) and not row_num
+                                                 and not _GROUP_TITLE_IN_CAPITALS.fullmatch(row_text.rstrip("."))))
             hanging = (in_list and not _is_heading_text(first_text) and not lost_marker and not opens_sub_list
                        and (at_label or at_value)
                        and not RE_LIST_MARKER.match(row_text) and not RE_NUMBERED_ITEM.match(row_text)
@@ -3422,27 +4498,77 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                 or (leaf_idx != current_leaf and x_overlap < 0.3 * narrow)          # different column
                 or (gap > stats.para_gap and not continues)                        # paragraph spacing
                 or sibling_item or outdented                                       # next list item / end of list
-                or (_is_heading_text(prev_text) and len(current) == 1 and not row_text[:1].islower()
+                # (a line in lower case carries the title on - unless it starts with a list marker: "NOTES" /
+                # "a. Signal levels are ...")
+                or (_is_heading_text(prev_text) and not title_under_label
+                    and (len(current) == 1 or (len(current) == 2 and bool(_SECTION_LABEL.fullmatch(first_text.strip()))))
+                    and (not row_text[:1].islower() or RE_LIST_MARKER.match(row_text))
                     and (prev_text.rstrip().endswith((".", ":")) or prev_text.isupper() or _starts_new_item(row_text)
                          or _is_heading_text(row_text) or wider_gap or next_word_fits))
                 or (_introduces_list(prev_text) and row_box[0] > first_box[0] + 0.6 * stats.line_h      # list starts
                     and (prev_text.rstrip().endswith(":") or len(row) > 1 or RE_LIST_MARKER.match(row_text)
-                         or RE_NUMBERED_ITEM.match(row_text) or RE_BARE_MARKER.match(row[0].text)))
+                         or RE_NUMBERED_ITEM.match(row_text) or RE_BARE_MARKER.match(row[0].text))
+                    # (a document's title may hold a colon - "... Management - Part 1:" / "Configuration Management
+                    # Process" under it: under an entry of a list of documents, only a list marker or a cited part,
+                    # "Method 500.6 - Low Pressure", starts a list)
+                    and not (_starts_document_entry(current[0], stats.line_h) and not _says_requirement(block_so_far)
+                             and not RE_LIST_MARKER.match(row_text) and not RE_NUMBERED_ITEM.match(row_text)
+                             and not re.match(r"(?:Method|Procedure|Test|Part|Section|Table|Volume)\s+\d", row_text)))
                 or ((_starts_new_item(row_text) or _is_heading_text(row_text)) and (sentence_ended or wider_gap))
                 or (sentence_ended and prev_box[2] < block_box[2] - 0.25 * (block_box[2] - block_box[0])
                     and len(current) > 1)                                           # short last line of a paragraph
                 or (max(prev_h, row_h) > 1.45 * max(1, min(prev_h, row_h)))         # font size change
                 or lost_marker                                                      # next item, marker lost
+                # a list item's marker left of the block it follows: "2.  The transponder shall ..." after the
+                # documents indented under item 1, also when the last of them has no full stop
+                or (bool(RE_NUMBERED_ITEM.match(row_text) or RE_LIST_MARKER.match(row_text))
+                    and row_box[0] < first_box[0] - 0.6 * stats.line_h)
                 or numbered_next                                                    # 3.5 -> 3.5.1
+                or title_edge                                                       # an underlined title
+                or document_entry                                                   # "MIL-STD-461G   Title ..."
+                or heading_after_short_line                                         # "... Equipment" / "3. REQ..."
                 # a new sentence after a blank line under a finished item, outside its value column - or a
                 # requirement of its own under an item without a full stop ("b. Track mode" / "The operator shall")
                 or (in_list and wider_gap and not at_value
                     and ((sentence_ended and row_text[:1].isupper()) or new_requirement))
             )
+            # (a new block for that reason alone is marked: see listed_split. "lead" also inside a block that states a
+            # requirement, under a line that leaves its sentence open: no list of documents says "shall". "item" where
+            # only an item of a list under a lead-in would be cut: after "; and", or in a block that starts with a
+            # document number and says "shall" - "MIL-STD-461G, CE102 ... shall be met on all power leads" /
+            # "MIL-STD-461G, RE102 ..." - when the lead-in is not on this page above it; finalize_document keeps the
+            # cut only when the block above is such an item, with its lead-in on the page or column before)
+            weak_split = ""
+            if listed_split and not new_block:
+                requirement_open = _says_requirement(block_so_far) and not _ends_sentence(prev_text)
+                # ("lead" too under a line of a paragraph that did not start with a document: "... shall be marked IAW
+                # MIL-STD-130N, ...;" / "MIL-STD-129R, ..." is running text)
+                if (listed_lead or (requirement_open and item_x is None and not doc_led)
+                        or (item_x is None and not _starts_listed_document(first_text) and not doc_led)):
+                    weak_split = "lead"
+                elif item_x is None and ((phrase_open and item_end) or (doc_led and requirement_open)):
+                    weak_split = "item"
+                else:
+                    weak_split = "next"
+            new_block = new_block or listed_split
             if new_block and hanging and max(prev_h, row_h) <= 1.45 * max(1, min(prev_h, row_h)):
                 new_block = False
+            # inside an entry of a list of documents in the dash layout, only the rules for such an entry end it (and
+            # spacing, a column or a type size): "... AND U.S." / "GOVERNMENT STORAGE FACILITIES" in a list typed in
+            # capitals is more of the title, although the line above ends in a full stop
+            if (new_block and in_dash_entry and not document_entry and not listed_split and not heading_after_short_line
+                    and not (gap < -0.3 * stats.line_h or (leaf_idx != current_leaf and x_overlap < 0.3 * narrow)
+                             or (gap > stats.para_gap and not continues)
+                             or max(prev_h, row_h) > 1.45 * max(1, min(prev_h, row_h)))):
+                new_block = False
             if new_block:
+                # (an item of a list under a lead-in, or the next one level with it)
+                if _introduces_list(prev_text) and row_box[0] > first_box[0] + 0.6 * stats.line_h:
+                    item_x = row_box[0]
+                elif item_x is None or abs(row_box[0] - item_x) > 0.6 * stats.line_h:
+                    item_x = None
                 flush()
+                weak_start = weak_split
                 # only a line that starts with something SHAPED like a marker ("C." "e." "3)"): a numbered
                 # paragraph ("3.4 Mass. ...") or a sentence level with the list is not an item
                 item_by_position = bool((sibling_item and (item_by_indent or next_in_sequence) and RE_MARKER_SHAPE.match(row_text)
@@ -3560,6 +4686,16 @@ rms vrms grms arms rpm psig psid vdc vac dbm dbw ghz gpm cfm pps bps kbps mbps g
 """.split())
 
 
+# What the scan most often reads in place of what was printed: a digit for the letter it resembles (and back),
+# one letter for another of nearly the same shape, and two letters that run together as one ("rn" for "m").
+# Used by WordChecker.correct, which only changes a word when exactly ONE ordinary word comes out of it.
+_LOOKALIKES = {"0": "o", "1": "li", "l": "i", "i": "l", "|": "li", "!": "li", "5": "s", "$": "s", "8": "b",
+               "6": "b", "c": "e", "e": "c", "u": "v", "v": "u", "n": "h", "h": "n"}
+_LOOKALIKE_PAIRS = {"rn": "m", "m": "rn", "cl": "d", "vv": "w", "ii": "u", "nn": "m", "ri": "n"}
+_SAME_SHAPE_CAPITALS = set("COSVWXZ")         # capitals the scan cannot tell from their small letters
+_NUMBER_LOOKALIKES = str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "|": "1"})
+
+
 class WordChecker:
     """Spots OCR misreads the OCR engine itself is confident about. Tested on the degraded test
     scans: most real misreads ('telémetry', 'fro', 'governmient', '16.AWG') scored above 0.95,
@@ -3568,7 +4704,8 @@ class WordChecker:
       * a word that is not in an English dictionary (pyspellchecker, MIT) and occurs only once
       * a rare word one letter away from a common word of the same document ('fro' vs 'from')
       * punctuation inside a word ('Rev'A')
-    Nothing is ever auto-corrected except the accent marks."""
+    Accent marks are removed. Misreads that can be undone with confidence are corrected by `correct` (and the
+    correction is shown in both outputs); everything else is only flagged."""
 
     def __init__(self, counts: Counter, settings: "Settings", ids: Counter = None):
         self.counts = counts
@@ -3621,6 +4758,136 @@ class WordChecker:
 
     def clean(self, raw: str) -> str:
         return remove_ocr_specks(strip_accents(raw) if self.settings.english_text else raw)
+
+    # ---- autocorrection (see Settings.autocorrect) ----------------------------------------------------------
+    def _known(self, word: str) -> bool:
+        """An ordinary word: in the dictionary, or written at least twice in this document."""
+        return (self.spell is not None and word in self.spell) or self.counts.get(word, 0) >= 2
+
+    def _lookalike_variants(self, word: str) -> set:
+        """Every spelling of `word` (lower case) with one or two look-alike characters swapped back."""
+        edits = []
+        for i, ch in enumerate(word):
+            edits += [(i, 1, rep) for rep in _LOOKALIKES.get(ch, "")]
+            pair = word[i:i + 2]
+            if pair in _LOOKALIKE_PAIRS:
+                edits.append((i, 2, _LOOKALIKE_PAIRS[pair]))
+
+        def apply(chosen):
+            out, pos = [], 0
+            for i, n, rep in sorted(chosen):
+                out.append(word[pos:i] + rep)
+                pos = i + n
+            return "".join(out) + word[pos:]
+        found = {apply([e]) for e in edits}
+        if len(edits) <= 24:                           # (a long word full of look-alikes: one swap only)
+            found |= {apply([a, b]) for k, a in enumerate(edits) for b in edits[k + 1:] if a[0] + a[1] <= b[0]}
+        found.discard(word)
+        return found
+
+    def _best(self, candidates: set) -> str:
+        """The one candidate clearly more likely than the others, or "" when two are about as likely."""
+        if not candidates:
+            return ""
+        ranked = sorted(candidates, key=lambda w: (self.counts.get(w, 0),
+                                                    self.spell.word_usage_frequency(w) if self.spell is not None else 0),
+                        reverse=True)
+        if len(ranked) == 1:
+            return ranked[0]
+        first, second = ranked[0], ranked[1]
+        c1, c2 = self.counts.get(first, 0), self.counts.get(second, 0)
+        f1 = self.spell.word_usage_frequency(first) if self.spell is not None else 0
+        f2 = self.spell.word_usage_frequency(second) if self.spell is not None else 0
+        return first if (c1 >= 2 and c1 >= 3 * max(c2, 1)) or (c1 >= c2 and f1 >= 20 * max(f2, 1e-12)) else ""
+
+    def correct(self, part: str, issue: str, sentence_start: bool = False) -> tuple:
+        """(corrected text, how) for one cleaned token the scan misread in a way that can be undone with
+        confidence - or ("", "") to leave it as read. Only these are corrected:
+          * a word with a look-alike character INSIDE it ("requ1red", "c0ntrol", "sha1l") when exactly one ordinary
+            word comes out of swapping it back ("required", "control", "shall");
+          * a word of six letters or more misread by letters of nearly the same shape ("systern", "rnodule",
+            "telernetry") when exactly one everyday word, or a word of this document, comes out ("system" ...).
+            In a shorter word such a swap is no evidence of a misread: almost any short term ("clk", "Rcv", "Ncm")
+            turns into some dictionary word that way;
+          * a word the checker flagged whose ordinary twin this document also writes ("governmient", with
+            "government" elsewhere), five letters or longer, not a dictionary word itself, and not differing in
+            its first two letters (a prefix: "defueled" is not "refueled"). This guess is less certain than a
+            look-alike swap, so the word is still marked for a check ("twin");
+          * a capital in the middle of a small-letter word that has the same shape as its small letter
+            ("sCope", "proVide");
+          * a number with a letter O, or an l / I / | between or before digits ("1O0" -> "100", "l5.5" -> "15.5").
+            At the end of a number an "l" is the litre sign ("20l"), and a "|" at either end is a table's rule.
+            These are also flagged for review, because a number decides what a requirement says.
+        Never changed: a word written the same way twice or more in the document (a term of the document, or a
+        misread the reviewer will see repeated, which the yellow mark already shows); a short word in capitals
+        and a Roman numeral ("UTC" is not "UTE", "VIII" not "VUL"); a term with a capital inside it ("PCIe",
+        "NiCd", "mAh", "DoS"); and a word with a number at its start or end ("Mode5", "Note1", "Pin5"), whose
+        number is part of what it says."""
+        lead = re.match(r"^[(\[\"'`]*", part).group(0)
+        tail = re.search(r"[)\].,;:!?\"'`]*$", part[len(lead):]).group(0)
+        core = part[len(lead):len(part) - len(tail)] if tail else part[len(lead):]
+        if len(core) < 2 or "-" in core or "/" in core or "@" in core:
+            return "", ""
+        # a number with a letter that looks like a digit in it
+        if re.fullmatch(r"[0-9OoIl|]+(?:[.,][0-9OoIl|]+)*", core) and re.search(r"[OoIl|]", core):
+            if re.search(r"[Il|]$", core) or core.startswith("|"):
+                return "", ""                    # "20l" (litres), "12|" (a table's rule): left as read
+            digits = sum(ch.isdigit() for ch in core)
+            if digits >= 2 or re.fullmatch(r"[Oo]\.\d+|\d+\.[Oo]", core):
+                fixed = core.translate(_NUMBER_LOOKALIKES)
+                if re.fullmatch(r"\d+(?:[.,]\d+)*", fixed) and not re.fullmatch(r"[0Il|]+", core):
+                    return lead + fixed + tail, "number"
+            return "", ""
+        if (self.counts.get(core.lower(), 0) >= 2 or self.ids.get(core, 0) >= 2
+                or sum(ch.isalpha() for ch in core) < 3):
+            return "", ""
+        if (core.isalpha() and core.isupper() and len(core) <= 6) or core.lower() in _ROMANS:
+            return "", ""                        # an acronym ("UTC", "GPS") or a numeral ("VIII"): not a word
+        letters_only = re.sub(r"[^A-Za-z]", "", core)
+        # a capital of the same shape inside a small-letter word: "sCope" -> "scope" (not "DoS", "PostScript")
+        inner = [k for k, ch in enumerate(core) if k and ch.isupper()]
+        if (inner and core.isalpha() and core[0].islower() and len(core) >= 5
+                and all(core[k] in _SAME_SHAPE_CAPITALS and k + 1 < len(core) and core[k - 1].islower()
+                        and core[k + 1].islower() for k in inner)
+                and self.spell is not None and core.lower() in self.spell):
+            fixed = core[0] + core[1:].lower()
+            return lead + fixed + tail, "capital"
+        if self.spell is None:
+            return "", ""
+        if re.search(r"[A-Z]", letters_only[1:]) and not letters_only.isupper():
+            return "", ""                        # "PCIe", "NiCd", "mAh", "BoM": a term, not a misread
+        glued = re.fullmatch(r"(\d*)([A-Za-z]+)(\d*)", core)
+        if glued and (glued.group(1) or glued.group(3)) and self._known(glued.group(2).lower()):
+            return "", ""                        # "Mode5", "Note1", "Pin5": a word and its number
+        low = core.lower()
+        word, how = "", "word"
+        if not re.fullmatch(r"[a-z]+", low) or low not in self.spell:
+            candidates = {v for v in self._lookalike_variants(low) if v.isalpha() and len(v) >= 3 and self._known(v)}
+            if not re.search(r"[0-9|!$]", core):         # letters of nearly the same shape only (rn/m, c/e, n/h ...)
+                candidates = {v for v in candidates if len(letters_only) >= 6 and self._everyday(v)}
+            word = self._best(candidates)
+        if not word and issue and len(low) >= 5 and re.fullmatch(r"[a-z]+", low) and low not in self.spell:
+            # one letter more, less or different from an ordinary word this document writes elsewhere. Less
+            # certain than a look-alike swap, and a sign the scan is hard to read here: still checked (see "twin")
+            twin = re.search(r"(?:also writes|possible misread of) '([a-z]+)'", issue)
+            word, how = (twin.group(1) if twin else self._document_twin(low)), "twin"
+            if word and (self.counts.get(word, 0) < 2 or word[:2] != low[:2]):
+                word = ""                        # (not a prefix: "defueled" is not "refueled", "dearm" not "rearm")
+        if not word or word == low:
+            return "", ""
+        # the case of the word as printed: all capitals, a capital first letter, or a sentence that starts here
+        # (when the first character itself was the misread one, only the sentence can say)
+        if letters_only.isupper() and len(letters_only) >= 2:
+            word = word.upper()
+        elif (core[:1].isupper() and word[0] == low[0]) or (sentence_start and word[0] != low[0]):
+            word = word.capitalize()
+        return lead + word + tail, how
+
+    def _everyday(self, word: str) -> bool:
+        """A word common enough in English, or one of this document or of the engineering list, to be what a
+        misread of nearly the same shape meant (a rare dictionary word such as "hied" or "pele" is not)."""
+        return (self.counts.get(word, 0) >= 1 or word in ENGINEERING_WORDS
+                or word in self.settings.extra_dictionary_words or self.spell.word_usage_frequency(word) >= 1e-6)
 
     def issue(self, raw: str, clean: str) -> str:
         key = (raw, clean)
@@ -3691,8 +4958,8 @@ def build_text_context(blocks: list, settings: "Settings") -> TextContext:
                     counts[tok.lower()] += 1
                 for part in plain.split():
                     core = part.strip(".,;:()[]{}\"'!?")
-                    if len(core) >= 5 and re.search(r"\d", core) and re.search(r"[A-Za-z]", core):
-                        ids[core] += 1
+                    if len(core) >= 2 and re.search(r"\d", core) and re.search(r"[A-Za-z]", core):
+                        ids[core] += 1          # (identifiers, and words written with their number: "Mode1")
     return TextContext(set(counts), counts, WordChecker(counts, settings, ids))
 
 
@@ -3719,19 +4986,69 @@ def token_attention(token: tuple, settings: "Settings") -> str:
     return ""
 
 
-def word_tokens(words: Iterable, ctx: TextContext) -> list:
-    """[(clean text, confidence, issue)] for a sequence of OCR words."""
+class Token(NamedTuple):
+    """One word of the text as the exports show it."""
+    text: str                 # the word (cleaned, and corrected where WordChecker.correct was sure)
+    conf: float               # the OCR confidence of the word
+    issue: str = ""           # why the word deserves a check against the scan ("" = none)
+    line_start: bool = False  # it is the first word of a printed line (see block_token_rows)
+    original: str = ""        # the word as the scan was read, when it was corrected ("" = not corrected)
+    underline: bool = False   # printed underlined
+
+
+# The check kept on a word corrected from a similar word the document writes elsewhere (WordChecker.correct, "twin")
+TWIN_CORRECTION = "corrected from '{}': one letter differs from a word this document writes"
+
+
+# the end of the note on a word that --no-autocorrect left as read ("looks like a misread of 'control' (left ...)")
+LEFT_AS_READ = "(left as read: autocorrect is off)"
+
+
+def token_original(token: tuple) -> str:
+    """What the scan read for a corrected token ("" when it was not corrected)."""
+    return token[4] if len(token) > 4 else ""
+
+
+def token_corrections(tokens: Iterable) -> list:
+    """["'sha1l' -> 'shall'", ...] for the corrected tokens, each once, in order."""
     out = []
+    for t in tokens:
+        if token_original(t):
+            note = f"'{token_original(t)}' -> '{t[0]}'"
+            if note not in out:
+                out.append(note)
+    return out
+
+
+def word_tokens(words: Iterable, ctx: TextContext, sentence_start: bool = True) -> list:
+    """[Token(clean text, confidence, issue, ...)] for a sequence of OCR words. A word the scan misread in a way
+    that can be undone with confidence is corrected here (WordChecker.correct), and keeps what was read.
+    sentence_start: whether the first word starts a sentence (not when it is a wrapped line of one)."""
+    out = []
+    autocorrect = ctx.checker.settings.autocorrect
     for w in words:
         clean = ctx.checker.clean(w.text)
         if not clean:
             continue
+        underline = bool(getattr(w, "underline", False))
         if out and re.fullmatch(r"[.,;:]", clean):
-            prev = out[-1]
-            out[-1] = (prev[0] + clean, min(prev[1], w.conf), prev[2])   # "mode ." -> "mode."
+            prev = out[-1]                                                  # "mode ." -> "mode."
+            out[-1] = prev._replace(text=prev.text + clean, conf=min(prev.conf, w.conf),
+                                    original=prev.original + clean if prev.original else "")
             continue
         issue = ctx.checker.issue(w.text, clean)
-        out.extend((part, w.conf, issue) for part in clean.split(" "))
+        for part in clean.split(" "):
+            starts = sentence_start if not out else bool(re.search(r"[.!?:]$", out[-1].text))
+            fixed, why = ctx.checker.correct(part, issue, starts)
+            if fixed and fixed != part and autocorrect:
+                check = TWIN_CORRECTION.format(part) if why == "twin" else ""   # (a guess: still checked)
+                out.append(Token(fixed, w.conf, check, False, part, underline))
+            elif fixed and fixed != part:
+                # --no-autocorrect: left as read, but marked for a check with what it would have become
+                note = f"looks like a misread of '{fixed}' {LEFT_AS_READ}"
+                out.append(Token(part, w.conf, f"{issue}; {note}" if issue else note, False, "", underline))
+            else:
+                out.append(Token(part, w.conf, issue, False, "", underline))
     return out
 
 
@@ -3741,27 +5058,45 @@ def block_token_rows(block: Block, ctx: TextContext) -> list:
     elsewhere in the document ("require-" + "ment" -> "requirement"), otherwise the hyphen is kept
     ("track-while-" + "scan"). Paper specks read as punctuation are removed; suspicious words get an
     'issue' text."""
-    raw_rows = []                                       # [[(raw text, conf)]] per row
+    raw_rows = []                                       # [[(raw text, conf, underlined)]] per row
     last = None                                         # (row index, token index) of the last token
-    for row in _block_rows(block):
+    cells = block.meta.get("cells") if block.meta.get("from_table") else None
+    if cells:
+        # a row of a table shown as a list (table_rows_as_list): its cells in order, each from the words the OCR
+        # read in it - the same text the exports show, also where a cell is merged over several rows
+        words, confs, row = block.meta.get("cell_words") or [], block.meta.get("cell_conf") or [], []
+        for c, cell in enumerate(cells):
+            if (cell or "").strip():
+                own = words[c] if c < len(words) and words[c] else [[w, confs[c] if c < len(confs) else 1.0]
+                                                                     for w in cell.split()]
+                row += [(str(w), float(cf), False) for w, cf in own]
+        raw_rows.append(row)
+    for row in ([] if cells else _block_rows(block)):
         current = []
         raw_rows.append(current)
         for k, w in enumerate(w for ln in row for w in ln.words):
             if k == 0 and last is not None:
-                prev_text, prev_conf = raw_rows[last[0]][last[1]]
+                prev_text, prev_conf, _underline = raw_rows[last[0]][last[1]]
                 if prev_text.endswith("-") and w.text[:1].islower():
                     head = re.search(r"([A-Za-z]+)-$", prev_text)
                     tail = re.match(r"[A-Za-z]+", w.text)
                     joined = prev_text[:-1] + w.text if head and tail and (head.group(1) + tail.group(0)).lower() in ctx.vocab \
                         else prev_text + w.text
-                    raw_rows[last[0]][last[1]] = (joined, min(prev_conf, w.conf))
+                    raw_rows[last[0]][last[1]] = (joined, min(prev_conf, w.conf), raw_rows[last[0]][last[1]][2])
                     continue
-            current.append((w.text, w.conf))
+            current.append((w.text, w.conf, w.underline))
             last = (len(raw_rows) - 1, len(current) - 1)
-    token_rows = [word_tokens((Word(t, c, (0, 0, 0, 0)) for t, c in r), ctx) for r in raw_rows]
-    # the first word of each further line is marked (a 4th field), so a check can tell a full stop at
+    token_rows, ended = [], True                        # (a wrapped line does not start a sentence)
+    for r in raw_rows:
+        token_rows.append(word_tokens((Word(t, c, (0, 0, 0, 0), u) for t, c, u in r), ctx, ended))
+        if token_rows[-1]:
+            ended = bool(re.search(r"[.!?:]$", token_rows[-1][-1].text))
+    fix = block.meta.get("marker_fix")                  # a list marker the sequence corrected ("C." -> "c.")
+    if fix and token_rows and token_rows[0] and token_rows[0][0].text == fix[0]:
+        token_rows[0][0] = token_rows[0][0]._replace(text=fix[1], original=fix[0], issue="")
+    # the first word of each further line is marked (line_start), so a check can tell a full stop at
     # the end of a line from a speck in the middle of one
-    return [[(r[0][0], r[0][1], r[0][2], True)] + r[1:] if k and r else r for k, r in enumerate(token_rows)]
+    return [[r[0]._replace(line_start=True)] + r[1:] if k and r else r for k, r in enumerate(token_rows)]
 
 
 def block_tokens(block: Block, ctx: TextContext) -> list:
@@ -3779,7 +5114,12 @@ def _text_rows(block: Block) -> list:
 def _on_new_line(tokens: list) -> list:
     """The tokens of a block that is joined on to the text above it: its first word starts a line
     (see block_token_rows), so a full stop just before it ends that line, not a sentence part-way."""
-    return [(tokens[0][0], tokens[0][1], tokens[0][2] if len(tokens[0]) > 2 else "", True)] + list(tokens[1:]) if tokens else []
+    if not tokens:
+        return []
+    first = tokens[0]
+    first = first._replace(line_start=True) if isinstance(first, Token) else Token(first[0], first[1],
+                                                                                   first[2] if len(first) > 2 else "", True)
+    return [first] + list(tokens[1:])
 
 
 def _block_rows(block: Block) -> list:
@@ -3810,6 +5150,23 @@ def tokens_text(tokens: list) -> tuple:
     return " ".join(parts), spans
 
 
+def _part_tokens(tokens: list, spans: list, start: int, end: int) -> list:
+    """The tokens of text[start:end] (tokens_text). A token the boundary cuts gives the part its own piece: the scan
+    may lose the space after a run-in title ("3.2.4 Leakage.No current shall ..."), and the title ends inside the
+    word - 'Leakage.' goes with the heading, 'No' with the text."""
+    out = []
+    for t, (a, z) in zip(tokens, spans):
+        lo, hi = max(a, start), min(z, end)
+        if lo >= hi:
+            continue                                     # the token is in another part
+        piece = t[0][lo - a:hi - a].strip()
+        if (lo, hi) == (a, z):
+            out.append(t)
+        elif piece:
+            out.append(t._replace(text=piece) if isinstance(t, Token) else (piece,) + tuple(t[1:]))
+    return out
+
+
 def finalize_document(doc: DocResult, settings: Settings) -> None:
     for i, b in enumerate(doc.blocks, 1):
         b.uid = i
@@ -3817,23 +5174,81 @@ def finalize_document(doc: DocResult, settings: Settings) -> None:
     ctx = build_text_context(doc.blocks, settings)
     doc._text_ctx = ctx                         # re-used by extraction and the exports
     for b in doc.blocks:
-        if b.kind not in ("table", "figure") and b.lines:
-            b.text = tokens_text(block_tokens(b, ctx))[0]
+        if b.kind not in ("table", "figure") and (b.lines or b.meta.get("from_table")):
+            tokens = block_tokens(b, ctx)
+            b.text = tokens_text(tokens)[0]
+            if b.kind == "heading" and b.meta.get("title") and token_corrections(tokens):
+                # a heading's title as corrected too, so the Section column, the Document Structure sheet and the
+                # Word headings agree ("3.1 P0WER SUPP1Y" -> "3.1 POWER SUPPLY"); the corrections are listed there
+                title = b.meta["title"]
+                for t in tokens:
+                    was, now = token_original(t).strip(".,;:()"), t[0].strip(".,;:()")
+                    if was and was != now:
+                        # (a whole word, also beside punctuation: "Contr0l, display", "(p0wer)")
+                        title = re.sub(r"(?<![\w-])" + re.escape(was) + r"(?![\w-])", now, title)
+                b.meta["title"], b.meta["corrections"] = title, token_corrections(tokens)
         if b.kind == "table" and b.table is not None:
             b.table.grid = [[ctx.checker.clean(c) if c else c for c in row] for row in b.table.grid]
+            if settings.autocorrect:
+                _correct_table_cells(b, ctx)
     _mark_page_furniture(doc)
+    _rejoin_running_text(doc)
     _merge_across_pages(doc)
     if settings.merge_continued_tables:
         _merge_continued_tables(doc)
     for i, b in enumerate(doc.blocks, 1):      # renumber BEFORE linking captions (merges removed blocks)
         b.uid = i
     _link_captions(doc)
+    if _tables_without_titles(doc, ctx):
+        new_uid = {}
+        for i, b in enumerate(doc.blocks, 1):
+            new_uid[b.uid], b.uid = i, i
+        for b in doc.blocks:                       # (a caption names its table or figure by that number)
+            if b.meta.get("caption_of") in new_uid:
+                b.meta["caption_of"] = new_uid[b.meta["caption_of"]]
     # page statistics for the "Page Quality" sheet
     for p in doc.pages:
         page_lines = [ln for b in doc.blocks if b.page == p.number for ln in b.lines]
         p.n_lines = len(page_lines)
         p.mean_conf = round(float(statistics.fmean(ln.conf for ln in page_lines)), 4) if page_lines else 1.0
         p.low_conf_lines = sum(1 for ln in page_lines if ln.min_word_conf < settings.review_confidence)
+
+
+def _correct_table_cells(block: Block, ctx: TextContext) -> None:
+    """Undo the misreads in a table's cells that WordChecker.correct is sure of. The corrections are kept in
+    block.meta["cell_corrections"] ({"row,column": [[read, corrected, how], ...]}) for the exports."""
+    t, fixes = block.table, {}
+    for r, row in enumerate(t.grid):
+        for c, cell in enumerate(row):
+            if not cell:
+                continue
+            found = []
+
+            def fix(m, found=found):
+                word = m.group(0)
+                corrected, how = ctx.checker.correct(word, ctx.checker.issue(word, word), m.start() == 0)
+                if corrected and corrected != word:
+                    found.append([word, corrected, how])
+                    return corrected
+                return word
+            new = re.sub(r"\S+", fix, cell)
+            if found:
+                if not _cell_words(t, r, c):          # (no OCR words kept for the cell, as from Docling: keep
+                    conf = t.conf[r][c] if r < len(t.conf) and c < len(t.conf[r]) else 1.0   # what was read, so
+                    _set_cell_words(t, r, c, [[w, conf] for w in cell.split()])   # its rows still flag the change)
+                row[c] = new
+                fixes[f"{r},{c}"] = found
+    if fixes:
+        block.meta["cell_corrections"] = fixes
+
+
+def _set_cell_words(t: TableData, r: int, c: int, words: list) -> None:
+    """Give one cell its OCR words, making the table's cell_words grid as large as its text grid first."""
+    while len(t.cell_words) < len(t.grid):
+        t.cell_words.append([])
+    for k, row in enumerate(t.grid):
+        t.cell_words[k] = list(t.cell_words[k]) + [[] for _ in range(len(row) - len(t.cell_words[k]))]
+    t.cell_words[r][c] = words
 
 
 def _mark_page_furniture(doc: DocResult) -> None:
@@ -3900,6 +5315,104 @@ _ENDS_MID_SENTENCE = re.compile(r"(?:-|,|\b(?:and|or|the|of|to|a|an|in|for|with|
                                 r"from|at|on|as|per|that|which))$", re.I)
 
 
+def _rejoin_running_text(doc: DocResult) -> None:
+    """analyze_page starts a new paragraph at a single-spaced line that starts with a document number and a title
+    ("MIL-STD-461G, Requirements ...") and marks it (meta "listed_split"): on its own page it cannot tell a list of
+    documents from running text that names documents ("3.4 EMI. Emission limits for the unit are" / "MIL-STD-461G
+    RE102 and CE102 for Navy aircraft, ..."). Here, with the whole document in order, such a paragraph is joined back
+    to the one it was cut from unless it is in a list of documents: a section numbered 2, or one titled as a list of
+    documents ("1.2 Applicable documents", "20. APPLICABLE DOCUMENTS", in an appendix's x.2 also "A.2 NORMATIVE
+    REFERENCES", or "A.2 STANDARDS" from its lead-in on) or saying that one follows ("The following documents form a
+    part of ...") - the sections read_document_lists reads. A paragraph marked "lead" (cut under a lead-in or a short
+    line) is joined back; one marked "next" (cut under a line like it) only in the same run as one joined back, so
+    that lines of documents under a heading stay as they are; one marked "item" unless it follows an item of a list
+    under a lead-in (on this page or the one before); and nothing is joined before the first heading, where the scan
+    may start inside a list."""
+    in_list, list_parts = None, None  # None: not known yet (the scan may start inside a list)
+    top_type, top_number = "", None   # the type and number of the top-level section now open ("", None: not known)
+    joined = False                    # the block above was joined back to the text above it
+    above_is_item = False             # the paragraph above is an item of a list under a lead-in (see "item")
+    lead_in_opens = False             # under "A.2 STANDARDS": a lead-in "The following documents ..." opens its list
+    body_above = None                 # the last block kept that is not page furniture
+    kept = []
+    for b in doc.blocks:
+        if b.kind in ("page_header", "page_footer"):
+            kept.append(b)
+            continue
+        text = b.text or ""
+        number, title = "", ""
+        if b.kind == "heading":
+            number = b.meta.get("number", "")
+            title = (b.meta.get("title") or text).strip()
+        elif b.kind == "paragraph":
+            m = RE_PARA_NUM.match(text)
+            if (m and ("." in m.group("num") or m.group("dot")) and m.group("rest")[:1].isupper()
+                    and not _starts_with_unit(m.group("rest"))):
+                number, title = m.group("num"), re.split(r"[.:]\s", m.group("rest") + " ", maxsplit=1)[0]
+        parts = _number_parts(_outline_number(number)) if number else None
+        if b.kind == "heading" and ((parts and len(parts) == 1) or (not parts and section_type(title) in TOP_LEVEL_TYPES)):
+            plain_title = " ".join(title.lower().split()).strip(" .:")
+            top_type = section_type(title) or (
+                "applicable documents" if (_DOCUMENT_LIST_TITLES.fullmatch(plain_title) or re.search(
+                    r"\b(?:documents?|documentation|standards|specifications|references|publications|handbooks|"
+                    r"drawings)$", plain_title)) else "other")         # ("2. STANDARDS", "2. NORMATIVE REFERENCES")
+            top_number = parts[0] if parts else None
+        elif parts and parts[0] != top_number:
+            top_type, top_number = "", parts[0]                # (its heading was lost: "2.1" after section 1)
+        if parts or b.kind == "heading":
+            plain = " ".join(title.lower().split()).strip(" .:")
+            # (section 2 of a MIL-STD-961 document; in an appendix, or where section 2 is something else, only a title
+            # that names a list of documents counts. In a section of documents - an appendix's own x.2, a MIL-STD-490
+            # appendix's 20 - so does a compound title, "A.2 NORMATIVE REFERENCES", "20. APPLICABLE STANDARDS", and a
+            # plain one, "A.2 STANDARDS", from a lead-in under it on: "The following documents form a part of this
+            # appendix ...". Elsewhere such titles may hold requirements: "3.4 Applicable standards. The unit shall
+            # ...", "A.2.3 Drawings. Drawings shall be prepared ...")
+            in_section_2 = bool(parts) and parts[0] == 2 and top_type in ("", "applicable documents")
+            documents_section = in_section_2 or (bool(parts) and ((len(parts) == 2 and parts[0] < 0 and parts[1] == 2)
+                                                                  or tuple(parts) == (20,)))
+            names_list = (section_type(title) == "applicable documents"
+                          or (bool(_DOCUMENT_LIST_TITLES.fullmatch(plain))
+                              and (in_section_2 or not _GENERIC_LIST_TITLES.fullmatch(plain)))   # ("3.4 Standards.")
+                          or (bool(_COMPOUND_LIST_TITLES.fullmatch(plain)) and documents_section)
+                          or (bool(_DOCUMENTS_FOLLOW.search(text)) and not _says_requirement(text)))
+            lead_in_opens = False
+            if names_list or in_section_2:
+                in_list, list_parts = True, parts
+            elif parts and list_parts and tuple(parts[:len(list_parts)]) == tuple(list_parts):
+                pass                                           # 1.2.1 inside "1.2 Applicable documents"
+            elif parts or section_type(title) in TOP_LEVEL_TYPES or _APPENDIX_TITLE.match(title):
+                in_list, list_parts = False, None
+                lead_in_opens = documents_section and bool(_GENERIC_LIST_TITLES.fullmatch(plain))
+        elif (lead_in_opens and in_list is False and b.kind == "paragraph" and _DOCUMENTS_FOLLOW.search(text)
+              and not _says_requirement(text)):
+            in_list = True             # (the lead-in under "A.2 STANDARDS": up to the next numbered paragraph)
+        above = kept[-1] if kept else None
+        mark = b.meta.get("listed_split")
+        # (a paragraph marked "item" stays apart only under an item of a list under a lead-in - "The unit shall meet
+        # the following limits:" / "MIL-STD-461G, CE102 ..." - also when the lead-in is on the page or column before;
+        # under any other paragraph it is running text: "... as defined in" / next page "MIL-STD-704F Aircraft
+        # Electric Power Characteristics and" / "MIL-STD-1275E ...")
+        if (mark and in_list is False and (mark == "lead" or joined or (mark == "item" and not above_is_item))
+                and b.kind == "paragraph" and above is not None
+                and above.kind in ("paragraph", "list_item") and above.page == b.page and b.lines and above.lines):
+            above.lines = above.lines + b.lines
+            above.box = box_union([above.box, b.box])
+            above.text = f"{above.text} {text}".strip()
+            joined = True                  # (the next document line of the same run is joined too)
+            continue
+        joined = False
+        # (an item that starts with a document number under a lead-in - also one that the first item ran on into:
+        # "... the following limits: MIL-STD-461G, CE102 ..." - under the item before it, or under any paragraph that
+        # ends as an item does: "...;", "...; and")
+        lead_text = (body_above.text or "") if body_above is not None else ""
+        above_is_item = bool(RE_DOC_ID_START.match(text)) and (
+            above_is_item or _introduces_list(lead_text) or bool(re.search(r";\s*(?:and|or)?$", lead_text.rstrip()))
+            or any(RE_DOC_ID_START.match(lead_text[m.end():]) for m in re.finditer(r":\s+", lead_text)))
+        body_above = b
+        kept.append(b)
+    doc.blocks = kept
+
+
 def _merge_across_pages(doc: DocResult) -> None:
     """Join a paragraph that is cut by a page break ('...shall not' | next page 'exceed 30 minutes')."""
     body = [b for b in doc.blocks if b.kind not in ("page_header", "page_footer")]
@@ -3947,19 +5460,39 @@ def _merge_continued_tables(doc: DocResult) -> None:
         if j >= len(body):
             break
         b = body[j]
+        fitted = False
+        if (b.kind == "table" and b.page == max(a.pages) + 1 and b.table.n_cols != a.table.n_cols
+                and ((b.meta.get("may_continue") and not a.meta.get("may_continue")) or continued_caption is not None)):
+            fitted = _fit_columns(b.table, a.table, a.meta)   # the same columns, read differently on the new page
         if b.kind == "table" and b.page == max(a.pages) + 1 and b.table.n_cols == a.table.n_cols:
             same_header = (a.table.header_rows and b.table.header_rows and
                            _similar(" ".join(a.table.grid[0]).lower(), " ".join(b.table.grid[0]).lower(), at_least=0.85) >= 0.85)
-            if same_header or continued_caption is not None:
+            # A table may also run on WITHOUT repeating its heading or its title: then the piece at the top of the
+            # next page has neither (analyze_page marked it "may_continue"), and the table ended its own page
+            # (nothing but the page footer below it), with the same columns across the same part of the page.
+            last_on_page = i + 1 >= len(body) or body[i + 1].page != max(a.pages)
+            overlap = min(a.box[2], b.box[2]) - max(a.box[0], b.box[0])
+            # (a table that is itself a piece with neither, which nothing before it carried on, is a list - and so
+            # is what follows it: a list is not joined on to a list here, each is turned into list rows on its own)
+            carried_on = (b.meta.get("may_continue") and not a.meta.get("may_continue") and last_on_page
+                          and overlap >= 0.7 * min(a.box[2] - a.box[0], b.box[2] - b.box[0]))
+            if same_header or continued_caption is not None or carried_on:
                 skip = b.table.header_rows if same_header else 0
-                if a.table.cell_words and b.table.cell_words:
-                    a.table.cell_words += b.table.cell_words[skip:]
-                else:
-                    a.table.cell_words = []
+                if a.table.cell_words or b.table.cell_words:      # (each piece's words, row for row)
+                    a.table.cell_words = _row_words_grid(a.table) + _row_words_grid(b.table)[skip:]
+                offset = len(a.table.grid)                # (the piece's rows start here)
+                for key, fixes in (b.meta.get("cell_corrections") or {}).items():   # the corrections of the piece
+                    r, c = (int(v) for v in key.split(","))
+                    if r < skip:
+                        continue
+                    row = b.table.grid[r] if r < len(b.table.grid) else []
+                    if fitted:                            # (its columns were put into the table's own columns)
+                        c = next((k for k, cell in enumerate(row) if any(f[1] in cell.split() for f in fixes)), c)
+                    a.meta.setdefault("cell_corrections", {}).setdefault(f"{r - skip + offset},{c}", []).extend(fixes)
                 a.table.grid += b.table.grid[skip:]
                 a.table.conf += b.table.conf[skip:]
-                offset = len(a.table.grid) - len(b.table.grid[skip:])
                 a.table.merges += [(r0 - skip + offset, c0, r1 - skip + offset, c1) for r0, c0, r1, c1 in b.table.merges if r0 >= skip]
+                a.meta.setdefault("column_spans", _column_spans(a.table))    # (kept for a third page)
                 a.table.cell_boxes = []
                 a.table.continued_pages.append(b.page)
                 a.lines = a.lines + b.lines
@@ -3974,6 +5507,75 @@ def _merge_continued_tables(doc: DocResult) -> None:
                 continue
         i += 1
     doc.blocks = [b for b in doc.blocks if id(b) not in removed]
+
+
+def _row_words_grid(t: TableData) -> list:
+    """A table's cell_words, one list of cells per row of its grid (empty where no words were kept)."""
+    out = []
+    for r, row in enumerate(t.grid):
+        words = list(t.cell_words[r]) if r < len(t.cell_words) else []
+        out.append(words + [[] for _ in range(len(row) - len(words))])
+    return out
+
+
+def _column_spans(t: TableData) -> list:
+    """(left, right) of each column of a table, from its cells that span one column; [] when not known."""
+    spans = []
+    for c in range(t.n_cols):
+        xs = [t.cell_boxes[r][c] for r in range(min(t.n_rows, len(t.cell_boxes))) if c < len(t.cell_boxes[r])
+              and t.cell_boxes[r][c] and not any(m[1] <= c <= m[3] and m[3] > m[1] and m[0] <= r <= m[2] for m in t.merges)]
+        if not xs:
+            return []
+        spans.append((float(statistics.median(x[0] for x in xs)), float(statistics.median(x[2] for x in xs))))
+    return spans
+
+
+def _fit_columns(piece: TableData, table: TableData, meta: dict) -> bool:
+    """Put the cells of a table's next piece (on the next page) into the table's own columns, by where they sit:
+    the detector may have cut the same columns differently on the two pages ("0 V / 5 V" read as three cells).
+    Leaves the piece as it is when the positions are not known. True when the piece was fitted."""
+    spans = meta.get("column_spans") or _column_spans(table)
+    if not spans or not piece.cell_boxes or len(spans) != table.n_cols:
+        return False
+    grid, conf, words = [], [], []
+    for r, row in enumerate(piece.grid):
+        cells, confs, cell_words = [""] * len(spans), [1.0] * len(spans), [[] for _ in spans]
+        for c, text in enumerate(row):
+            box = piece.cell_boxes[r][c] if r < len(piece.cell_boxes) and c < len(piece.cell_boxes[r]) else None
+            if not text or box is None:
+                continue
+            k = max(range(len(spans)), key=lambda i: min(box[2], spans[i][1]) - max(box[0], spans[i][0]))
+            if text not in cells[k].split(" "):
+                cells[k] = (cells[k] + " " + text).strip()
+            confs[k] = min(confs[k], piece.conf[r][c] if r < len(piece.conf) and c < len(piece.conf[r]) else 1.0)
+            if r < len(piece.cell_words) and c < len(piece.cell_words[r]):
+                cell_words[k] += piece.cell_words[r][c]
+        grid.append(cells)
+        conf.append(confs)
+        words.append(cell_words)
+    piece.grid, piece.conf, piece.cell_words, piece.merges, piece.cell_boxes = grid, conf, words, [], []
+    return True
+
+
+def _tables_without_titles(doc: DocResult, ctx: "TextContext") -> bool:
+    """A table found at the top of a page with neither a heading row nor a title, which did not turn out to be the
+    rest of a table from the page before (_merge_continued_tables) and was given no caption, is a list after all:
+    its rows become list entries (table_rows_as_list), as on any other part of a page. True when one was changed."""
+    dpi_of = {p.number: p.dpi for p in doc.pages}
+    changed, out = False, []
+    for b in doc.blocks:
+        if b.kind == "table" and b.meta.get("may_continue") and not b.meta.get("caption") and b.table is not None:
+            rows = table_rows_as_list(b, dpi_of.get(b.page, 200.0))
+            for r in rows:
+                r.pages = [r.page]
+                if r.lines or r.meta.get("from_table"):
+                    r.text = tokens_text(block_tokens(r, ctx))[0]
+            out.extend(rows)
+            changed = True
+        else:
+            out.append(b)
+    doc.blocks = out
+    return changed
 
 
 def _min_cost_assignment(cost: list) -> list:
@@ -4115,6 +5717,16 @@ class EngineUnavailable(RuntimeError):
     pass
 
 
+def _docling_heading_rows(cells: list, grid: list) -> tuple:
+    """(heading rows, header_format) of a table Docling read: the rows its table model marks as column headers are
+    shown as heading rows; a first row that only looks like one (short words, _looks_like_header) is counted but not
+    shown as one (see shown_header_rows). `cells`: Docling's rows of table cells; `grid`: their text."""
+    marked = next((k for k, row in enumerate(cells) if not (row and all(c.column_header for c in row))), len(cells))
+    # (only the rows at the top count: a heading row repeated lower down does not make the rows above it headings)
+    header_rows = marked or (1 if grid and _looks_like_header(grid[0]) else 0)
+    return min(header_rows, 3), ("column header (Docling)" if marked else "")
+
+
 class DoclingEngine:
     def __init__(self, settings: Settings):
         models_dir = settings.docling_models_dir or os.environ.get("DOCLING_ARTIFACTS_PATH")
@@ -4218,8 +5830,9 @@ class DoclingEngine:
                 grid = [[(cell.text or "").strip() for cell in row] for row in item.data.grid]
                 merges = sorted({(c.start_row_offset_idx, c.start_col_offset_idx, c.end_row_offset_idx - 1, c.end_col_offset_idx - 1)
                                  for c in item.data.table_cells if c.row_span > 1 or c.col_span > 1})
-                header_rows = sum(1 for row in item.data.grid if row and all(c.column_header for c in row)) or (1 if grid and _looks_like_header(grid[0]) else 0)
-                table = TableData(grid=grid, conf=[[conf] * len(r) for r in grid], merges=list(merges), header_rows=min(header_rows, 3))
+                header_rows, header_format = _docling_heading_rows(item.data.grid, grid)
+                table = TableData(grid=grid, conf=[[conf] * len(r) for r in grid], merges=list(merges),
+                                  header_rows=header_rows, header_format=header_format)
                 blk = Block("table", page_number, box, table=table,
                             lines=[Line(" ".join(" ".join(r) for r in grid), conf, box, _estimate_word_boxes(" ".join(" ".join(r) for r in grid), box, conf))])
                 cap = item.caption_text(doc) if hasattr(item, "caption_text") else ""
@@ -4400,6 +6013,35 @@ def split_sentences(text: str) -> list:
     return [(s, e) for s, e in spans if text[s:e].strip()]
 
 
+CORRECTIONS_NOTE = "OCR corrections: "      # marks the corrections among an item's notes while it is being made
+
+
+def underlined_after_number(tokens: list, spans: list, start: int = 0) -> str:
+    """The words printed underlined right after a paragraph number at character `start` of a block's text (or
+    at its very start, when the block has no number): a typewritten paragraph title. "" when there are none."""
+    k = next((i for i, (a, _z) in enumerate(spans) if a >= start), None)
+    if k is None:
+        return ""
+    if RE_PARA_NUM.match(" ".join(t[0] for t in tokens[k:k + 3])) and re.fullmatch(r"[\dA-Z][\d.lIi|]*\.?", tokens[k][0]):
+        k += 1                                  # the number itself (underlined or not)
+    run = []
+    for t in tokens[k:]:
+        if not (len(t) > 5 and t[5]):
+            break
+        run.append(t[0])
+    return " ".join(run)
+
+
+# a title of two or three words that ends in a particle: "Power on", "Data in", "Stand by", "Weapon lock on" (not the
+# lead words of a sentence: "Except in", "Based on", "Depending on", "Shown in")
+_PARTICLE_TITLE = re.compile(r"(?!(?:Except|As|If|When|Unless|Where|While|Only|Also|Then|See|Refer|Due|Prior|According|"
+                             r"Subject|Pursuant|Up|Once|Set|Found|Dependent|Effective|Contingent|Conditional|Even|"
+                             r"Put|Left|Laid|Kept|Held|Turned|Switched|Brought|Carried)\b)"
+                             r"(?![A-Za-z]+(?:ed|en|wn|ing)\b)[A-Z][\w/-]*"
+                             r"(?:\s+(?!(?:out|forth|up|down|back|off|away)\b)[a-z][\w/-]*)?(?<!ed)(?<!ing)(?<!wn)(?<!en)"
+                             r"\s+(?:on|in|off|up|by|out|down|over)")
+
+
 class RequirementExtractor:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -4479,15 +6121,37 @@ class RequirementExtractor:
         if stray:
             reasons.append("Stray period? " + "; ".join(f"'{x}'" for x in stray[:5]))
         suspicious = []
+        # (a garbled keyword that the keyword repair put right in the text - "OCR keyword repaired: 'sha11' ->
+        # 'shall'" - is not also listed as left as read: that note already says what happened to it)
+        repaired = {m.group(1) for m in (re.match(r"OCR keyword repaired: '([^']+)'", r) for r in reasons) if m}
         for t in tokens:
-            if len(t) > 2 and t[2] and (t[0], t[2]) not in suspicious:
+            if (len(t) > 2 and t[2] and (t[0], t[2]) not in suspicious
+                    and t[0].strip(".,;:()[]\"'`\u2018\u2019\u201c\u201d") not in repaired):
                 suspicious.append((t[0], t[2]))
         if suspicious:
             reasons.append("Check word(s): " + "; ".join(f"'{w}' ({why})" for w, why in suspicious[:6]))
         suspects = sorted(set(RE_SUSPECT_NUMBER.findall(text)))
         if suspects:
             reasons.append("Number may contain a misread letter: " + ", ".join(suspects[:5]))
+        reasons += [r for r in self.correction_reasons(tokens) if r not in reasons]
         return min_conf, reasons
+
+    def correction_reasons(self, tokens: list) -> list:
+        """The notes about the words the tool corrected among these tokens: a corrected number and a corrected
+        keyword still get a look (a number decides what a requirement says, a keyword makes it one), and the
+        corrections themselves (CORRECTIONS_NOTE, moved to the OCR Corrections column by extract)."""
+        reasons, fixed = [], token_corrections(tokens)
+        numbers = [f for f in fixed if re.search(r"\d", f.split("->")[-1])]
+        if numbers:
+            reasons.append("Number corrected by the tool - check against the scan: " + ", ".join(numbers[:5]))
+        for t in tokens:
+            if token_original(t) and " ".join(t[0].lower().strip(".,;:()").split()) in self.classes:
+                note = f"OCR keyword repaired: '{token_original(t)}' -> '{t[0].strip('.,;:()')}'"
+                if note not in reasons:
+                    reasons.append(note)
+        if fixed:
+            reasons.append(CORRECTIONS_NOTE + "; ".join(fixed))
+        return reasons
 
     # ---- main entry ------------------------------------------------------------------
     def extract(self, doc: DocResult) -> list:
@@ -4549,6 +6213,34 @@ class RequirementExtractor:
                         "not be read; the methods follow the order given in the legend - check against the scan")
                 elif entry:
                     it.verification = entry.methods + " (from verification matrix)"
+        # the corrections the tool made are listed in their own column: they are not a reason to review the item
+        # (a corrected number is, and says so separately - see review_for_tokens)
+        for it in items:
+            notes = [r for r in it.review_reasons if r.startswith(CORRECTIONS_NOTE)]
+            if notes:
+                it.review_reasons = [r for r in it.review_reasons if not r.startswith(CORRECTIONS_NOTE)]
+                for note in notes:
+                    it.corrections += [c for c in note[len(CORRECTIONS_NOTE):].split("; ") if c not in it.corrections]
+            for reason in it.review_reasons:             # a list marker put right from the sequence ("C." -> "c."):
+                fix = re.match(r"List marker read as '([^']+)' - taken as '([^']+)'", reason)   # listed with them too
+                if fix and f"'{fix.group(1)}' -> '{fix.group(2)}'" not in it.corrections:
+                    it.corrections.append(f"'{fix.group(1)}' -> '{fix.group(2)}'")
+            if it.item_type == "Table" and it.block_uids:
+                block = next((b for b in doc.blocks if b.uid == it.block_uids[0]), None)
+                twins = []
+                for fixes in (block.meta.get("cell_corrections", {}).values() if block is not None else []):
+                    for a, z, how in fixes:
+                        if f"'{a}' -> '{z}'" not in it.corrections:
+                            it.corrections.append(f"'{a}' -> '{z}'")
+                        if how == "twin":
+                            twins.append(f"'{a}' -> '{z}'")
+                numbers = [c for c in it.corrections if re.search(r"\d", c.split("->")[-1])]
+                if numbers:
+                    it.review_reasons.append("Number corrected by the tool - check against the scan: "
+                                             + ", ".join(numbers[:5]))
+                if twins:
+                    it.review_reasons.append("Word corrected from a similar word in the document - check against "
+                                             "the scan: " + ", ".join(twins[:5]))
         # item numbers
         counters = Counter()
         prefix = {"Requirement": "R", "Table": "T", "Table Caption": "TC", "Figure Caption": "FC"}
@@ -4564,6 +6256,9 @@ class RequirementExtractor:
         table ID column). A bare 'MK-54 torpedo ...' is only read as an ID if MK is such a prefix."""
         prefixes = Counter()
         for b in blocks:
+            first_cell = (b.meta.get("cells") or [""])[0].strip() if b.meta.get("from_table") else ""
+            if first_cell and re.fullmatch(r"(?:" + RE_REQ_ID + r")", first_cell) and re.search(r"[-_]", first_cell):
+                prefixes[_id_prefix(first_cell)] += 1          # an ID column of a table shown as a list
             if b.kind in ("paragraph", "list_item", "heading") and b.text:
                 m = RE_LEADING_ID.match(b.text)
                 if m and _starts_with_delimited_id(b.text):
@@ -4622,6 +6317,7 @@ class RequirementExtractor:
         if not kw:
             return []
         tokens = word_tokens((w for ln in b.lines for w in ln.words), self.ctx)
+        label_text = tokens_text(tokens)[0] or label_text          # (as corrected, like every other row)
         conf, reasons = self.review_for_tokens(tokens, label_text, ["Keyword found inside a figure - check manually"])
         return [ExtractedItem("Requirement", source, b.page_label(), section, text=label_text, keyword=kw,
                               req_class=self.classes.get(kw, ""), found_in="Figure text", ocr_conf=conf,
@@ -4820,10 +6516,12 @@ class RequirementExtractor:
                              review_reasons=reasons, quality_notes=self.quality_notes(text), block_uids=[b.uid])
 
     # ---- paragraphs and lists ----------------------------------------------------------------
-    def parse_head(self, text: str) -> tuple:
+    def parse_head(self, text: str, underlined: str = "") -> tuple:
         """Split '3.2.1.1 Detection range. The radar shall ...' -> ('3.2.1.1', 'Detection range', body, offset)
         and '[SRS-101] The GCS shall ...' -> ('SRS-101', '', body, offset).
-        'MK-54 torpedo ...' and '3.3 V shall ...' are left alone (a designator and a quantity)."""
+        'MK-54 torpedo ...' and '3.3 V shall ...' are left alone (a designator and a quantity).
+        `underlined`: the words printed underlined straight after the number, if any - a typewritten title,
+        which needs no full stop to end it ('3.2.1  Power input  The equipment shall ...')."""
         ref, title, body = "", "", text
         lowered = False                  # the title's capital was read as a small letter ("3.2.7 output. The ...")
         prefixes = getattr(self, "id_prefixes", Counter())
@@ -4838,11 +6536,31 @@ class RequirementExtractor:
                     and _lowercased_title(m.group("rest"))
                 if m.group("rest")[:1].isupper() or lowered:
                     ref, body = clean_para_number(m.group("num")), m.group("rest")
-        if ref:
-            t = re.match(r"^(?P<title>[A-Z][^.:;!?\[\]]{0,80}?)[.:]{1,3}['`·,]?(?:\s+|(?=[A-Z]))(?P<body>[A-Z\[(\"].*)$",
+        u = " ".join(underlined.split())
+        rest = re.sub(r"^[-–—]+\s+", "", body[len(u):].lstrip(" .:;")) if u and body.startswith(u) else ""   # (not "-40")
+        if (ref and u and word_count(u) <= 12 and body.startswith(u) and not _modal_re().search(u)
+                and not _sentence_ends_inside(u.rstrip(" .:;-")) and not u.endswith(",")
+                and (not re.search(r"(?<![\w-])(?:of|in|the|and|or|to|for|with|by|on|at|from|as|that|which|than|per)$",
+                                   u.rstrip(" .:;-"))
+                     or _PARTICLE_TITLE.fullmatch(u.rstrip(" .:;-")))
+                and (not rest or not rest[:1].islower() or RE_LIST_MARKER.match(rest))):
+            # an underlined title: the underline ends it ("3.2.1  U.S. Army interface  The radar ...", "Input
+            # voltage  115 V ac ...", "Mode A", "Power-on", "Data in"). Not underlined lead words that are part of the
+            # sentence ("Except as noted in 3.2.7, the unit ...", "Weight. The unit, with its cables, shall ..."): those
+            # hold a sentence end, end in a comma or in a small linking word ("... noted in"), or run on in lower
+            # case - the full-stop rule below decides
+            title, body = u.rstrip(" .:;-"), rest
+        elif ref:
+            t = re.match(r"^(?P<title>[A-Z][^.:;!?\[\]]{0,80}?)[.:]{1,3}['`·,]?(?P<space>\s+|(?=[A-Z]))"
+                         r"(?P<body>[A-Z\[(\"].*)$",
                          body[:1].upper() + body[1:] if lowered else body, re.S)
             if (t and word_count(t.group("title")) <= 8 and not _modal_re().search(t.group("title"))
-                    and not re.search(r"\s(?:The|A|An|This|These|Each|All|Any)\s", t.group("title"))):
+                    and not re.search(r"\s(?:The|A|An|This|These|Each|All|Any)\s", t.group("title"))
+                    # a title glued to its text ("Leakage.No current", "Detection range.:The radar", "Data bus
+                    # (MIL-STD-1553).The bus", "Mode A.The radar") ends at its full stop - but not inside an
+                    # initialism: "U" + "S. Army" in "U.S. Army interface"
+                    and (t.group("space") or not (re.search(r"(?:^|[^\w.])[A-Za-z]$", t.group("title"))
+                                                  and re.match(r"[A-Za-z]\.", t.group("body"))))):
                 title, body = t.group("title").strip(), t.group("body")
         offset = len(text) - len(body)
         return ref, title, body, offset
@@ -4935,14 +6653,14 @@ class RequirementExtractor:
     def _text_block_items(self, blocks: list, i: int, source: str, section: str, vocab: set, dpi_of: dict, items: list) -> int:
         """Handle a paragraph/list item (and, for a stem, the list below it). Returns blocks consumed."""
         b = blocks[i]
-        tokens = block_tokens(b, vocab) if b.lines else [(w, 1.0, "") for w in b.text.split()]
+        tokens = block_tokens(b, vocab) if b.lines or b.meta.get("from_table") else [(w, 1.0, "") for w in b.text.split()]
         text, spans = tokens_text(tokens)
         marker = ""
         lead = RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text) if b.kind == "list_item" else None
         if lead:
             marker = lead.group("marker")
         body_start = len(text) - len(lead.group("rest")) if lead else 0
-        ref, title, body, off = self.parse_head(text[body_start:])
+        ref, title, body, off = self.parse_head(text[body_start:], underlined_after_number(tokens, spans, body_start))
         body_start += off
         own_ref = ref                            # the paragraph's own number - never a list marker
         if marker and not ref:
@@ -4994,6 +6712,20 @@ class RequirementExtractor:
             k = paragraph_of(u[0])
             return (ref, title) if k == 0 else tuple(inner[k - 1][1:3])
         heads = [head_of(u) for u in units]
+
+        def head_notes(u: list) -> list:
+            """The block's own notes, and what the tool corrected in the number and title of the paragraph a
+            sentence sits in ("3.3 Governmient rights. ..."): its rows say so, as for a word of their text.
+            A one-letter guess there is a word to check, like one in the text."""
+            k = paragraph_of(u[0])
+            a, z = (0, body_start) if k == 0 else (inner[k - 1][0], inner[k - 1][3])
+            # (with --no-autocorrect, a look-alike left as read in the title is a word to check too: "M0nitor")
+            head = [t for t, (x, y) in zip(tokens, spans) if x >= a and y <= z
+                    and (token_original(t) or (len(t) > 2 and LEFT_AS_READ in (t[2] or "")))
+                    and not re.fullmatch(r"\d{1,2}(?:\.\d{1,3})*\.?", t[0])]   # (not the number: see clean_para_number)
+            twins = [f"'{t[0]}' ({t[2]})" for t in head if len(t) > 2 and t[2]]
+            return (extra_reasons + self.correction_reasons(head)
+                    + (["Check word(s) in the title: " + "; ".join(twins)] if twins else []))
 
         dpi = dpi_of.get(b.page, 200)
         # a stem inside the block ("... shall provide:" with the first items on the next rows of the same block)
@@ -5072,6 +6804,8 @@ class RequirementExtractor:
                 if nb.kind == "list_item":
                     if children and not marked and nb.box[0] < children[0][0] - 0.1 * dpi:
                         break                    # "NOTE:  ..." back left of the items: after the list, not in it
+                    if not marked and _starts_with_delimited_id(nb.text) and _modal_re().search(nb.text):
+                        break                    # "SRS-101:  The radar shall ...": a requirement with its own ID
                     children.extend(self._child_entries(nb, vocab))
                     j += 1
                     continue
@@ -5087,7 +6821,7 @@ class RequirementExtractor:
             for u in [u for u in units if u[1] <= last[0]]:
                 u_ref, u_title = head_of(u)
                 items.append(self._req_item(b, source, section, u_ref, u_title, text, tokens, spans, u[0], u[1], u[2],
-                                            "Paragraph", "", extra_reasons))
+                                            "Paragraph", "", head_notes(u)))
             stem_ref, stem_title = head_of(last)            # the list belongs to the stem's paragraph
             if not children:
                 # a colon promises a list. Without one, only flag it when a short indented line follows that
@@ -5101,10 +6835,10 @@ class RequirementExtractor:
                             ["Leads into a list ('the following ...') but no list items were taken from the "
                              "indented text below it - check"] if missed else [])
                 items.append(self._req_item(b, source, section, stem_ref, stem_title, text, tokens, spans, last[0], last[1], last[2],
-                                            "Paragraph", "", extra_reasons + promised))
+                                            "Paragraph", "", head_notes(last) + promised))
                 return 1
             self._list_items(b, children, source, section, stem_ref, stem_title, text, tokens, spans, last, vocab, items,
-                             extra_reasons, dpi)
+                             head_notes(last), dpi)
             for sb in skipped:                   # captions / figures that sat inside the list are exported too
                 if sb.kind == "caption" and not sb.meta.get("duplicate_of_table"):
                     items.append(self._caption_item(sb, source, section))
@@ -5114,7 +6848,8 @@ class RequirementExtractor:
 
         found_in = "List item" if b.kind == "list_item" else "Paragraph"
         for (s, e, kw), (u_ref, u_title) in zip(units, heads):
-            items.append(self._req_item(b, source, section, u_ref, u_title, text, tokens, spans, s, e, kw, found_in, "", extra_reasons))
+            items.append(self._req_item(b, source, section, u_ref, u_title, text, tokens, spans, s, e, kw, found_in, "",
+                                        head_notes([s, e, kw])))
         return 1
 
     @staticmethod
@@ -5482,6 +7217,14 @@ class RequirementExtractor:
             merged.append(entry)
             sequenced.append(seq)
         children = merged
+        for k, ((_x0, c_tokens, child), (_mk, body, note, merge)) in enumerate(zip(children, sequenced)):
+            fix = re.match(r"List marker read as '([^']+)' - taken as '([^']+)'", note or "")
+            if fix and not self.settings.autocorrect:
+                # --no-autocorrect: the marker is left as read ('C.'); the sequence still decides where the item goes
+                sequenced[k] = (fix.group(1), body, f"List marker read as '{fix.group(1)}' - the sequence says "
+                                f"'{fix.group(2)}' {LEFT_AS_READ}", merge)
+            elif fix and c_tokens and c_tokens[0][0] == fix.group(1):
+                child.meta["marker_fix"] = [fix.group(1), fix.group(2)]     # shown corrected in the Word report
         # "a.  Search mode:   (1) Range of 100 km." with "(2) Azimuth ..." under it on the value tab stop: the
         # first sub-item sits on its parent's line. It is split off, so both sub-items are filed under 'a.'
         split, split_seq = [], []
@@ -5604,6 +7347,607 @@ def _page_label(pages: list) -> str:
     return str(pages[0]) if len(pages) == 1 else f"{pages[0]}-{pages[-1]}"
 
 
+# ---- 9b. The outline: sections, their levels, and what sits under each one -----------------------------------
+# A specification numbers its paragraphs to show what contains what: 3.1.1 is part of 3.1, 3.1.1.1 part of 3.1.1.
+# The outline gives every numbered paragraph a level from its number - not from where it is printed or how much
+# space is around it - and files the text under it, so the Word documents have one heading level per depth
+# (Heading 1 for 3, Heading 2 for 3.1 ...): the structure DOORS builds its hierarchy from (README: "Importing into
+# DOORS"). It is worked out once per document, after the requirements (build_outline), and kept on each block.
+
+# The sections of a military / weapon-system specification (MIL-STD-961, and the older MIL-STD-490 layout), as
+# (type, title pattern). The type of a section is shown in the "Document Structure" sheet; "applicable documents"
+# also says where the lists of standards are read (9c). A title is matched as a whole, ignoring case.
+SPEC_SECTION_TYPES = (
+    ("front matter", r"foreword|contents|table of contents|summary of change.*|index|concluding material"),
+    ("scope", r"scope(?: and purpose)?|purpose|introduction"),
+    ("applicable documents", r"applicable documents|referenced documents|reference documents|references|"
+                             r"documents applicable|applicable publications"),
+    ("requirements", r"(?:technical |system |performance |general |detailed )?requirements"),
+    ("verification", r"verification|quality assurance provisions|quality assurance|qualification provisions|"
+                     r"qualification requirements|test(?:ing)? provisions|test and evaluation|verification requirements"),
+    ("traceability", r"requirements traceability|traceability"),
+    ("packaging", r"packaging|preparation for delivery|packing|delivery|packaging requirements"),
+    ("notes", r"notes|general notes|notes and definitions"),
+    ("definitions", r"definitions|acronyms|abbreviations|glossary|terms and definitions|acronyms and abbreviations|"
+                    r"definitions and acronyms|abbreviations and acronyms|list of acronyms|"
+                    # (ISO and ECSS clause 3: "Terms, definitions and abbreviated terms")
+                    r"terms,? definitions,? and (?:abbreviated terms|abbreviations|acronyms)|definitions and abbreviations|"
+                    r"(?:terms, definitions, )?symbols,? and abbreviated terms|abbreviated terms"),
+    ("appendix", r"appendix(?:\s+[A-Z0-9]{1,3})?\b.*|annex(?:\s+[A-Z0-9]{1,3})?\b.*"),
+)
+# sub-sections of section 2 whose title says that a list of documents follows
+_DOCUMENT_LIST_TITLES = re.compile(
+    r"(?:applicable|referenced|reference|government|non-?government|other government)\s+(?:documents|publications)"
+    r"|specifications,?\s+standards,?\s+and\s+handbooks|specifications\s+and\s+standards|standards\s+and\s+handbooks"
+    r"|(?:other\s+)?(?:government\s+)?(?:documents,\s+)?drawings,?\s+and\s+publications|industry standards"
+    r"|commercial (?:standards|documents|publications)|specifications|standards|handbooks|publications|drawings"
+    r"|documents|documents and publications",
+    re.I)
+# ... and the sentence such a section opens with: "The following documents form a part of this specification"
+# titles that name a list of documents only in a section of documents (section 2, an appendix's x.2 or 20): elsewhere
+# "3.4 Applicable standards." holds requirements ("APPLICABLE STANDARDS", "NORMATIVE REFERENCES", "APPLICABLE
+# SPECIFICATIONS, STANDARDS AND DRAWINGS"; not "6.3 Related documents", which lists documents for information only)
+_COMPOUND_LIST_TITLES = re.compile(
+    r"(?:applicable|referenced|normative|cited)\s+(?:documents|publications|standards|specifications|references"
+    r"|documentation|drawings)(?:(?:,\s*|\s+)(?:(?:and|or)\s+)?(?:documents|publications|standards|specifications"
+    r"|handbooks|drawings))*", re.I)
+# titles that name a list of documents only in section 2: elsewhere "3.4 Standards." holds requirements
+_GENERIC_LIST_TITLES = re.compile(r"specifications|standards|handbooks|publications|drawings|documents"
+                                  r"|documents and publications", re.I)
+_DOCUMENTS_FOLLOW = re.compile(r"\bthe following (?:\w+,?\s+){0,4}?(?:documents|specifications|standards|handbooks|"
+                               r"publications|drawings)\b.{0,100}?\b(?:forms?|are)\s+(?:a\s+)?part\b", re.I | re.S)
+TOP_LEVEL_TYPES = {"front matter", "scope", "applicable documents", "requirements", "verification", "traceability",
+                   "packaging", "notes", "definitions", "appendix"}
+# the numbers of the sections of a MIL-STD-961 specification
+_SECTION_NUMBERS = {"scope": 1, "applicable documents": 2, "requirements": 3, "verification": 4, "packaging": 5,
+                    "notes": 6}
+
+
+def section_type(title: str) -> str:
+    """'APPLICABLE DOCUMENTS' -> 'applicable documents', 'QUALITY ASSURANCE PROVISIONS' -> 'verification',
+    'Order of precedence' -> '' (no type of its own: it takes its parent's)."""
+    t = " ".join(re.sub(r"[^A-Za-z0-9 ,()-]", " ", title or "").split()).lower().strip(" .:-")
+    # ("SECTION 4 QUALITY ASSURANCE PROVISIONS", "SECTION 2 - APPLICABLE DOCUMENTS")
+    t = re.sub(r"^section\s+\d{1,2}\s*-?\s*(?=[a-z])", "", t)
+    for kind, pattern in SPEC_SECTION_TYPES:
+        if re.fullmatch(pattern, t, re.I):
+            return kind
+    return ""
+
+
+def _outline_number(number: str) -> str:
+    """A paragraph number as the outline counts it: misread digits put right, and the ".0" a document may write
+    after a section's own number left off ("3.0 REQUIREMENTS" is section 3, "3.2.0" is 3.2)."""
+    n = clean_para_number((number or "").strip().rstrip("."))
+    while re.search(r"\.0$", n) and n.count("."):
+        n = n[:-2]
+    return n
+
+
+def _heading_level(number: str) -> int:
+    """'3' -> 1, '3.1' -> 2, '3.1.1.1' -> 4, 'A.1' -> 2 (an appendix letter counts as a level), '3.0' -> 1;
+    9 at most."""
+    parts = _number_parts(_outline_number(number))
+    return min(9, len(parts)) if parts else 0
+
+
+_APPENDIX_TITLE = re.compile(r"(?:APPENDIX|ANNEX|Appendix|Annex)\s+([A-Z]|[IVX]{1,4}|\d{1,2})\b")
+# the letters a scan reads as a digit of the same shape ("B.3" read as "8.3" in APPENDIX B)
+_DIGIT_AS_LETTER = {8: "B", 0: "DO", 6: "G", 1: "IL", 5: "S", 2: "Z", 4: "A"}
+# "SECTION 4" in front of a section's title ("SECTION 4 QUALITY ASSURANCE PROVISIONS")
+_SECTION_LABEL_NUMBER = re.compile(r"SECTION\s+(\d{1,2})\b", re.I)
+
+
+def build_outline(doc: DocResult, extractor: "RequirementExtractor") -> list:
+    """Work out the document's sections and store them on its blocks, for the exports.
+
+    block.meta["outline"] = [part, ...], each part a dict:
+        kind    "heading" (a numbered section, or an unnumbered top-level one such as "REQUIREMENTS"),
+                "subheading" (an unnumbered title inside a numbered section, e.g. "SPECIFICATIONS" above a list of
+                documents - shown as a title, but given no level of its own, so the numbered levels stay exact),
+                or "body" (text that belongs to the section above it)
+        level   the heading level (1-9); for body text, the level of the section it is in
+        number  the paragraph number ("3.2.1"), title  the heading's title ("Power input")
+        start, end  where the part is in the block's text (the text the exports write, see block_tokens)
+        type    the kind of section it is in (SPEC_SECTION_TYPES), "" when not known
+        id      for a heading: its "S-0001" identifier in the Document Structure sheet; parent: its parent's
+        missing True for the heading of a parent the scan did not show ("3.2" when 3.2.1 follows 3.1), put before
+                the heading under it with no text of its own: "3.2 [heading not found in the scan]"
+    A block holding the end of one numbered paragraph and the start of the next ("... 45 kg. 3.2.2.2 Input power.
+    The unit ...") gets several parts. Returns the headings in order, each {"id", "level", "number", "title",
+    "type", "page", "uid", "kind"}."""
+    ctx = document_text_context(doc, extractor.settings)
+    headings, stack = [], []          # stack: the open sections, [(level, heading dict)]
+    last_number, numbered_seen, current_type = "", False, ""
+    made_parents = []                 # the parents open_section has just added for a heading (see "missing" above)
+    last_opened = ""                  # the number of the last numbered section opened
+    numbers_in_appendix = 0           # numbered sections opened since the last appendix title
+
+    def follows_on(previous: str, number: str, nxt) -> bool:
+        """Is `number` where the numbering says it should be, so that it is filed under its own number's parent? It
+        is when it follows on from the number before (plausible_next_number) - unless the number after it shows it
+        is a misread ("3.7.2" between 3.1.1 and 3.1.3, or "3.2.2" there; "8.3" between B.2 and B.4). It is too when
+        it does not follow on but the number after it does follow on from it: a real jump (pages left out, a lost
+        page, a second document), not a misread."""
+        fits = plausible_next_number(previous, number)
+        if not (nxt and previous):
+            return fits
+        before, here, following = _number_parts(_outline_number(previous)), _number_parts(_outline_number(number)), \
+            _number_text(nxt)
+        if not (before and here):
+            return fits
+        fits_after = plausible_next_number(number, following)
+        after_fits_before = plausible_next_number(previous, following)
+        if (before[0] < 0) != (here[0] < 0):             # into or out of an appendix's letters ...
+            return not ((nxt[0] < 0) == (before[0] < 0) and after_fits_before)   # ... unless the next goes back
+        if not fits:
+            return fits_after and not after_fits_before
+        return fits_after or not after_fits_before
+
+    def section_parts(h: dict):
+        """The number parts a section on the stack stands for: the number its place shows ("implied": "REQUIREMENTS"
+        before 3.1 stands for 3, a misread "3.7.2" between 3.1.1 and 3.1.3 for 3.1.2), its own number, or an
+        appendix's letter ("APPENDIX A": A)."""
+        if h["number"] or h.get("implied"):
+            return _number_parts(_outline_number(h.get("implied") or h["number"]))
+        letter = _APPENDIX_TITLE.match(h["title"] or "")
+        if letter and len(letter.group(1)) == 1 and letter.group(1).isalpha():
+            return (-(ord(letter.group(1)) - ord("A") + 1),)
+        return None
+
+    def open_section(kind: str, level: int, number: str, title: str, b: Block, nxt=None, implied: str = "") -> dict:
+        """Open a section (or note a sub-title) and return its heading. `nxt`: the parts of the paragraph number
+        after this one, if known. `implied`: the number an unnumbered top-level title stands for."""
+        nonlocal current_type, last_opened, numbers_in_appendix
+        parts = _number_parts(_outline_number(number)) if number else None
+        appendix = _APPENDIX_TITLE.match(title or "")
+        # in APPENDIX B, "8.3" is B.3 with its letter misread as a digit of the same shape (8 B, 0 D, 6 G ...) - as the
+        # first number after the appendix's title, or after its lettered numbers (not "4.6" after 4.5)
+        letter = next((p[0] for _lvl, h in reversed(stack) for p in [section_parts(h)] if p and p[0] < 0), None)
+        before = _number_parts(_outline_number(last_opened)) or (0,)
+        after_letters = ((numbers_in_appendix == 0 or before[0] < 0)
+                         and not (parts and before[0] >= 0 and parts[0] == before[0]
+                                  and plausible_next_number(last_opened, number)))
+        if (parts and len(parts) > 1 and parts[0] >= 0 and letter is not None and not implied and after_letters
+                and chr(ord("A") - letter - 1) in _DIGIT_AS_LETTER.get(parts[0], "")):
+            parts = (letter,) + tuple(parts[1:])
+            implied = _number_text(parts)
+        by_number = bool(parts) and follows_on(last_opened, implied or number, nxt)
+        while stack:
+            top_level, top = stack[-1]
+            top_parts = section_parts(top)
+            if top_level >= level:
+                stack.pop()                      # a sibling or something deeper: closed
+            elif by_number and top_parts and tuple(parts[:len(top_parts)]) != tuple(top_parts):
+                stack.pop()                      # not its number's parent ("A.2" is not inside "6 NOTES")
+            elif by_number and not top_parts:
+                stack.pop()                      # an unnumbered title (FOREWORD) is the parent of no numbered section
+            else:
+                break
+        if parts and not by_number and not implied:
+            # filed by its level: it stands for the number its place shows, so the numbers after it find it - "3.7.2"
+            # under 3.1 is 3.1.2, "8.3" in APPENDIX B is B.3, "8. REQUIREMENTS" before 3.1 is 3
+            # (and when the number after it is a sub-section of it, that one shows the number it stands for: "3.1.8
+            # Ripple." with 3.1.2.1 under it is 3.1.2, "3.7 Cooling." with 3.2.1 under it is 3.2)
+            above = section_parts(stack[-1][1]) if stack else None
+            if len(parts) == 1 and nxt and len(nxt) > 1:
+                implied = _number_text(nxt[:1])
+            elif above and len(above) < len(parts):
+                implied = _number_text(tuple(nxt[:len(parts)])
+                                       if nxt and len(nxt) > len(parts) and tuple(nxt[:len(above)]) == tuple(above)
+                                       else tuple(above) + tuple(parts[len(above):]))
+        if kind == "heading" and parts and len(parts) > 1:
+            # Every parent the scan did not show gets a heading of its own - the DOORS file writes these parts as
+            # headings (_ReportWriter.block) - so the section is filed under its own number: 3.2.1 after 3.1 goes
+            # under a "3.2 [heading not found in the scan]", not under 3.1. Filed by its level (a number that does
+            # not follow on), only a level it skips gets one.
+            shown = {tuple(section_parts(h) or ()) for _lvl, h in stack}
+            digits = _outline_number(implied or number).split(".")
+            first = 1 if by_number else (stack[-1][0] + 1 if stack else 1)
+            for k in range(first, min(level, len(parts))):
+                if by_number and tuple(parts[:k]) in shown:
+                    continue
+                above = stack[-1][1] if stack else None
+                lost = {"id": f"S-{len(headings) + 1:04d}", "kind": "heading", "level": k, "number": ".".join(digits[:k]),
+                        "title": "[heading not found in the scan]", "type": above["type"] if above else "",
+                        "page": b.page, "uid": b.uid, "parent": above["id"] if above else "", "missing": True}
+                headings.append(lost)
+                stack.append((k, lost))
+                made_parents.append(lost)
+        if parts:
+            last_opened = implied or number
+            numbers_in_appendix += 1
+        elif appendix:
+            numbers_in_appendix = 0
+        parent = stack[-1][1] if stack else None
+        # a section has a type of its own only at the top ("4 QUALITY ASSURANCE PROVISIONS", "APPENDIX A"); below,
+        # it is its top-level section's ("3.6 Notes." in section 3 is part of the requirements, not section 6)
+        own = section_type(title) if (level == 1 or appendix or parent is None) else ""
+        current_type = own or (parent["type"] if parent else ("" if level == 1 else current_type))
+        h = {"id": f"S-{len(headings) + 1:04d}", "kind": kind, "level": level, "number": number, "title": title,
+             "type": current_type, "page": b.page, "uid": b.uid, "parent": parent["id"] if parent else ""}
+        if implied:
+            h["implied"] = implied
+        headings.append(h)
+        if kind == "heading":
+            stack.append((level, h))
+        return h
+
+    def next_number(i: int) -> tuple:
+        """The parts of the next paragraph number after block i (heading or numbered paragraph), or None."""
+        for nb in doc.blocks[i + 1:]:
+            if nb.kind in ("page_header", "page_footer", "table", "figure", "caption"):
+                continue
+            number = nb.meta.get("number", "") if nb.kind == "heading" else ""
+            if not number:
+                m = RE_PARA_NUM.match(nb.text or "")
+                number = m.group("num") if m and "." in m.group("num") + m.group("dot") else ""
+            parts = _number_parts(_outline_number(number)) if number else None
+            if parts:
+                return parts
+        return None
+
+    def top_number() -> tuple:
+        """The parts of the numbered top-level section now open, or None."""
+        for _lvl, h in stack:
+            if h["number"] or h.get("implied"):
+                return _number_parts(_outline_number(h.get("implied") or h["number"]))
+        return None
+
+    def starts_new_section(parts) -> bool:
+        """Does a number with these parts come after the numbered top-level section now open - "4.1" after section
+        3, or "A.1" (an appendix) after section 6? Section numbers only go forward: a "1." inside section 3 is a
+        numbered note or item, not section 1."""
+        top = top_number()
+        return top is None or parts[0] > top[0] or (parts[0] < 0 < top[0])
+
+    def level_now() -> int:
+        return stack[-1][0] if stack else 0
+
+    def lost_parent_parts(at: int) -> list:
+        """The outline parts of the parents open_section just added (no text: they take no room in the block)."""
+        out = [{"kind": "heading", "level": h["level"], "number": h["number"], "title": h["title"], "start": at,
+                "end": at, "type": h["type"], "id": h["id"], "parent": h["parent"], "missing": True}
+               for h in made_parents]
+        made_parents.clear()
+        return out
+
+    def parent_now() -> str:
+        return stack[-1][1]["id"] if stack else ""
+
+    for i, b in enumerate(doc.blocks):
+        if b.kind in ("page_header", "page_footer"):
+            continue
+        text = b.text or ""
+        if b.kind in ("table", "figure", "caption") or not text.strip():
+            b.meta["outline"] = [{"kind": "body", "level": level_now(), "number": "", "title": "", "start": 0,
+                                  "end": len(text), "type": current_type, "parent": parent_now()}]
+            continue
+        tokens = block_tokens(b, ctx) if b.lines or b.meta.get("from_table") else [Token(w, 1.0) for w in text.split()]
+        text, spans = tokens_text(tokens)
+        if b.kind == "heading":
+            number = b.meta.get("number", "")
+            title = (b.meta.get("title") or text).strip().rstrip(".")
+            parts_of = _number_parts(_outline_number(number)) if number else None
+            nxt = next_number(i)
+            top = top_number()
+            if (parts_of and len(parts_of) == 1 and not starts_new_section(parts_of)
+                    and section_type(title) not in TOP_LEVEL_TYPES
+                    and not (nxt and len(nxt) > 1 and nxt[0] == parts_of[0] and nxt[1] <= 1
+                             and (top is None or top[0] != parts_of[0]))):
+                # "1. Signal levels are measured at ..." under a "NOTES" title inside section 3: a numbered note, not
+                # section 1 - a title inside the section, with its number kept in the text. ("1. SCOPE" there still
+                # starts a section, and so does "1. GENERAL" with its 1.1 after it: a second document in the file.)
+                h = open_section("subheading", min(9, level_now() + 1), "", text.strip().rstrip("."), b)
+                title = h["title"]
+            elif _heading_level(number):
+                last_number, numbered_seen = number, True
+                h = open_section("heading", _heading_level(number), number, title, b, nxt)
+            elif ((not numbered_seen or _APPENDIX_TITLE.match(title)
+                   or ((section_type(title) in TOP_LEVEL_TYPES or _SECTION_LABEL_NUMBER.match(title))
+                       and (nxt is None or starts_new_section(nxt))))
+                  # (a bare "SECTION 4" is only a label: the title under it, "QUALITY ASSURANCE PROVISIONS", or the
+                  # "4. ..." under it is the section's heading)
+                  and not re.fullmatch(r"SECTION\s+\d{1,2}(?:\.0)?\.?", title, re.I)):
+                # an unnumbered top-level title: before the numbered sections (FOREWORD), an appendix, or a
+                # "NOTES" / "DEFINITIONS" after which the next number starts a new section. A "NOTES" above notes
+                # inside 3.2.4, followed by "1." or 3.2.5, is only a title inside the section. A top-level title
+                # whose number the scan lost ("REQUIREMENTS", then 3.1) stands for the number its sections have.
+                kind_of, implied = section_type(title), ""
+                label = _SECTION_LABEL_NUMBER.match(title)
+                if label:
+                    implied = str(int(label.group(1)))   # ("SECTION 2 - APPLICABLE DOCUMENTS" is section 2, also
+                                                         # when it holds no numbered paragraph of its own)
+                elif nxt and len(nxt) > 1 and nxt[0] > 0 and not _APPENDIX_TITLE.match(title):
+                    # (the number its label or its MIL-STD-961 title names, or the next section's when it names a
+                    # numbered section - "REQUIREMENTS" then 4.1 is section 4; not FOREWORD's or a title page's:
+                    # section 1 comes after them)
+                    if (_SECTION_NUMBERS.get(kind_of) == nxt[0]
+                            or (kind_of in TOP_LEVEL_TYPES - {"front matter", "appendix"} and not numbered_seen
+                                and not (kind_of == "definitions" and nxt[0] == 1))   # (ACRONYMS before 1.1)
+                            or (kind_of in TOP_LEVEL_TYPES - {"front matter", "appendix"} and numbered_seen
+                                and starts_new_section(nxt))):
+                        implied = str(nxt[0])
+                h = open_section("heading", 1, "", title, b, implied=implied)
+            else:
+                h = open_section("subheading", min(9, level_now() + 1), "", title, b)
+            b.meta["outline"] = lost_parent_parts(0) + [{"kind": h["kind"], "level": h["level"], "number": number,
+                                                         "title": title, "start": 0, "end": len(text),
+                                                         "type": h["type"], "id": h["id"], "parent": h["parent"],
+                                                         "implied": h.get("implied", "")}]
+            continue
+        # a paragraph or a list item: a numbered paragraph opens a section; so may numbers inside the block
+        marker_end = 0
+        if b.kind == "list_item":
+            lead = RE_LIST_MARKER.match(text) or RE_NUMBERED_ITEM.match(text)
+            marker_end = len(text) - len(lead.group("rest")) if lead else 0
+        cuts = []                                           # (number start, body start, number, title)
+        if b.kind == "paragraph" and not b.meta.get("from_table"):
+            ref, title, _body, off = extractor.parse_head(text, underlined_after_number(tokens, spans, 0))
+            if ref and _heading_level(ref) and (title or plausible_next_number(last_number, ref)):
+                cuts.append((0, off, ref, title))
+                last_number = ref
+            else:
+                # "3.2 operation." on a line of its own: a heading whose capital the scan read as the small letter
+                # of the same shape (c, o, s, v, w, x, z) - not text under the section before it
+                m = RE_PARA_NUM.match(text.strip())
+                rest = m.group("rest").strip().rstrip(".") if m else ""
+                if (m and rest[:1] in "cosvwxz" and word_count(rest) <= 6 and not _modal_re().search(text)
+                        and not re.search(r"[.:;]\s", rest) and plausible_next_number(last_number, m.group("num"))
+                        and _heading_level(m.group("num"))):
+                    ref = clean_para_number(m.group("num").rstrip("."))
+                    cuts.append((0, len(text), ref, rest[:1].upper() + rest[1:]))
+                    last_number = ref
+        for cut, ref, title, body_at in extractor._inner_paragraphs(text, cuts[0][1] if cuts else marker_end,
+                                                                    last_number):
+            if _heading_level(ref):
+                cuts.append((cut + len(text[cut:]) - len(text[cut:].lstrip()), body_at, ref, title))
+                last_number = ref
+        parts, pos = [], 0
+        for k, (start, body_at, ref, title) in enumerate(cuts):
+            if start > pos and text[pos:start].strip():
+                parts.append({"kind": "body", "level": level_now(), "number": "", "title": "", "start": pos,
+                              "end": start, "type": current_type, "parent": parent_now()})
+            numbered_seen = True
+            nxt = _number_parts(_outline_number(cuts[k + 1][2])) if k + 1 < len(cuts) else next_number(i)
+            h = open_section("heading", _heading_level(ref), ref, (title or "").strip().rstrip("."), b, nxt)
+            parts.extend(lost_parent_parts(start))
+            parts.append({"kind": "heading", "level": h["level"], "number": ref, "title": h["title"],
+                          "start": start, "end": body_at, "type": h["type"], "id": h["id"], "parent": h["parent"]})
+            pos = body_at
+        if pos < len(text) and text[pos:].strip():
+            parts.append({"kind": "body", "level": level_now(), "number": "", "title": "", "start": pos,
+                          "end": len(text), "type": current_type, "parent": parent_now()})
+        b.meta["outline"] = parts
+    doc._outline = headings
+    return headings
+
+
+def document_outline(doc: DocResult, settings: Settings) -> list:
+    """The document's headings (build_outline), worked out when they are first needed."""
+    if getattr(doc, "_outline", None) is None:
+        extractor = RequirementExtractor(settings)
+        extractor.ctx = document_text_context(doc, settings)
+        extractor.id_prefixes = extractor._learn_id_prefixes(doc.blocks)
+        build_outline(doc, extractor)
+        read_document_lists(doc)
+    return doc._outline
+
+
+def note_section_types(doc: DocResult, items: list) -> None:
+    """A requirement found in section 6 (NOTES) gets a quality note: MIL-STD-961E 5.11 says section 6 is not
+    contractually binding and holds no requirements, so a "shall" there is worth a second look."""
+    types = {}
+    for b in doc.blocks:
+        parts = b.meta.get("outline") or []
+        if parts:
+            types[b.uid] = parts[-1].get("type", "")
+    for it in items:
+        if it.item_type == "Requirement" and any(types.get(uid) == "notes" for uid in it.block_uids[:1]):
+            note = "In section 6 (Notes), which is not contractually binding (MIL-STD-961E 5.11)"
+            if note not in it.quality_notes:
+                it.quality_notes.append(note)
+
+
+# ---- 9c. Lists of documents (section 2, "Applicable documents") ----------------------------------------------------
+# Section 2 of a specification lists the standards and other documents it calls up, usually under group titles and
+# sub-titles:
+#
+#       SPECIFICATIONS
+#
+#           Military
+#       MIL-E-5400T      Electronic Equipment, Aerospace, General Specification for      3.2.1, 3.4.5
+#
+# Each entry gives the document's number, its title and, in many specifications, the paragraphs of this one that
+# call it up. Inside a section whose title says it holds documents (SPEC_SECTION_TYPES, _DOCUMENT_LIST_TITLES),
+# every line that starts with a document number (RE_DOC_ID) is read as such an entry, and the titles above them
+# as its group and sub-group. They are shown in one consistent layout in the Word documents ("Document List" style)
+# and listed in the "Applicable Documents" sheet of the workbook.
+# the referencing paragraphs at the end of an entry: "3.2.1", "3.2.1, 3.4.5", "3.2.1 and 4.3", "3.2.1 & A.1.2"
+_PARA_LIST = r"(?:\d{1,2}(?:\.\d{1,3}){1,7}|[A-Z]\.\d{1,3}(?:\.\d{1,3}){0,6})"
+# a number after one of these words is part of the title ("High Performance Serial Bus, Revision 1.1", "Part 21"),
+# not the paragraphs that call the document up: after a version word a number of one or two parts, after a part
+# word a number of one part ("... Regulation Supplement 3.11" ends in a paragraph)
+# (a part word set off by a comma, as titles write them; a version word also without one - "Ethernet Specification
+# Revision 3.0" - but not in "Notice of Revision 3.4", which ends in a paragraph)
+_ENDS_IN_VERSION_WORD = re.compile(r"(?P<comma>,)?\s*\b(?P<word>Revision|Rev|Version|Ver|Issue|Edition|Ed|Release|Rel)"
+                                   r"\.?\s*$", re.I)
+_ENDS_IN_PART_WORD = re.compile(r",\s*(?:Part|Volume|Vol|Number|No|Amendment|Amdt|Change|Notice|Supplement|Suppl)\.?\s*$",
+                                re.I)
+RE_REFERENCING_PARAGRAPHS = re.compile(r"(?:^|\s)(?P<paras>" + _PARA_LIST + r"(?:\s*(?:,|;|and|&)\s*" + _PARA_LIST +
+                                       r")*)\s*[.;]?$")
+_SUBGROUP_WORDS = {"military", "federal", "industry", "commercial", "government", "non-government", "navy", "army",
+                   "air force", "marine corps", "nasa", "department of defense", "dod", "other", "drawings",
+                   "publications", "specifications", "standards", "handbooks", "international", "national",
+                   "industry standards", "other publications", "other documents", "technical manuals", "manuals"}
+# who issued the documents: a sub-title also when typed in capitals ("MILITARY" under "SPECIFICATIONS"). A kind of
+# document in capitals ("STANDARDS") is a group title of its own.
+_ISSUER_WORDS = {"military", "federal", "industry", "commercial", "government", "non-government", "navy", "army",
+                 "air force", "marine corps", "nasa", "department of defense", "dod", "other", "international",
+                 "national"}
+
+
+def _entry_columns(block: Block) -> Optional[list]:
+    """The columns of a document entry laid out on tab stops, as cells: the pieces of its first line give the
+    columns (number, title, referencing paragraphs), and every line under it is put in the column it starts in -
+    so a title that wraps onto a second line stays the title, wherever the paragraph numbers are."""
+    if block.meta.get("cells"):
+        return block.meta["cells"]
+    rows = _block_rows(block) if block.lines else []
+    if not rows or len(rows[0]) < 2:
+        return None
+    starts = [ln.box[0] for ln in sorted(rows[0], key=lambda ln: ln.box[0])]
+    cells = [[] for _ in starts]
+    for row in rows:
+        for ln in sorted(row, key=lambda l: l.box[0]):
+            k = max([i for i, x in enumerate(starts) if ln.box[0] >= x - 0.02 * max(1, block.box[2] - block.box[0])],
+                    default=0)
+            cells[k].append(ln.text)
+    return [" ".join(c) for c in cells]
+
+
+def parse_document_entry(text: str, cells: Optional[list] = None) -> Optional[dict]:
+    """'MIL-STD-461G  Requirements for the Control of Electromagnetic Interference ...  3.2.5' ->
+    {"id": "MIL-STD-461G", "title": "Requirements for the Control of ...", "paragraphs": "3.2.5"}; None when the text
+    does not start with a document number. `cells`: the columns of the entry, when it was laid out on tab stops or as
+    a table (see _entry_columns) - then the title is the middle column and the paragraphs the last one."""
+    filled = [" ".join(c.split()) for c in (cells or []) if c and c.strip()]
+    if len(filled) >= 2 and RE_DOC_ID_START.match(filled[0]):
+        # the paragraphs are the last cell - or the last few, when the reading split the list ("3.2.1," / "3.4.5")
+        k = len(filled)
+        while k > 2 and RE_REFERENCING_PARAGRAPHS.fullmatch(" " + " ".join(filled[k - 1:])):
+            k -= 1
+        text, paragraphs = " ".join(filled[:k]), " ".join(filled[k:]).strip(" .;")
+        entry = parse_document_entry(text)
+        if entry is not None:
+            entry["paragraphs"] = paragraphs or entry["paragraphs"]
+        return entry
+    t = " ".join((text or "").split())
+    marker = RE_LIST_MARKER.match(t)
+    if marker and not RE_DOC_ID_START.match(t):
+        t = marker.group("rest")                             # "a. MIL-STD-461G ..." - an entry with a list marker
+    m = RE_DOC_ID_START.match(t)
+    if not m:
+        return None
+    doc_id = m.group(0).strip()
+    rest = re.sub(r"^,\s*", "", t[m.end():].strip())          # ("MIL-STD-1553B, Notice 4, Digital ...")
+    revision = re.match(r"^(?:\(([^)]{1,30})\)|(?:Rev(?:ision)?\.?|Amendment|Amdt\.?|Notice|Change|"
+                        r"w/\s*(?:Change|Notice|Amendment))\s+"
+                        r"(?-i:\d{1,3}[A-Z]?|[A-Z]{1,2}|[IVX]{1,4})\b)", rest, re.I)
+    if revision:                                             # "(30 Jan 2015)", "Rev C", "Notice 2" - not "Notice of"
+        doc_id = f"{doc_id} {revision.group(0)}"
+        rest = rest[revision.end():].strip()
+    paragraphs = ""
+    tail = RE_REFERENCING_PARAGRAPHS.search(rest)
+    # (a single number of one or two parts after 'Revision', 'Version', 'Part' ... is part of the title: "High
+    # Performance Serial Bus, Revision 1.1" - but "Request for Engineering Change 3.10.1" ends in a paragraph)
+    number = tail.group("paras").strip(" .;") if tail else ""
+    before = rest[:tail.start("paras")] if tail else ""
+    version_word = _ENDS_IN_VERSION_WORD.search(before)
+    version = ((bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3})?", number)) and bool(version_word)
+                and (bool(version_word.group("comma"))
+                     or not re.search(r"\b(?:of|for|to|on|per)\s*$", before[:version_word.start("word")], re.I)))
+               or (bool(re.fullmatch(r"\d{1,3}", number)) and bool(_ENDS_IN_PART_WORD.search(before))))
+    if tail and tail.start("paras") > 0 and not version:
+        paragraphs = tail.group("paras").strip()
+        rest = rest[:tail.start("paras")].strip()
+    title = re.sub(r"^[-–—:,]+\s*|\s*[-–—,;.:]+$", "", rest).strip()
+    return {"id": doc_id, "title": title, "paragraphs": paragraphs}
+
+
+def _document_base(doc_id: str) -> str:
+    """'MIL-STD-461G (30 Jan 2015)' -> 'MIL-STD-461', 'MIL-STD-810H w/CHANGE 1' -> 'MIL-STD-810': the number without
+    its revision letter, activity, date or change notice, so a citation of any issue finds it."""
+    base = re.split(r"\s*\(|\s+(?i:rev(?:ision)?\b|w/|with\s|change\b|chg\b|notice\b|amendment\b|amdt\b|amd\b|"
+                    r"supplement\b)", doc_id)[0]
+    return re.sub(r"(?<=\d)[A-Z]{1,2}$", "", base.strip())
+
+
+def read_document_lists(doc: DocResult) -> list:
+    """Find the lists of documents (see the top of 9c) and mark their blocks: block.meta["document_entry"] for an
+    entry, block.meta["document_group"] = "group" / "subgroup" for the titles above them. Returns the entries in
+    order: [{"id", "title", "paragraphs", "group", "subgroup", "page", "uid"}] (kept as doc._documents)."""
+    entries = []
+    in_list, group, subgroup = False, "", ""
+    entry_title_x = None              # where the title of the entry just read starts, when it is on a tab stop
+    after_requirement = False         # the block above in the list is a requirement (its tests follow it)
+    for b in doc.blocks:
+        if b.kind in ("page_header", "page_footer"):
+            continue
+        parts = b.meta.get("outline") or []
+        heading = next((p for p in parts if p["kind"] in ("heading", "subheading") and not p.get("missing")), None)
+        if heading is not None and heading["kind"] == "heading":
+            title = heading.get("title", "")
+            number = _number_parts(_outline_number(heading.get("number", ""))) if heading.get("number") else None
+            # a section titled as a list of documents ("1.2 Applicable documents", "A.2.1 Specifications, standards,
+            # and handbooks"), or one that says a list of documents follows. A title of one plain word such as
+            # "Standards" names a list only in section 2 (or an appendix's A.2): "3.4 Standards." holds requirements
+            plain = " ".join(title.lower().split()).strip(" .:")
+            # (section 2, an appendix's x.2, or a MIL-STD-490 appendix's 20: "20. STANDARDS", "20. APPLICABLE
+            # STANDARDS")
+            in_section_2 = bool(number) and (number[0] in (2, 20)
+                                             or (number[0] < 0 and len(number) > 1 and number[1] == 2))
+            in_list = (heading.get("type") == "applicable documents"
+                       or (bool(_DOCUMENT_LIST_TITLES.fullmatch(plain))
+                           and (in_section_2 or not _GENERIC_LIST_TITLES.fullmatch(plain)))
+                       or (bool(_COMPOUND_LIST_TITLES.fullmatch(plain)) and in_section_2)
+                       or bool(_DOCUMENTS_FOLLOW.search(b.text or "")))
+            group = subgroup = ""
+            entry_title_x, after_requirement = None, False
+            if not any(p["kind"] == "body" for p in parts):
+                continue
+        if not in_list or b.kind in ("table", "figure", "caption"):
+            continue
+        text = (b.text or "").strip()
+        if _says_requirement(text):
+            # (a lead-in that also says "shall" about the documents - "... the contents of this specification shall be
+            # considered a superseding requirement." - names no tests)
+            entry_title_x, after_requirement = None, not _LEAD_IN_BOILERPLATE.search(text)
+            continue                                 # a requirement, not a document: no document's title says "shall"
+        entry = parse_document_entry(text, _entry_columns(b) if RE_DOC_ID_START.match(text) else None)
+        if (entry is not None and after_requirement
+                and re.match(r"(?:Method|Procedure|Table|Figure|Paragraph|Condition)\.?\s+\d", entry["title"])):
+            entry_title_x = None
+            continue                                 # "... The methods to be used are:" / "MIL-STD-810H, Method 514.8
+                                                     # Vibration, ...": a test that requirement names, not a document
+        if entry is not None:
+            lead = None if RE_DOC_ID_START.match(text) else RE_LIST_MARKER.match(text)
+            entry.update({"group": group, "subgroup": subgroup, "page": b.page_label(), "uid": b.uid,
+                          "marker": lead.group("marker") if lead else ""})          # ("a. DI-MISC-80508 ...")
+            b.meta["document_entry"] = entry
+            entries.append(entry)
+            first_row = sorted(_block_rows(b)[0], key=lambda ln: ln.box[0]) if b.lines else []
+            entry_title_x = first_row[1].box[0] if len(first_row) >= 2 else None
+            continue
+        short = 0 < word_count(text) <= 8 and not RE_TERMINAL.search(text.rstrip(":"))
+        name = text.rstrip(":").strip()
+        # a short line at the tab stop of the title of the entry above, or a few characters right of it, is the end
+        # of that title, not a sub-title (sub-titles stand left of the titles, or are centred)
+        line_h = max(ln.height for ln in b.lines) if b.lines else 0
+        page_w = next((p.width for p in doc.pages if p.number == b.page), 0)
+        centred = bool(page_w) and abs((b.box[0] + b.box[2]) / 2 - page_w / 2) < 1.5 * line_h
+        on_title_stop = (entry_title_x is not None and b.lines and not centred
+                         and entry_title_x - 0.6 * line_h <= b.box[0] <= entry_title_x + 4 * line_h)
+        # an issuer in capitals ("MILITARY") is a sub-title under a kind of document ("SPECIFICATIONS"); under
+        # another issuer ("MILITARY", then "FEDERAL") it is a group of its own
+        issuer_under_kind = name.lower() in _ISSUER_WORDS and group.lower() not in _ISSUER_WORDS
+        if short and group and name.lower() in _SUBGROUP_WORDS and (not name.isupper() or issuer_under_kind):
+            subgroup = name                                            # "Military" / "MILITARY" under a group title
+            b.meta["document_group"] = "subgroup"
+        elif short and name.isupper():
+            group, subgroup = name, ""                                 # "SPECIFICATIONS", "DEPARTMENT OF DEFENSE ..."
+            b.meta["document_group"] = "group"
+        elif short and group and not on_title_stop and word_count(name) <= 4 and name[:1].isupper():
+            subgroup = name                                            # another sub-title ("Regulations")
+            b.meta["document_group"] = "subgroup"
+        elif short and heading is not None:
+            group, subgroup = name, ""                                 # a title in lower case with no group above
+            b.meta["document_group"] = "group"
+        entry_title_x = None
+    doc._documents = entries
+    return entries
+
+
 # =============================================================================
 # 10. EXCEL EXPORT
 #     Sheet "Extracted Items": one row per requirement, caption and table.
@@ -5617,7 +7961,7 @@ MASTER_COLUMNS = [  # (header, width, description used in the Run Info sheet)
     ("Section", 28, "Nearest heading above the item"),
     ("Doc Ref", 13, "Paragraph number, requirement ID or table/figure number printed in the document"),
     ("Title", 20, "Paragraph title (e.g. 'Detection range') or table caption"),
-    ("Content", 72, "The complete requirement text, caption text, or the table as text"),
+    ("Content", 72, "The complete requirement text or caption text; for a table, a link to the sheet that holds it"),
     ("Keyword", 10, "Requirement keyword found (shall, must, should, will ...)"),
     ("Class", 18, "Mandatory / Goal / Statement of intent (from the keyword)"),
     ("Found In", 20, "Paragraph, list item under a stem, table row ..."),
@@ -5629,6 +7973,8 @@ MASTER_COLUMNS = [  # (header, width, description used in the Run Info sheet)
     ("Needs Review", 9, "Yes when something below deserves a human check"),
     ("Review Reasons", 42, "Why the item needs a check"),
     ("Quality Notes", 36, "INCOSE-style writing checks: TBD, vague terms, escape clauses, and/or ..."),
+    ("OCR Corrections", 26, "Misreads the tool corrected in this item, as 'read' -> 'corrected' (also marked in the Word "
+                            "report). Look at the scan when one matters"),
     ("Table Sheet", 11, "Link to the worksheet holding the full table"),
 ]
 _COL = {name: i for i, (name, _w, _d) in enumerate(MASTER_COLUMNS, 1)}
@@ -5691,8 +8037,9 @@ def write_workbook(path: Path, runs: list, settings: Settings, multi_doc: bool =
     ws.freeze_panes = "B2"
     ws.row_dimensions[1].height = 30
 
-    sheet_names = {"Extracted Items", "Full Text", "Page Quality", "Run Info"}
-    table_sheets = []           # (sheet title, item, doc)
+    sheet_names = {"Extracted Items", "Full Text", "Page Quality", "Run Info", "Document Structure",
+                   "Applicable Documents"}
+    table_sheets = []           # (sheet title, item, doc, the item's ID in Extracted Items)
     row = 2
     for d_index, (doc, items) in enumerate(runs, 1):
         for it in items:
@@ -5700,20 +8047,25 @@ def write_workbook(path: Path, runs: list, settings: Settings, multi_doc: bool =
                 name = _safe_sheet_title((f"D{d_index}-" if multi_doc else "") + it.item_id.replace("-", ""), sheet_names)
                 sheet_names.add(name)
                 it.table_sheet = name
-                table_sheets.append((name, it, doc))
+                table_sheets.append((name, it, doc, (f"D{d_index}-" if multi_doc else "") + it.item_id))
+            # a table's cells strung together are unreadable in one cell: its row links to the table's own sheet
+            content = (f"Table - see sheet {it.table_sheet} ({it.table.n_rows} rows x {it.table.n_cols} columns)"
+                       if it.table_sheet else it.text)
             values = [it.item_id if not multi_doc else f"D{d_index}-{it.item_id}", it.item_type, it.source_file, it.pages,
-                      it.section, it.doc_ref, it.title, it.text, it.keyword, it.req_class, it.found_in, it.context,
+                      it.section, it.doc_ref, it.title, content, it.keyword, it.req_class, it.found_in, it.context,
                       it.attributes, it.verification, it.references, round(it.ocr_conf, 3) if it.ocr_conf is not None else None,
                       "Yes" if it.needs_review else "No", "\n".join(it.review_reasons), "\n".join(it.quality_notes),
-                      it.table_sheet or None]
+                      "\n".join(it.corrections), it.table_sheet or None]
             for c, v in enumerate(values, 1):
                 cell = _put(ws, row, c, v, number_format="0.00" if c == _COL["OCR Confidence"] else None)
                 cell.border = _BORDER
             if it.table_sheet:
-                link = ws.cell(row=row, column=len(MASTER_COLUMNS))
-                link.hyperlink = Hyperlink(ref=link.coordinate, location=f"'{it.table_sheet}'!A1", display=it.table_sheet)
-                link.style = "Hyperlink"
-                link.alignment = _WRAP_TOP
+                for col in (_COL["Content"], _COL["Table Sheet"]):
+                    link = ws.cell(row=row, column=col)
+                    link.hyperlink = Hyperlink(ref=link.coordinate, location=f"'{it.table_sheet}'!A1",
+                                               display=str(link.value))
+                    link.style = "Hyperlink"
+                    link.alignment = _WRAP_TOP
             row += 1
     if row == 2:
         _put(ws, 2, 1, "-")
@@ -5729,39 +8081,43 @@ def write_workbook(path: Path, runs: list, settings: Settings, multi_doc: bool =
                                   FormulaRule(formula=[f'${review_col}2="Yes"'], fill=_REVIEW_FILL))
 
     # ---- one sheet per table ----------------------------------------------------------
-    for name, it, doc in table_sheets:
+    for name, it, doc, row_id in table_sheets:
         ts = wb.create_sheet(name)
         t = it.table
         ctx = document_text_context(doc, settings)
         _put(ts, 1, 1, it.title or it.doc_ref or "Table (no caption found)", bold=True, wrap=False).font = Font(bold=True, size=12)
-        _put(ts, 2, 1, f"{it.item_id}  |  {it.source_file}  |  page(s) {it.pages}  |  {t.n_rows} rows x {t.n_cols} columns", wrap=False)
+        heading = (f"heading row: {t.header_rows} ({t.header_format})" if t.header_format and t.header_rows
+                   else "no heading row (no row is printed differently from the others)")
+        _put(ts, 2, 1, f"{row_id}  |  {it.source_file}  |  page(s) {it.pages}  |  {t.n_rows} rows x {t.n_cols} columns"
+                       f"  |  {heading}", wrap=False)
         back = _put(ts, 3, 1, "<< Back to Extracted Items", wrap=False)
         back.hyperlink = Hyperlink(ref=back.coordinate, location="'Extracted Items'!A1", display="Extracted Items")
         back.style = "Hyperlink"
         top = 5
         widths = [8] * t.n_cols
         merged_hidden = set()
-        for r0, c0, r1, c1 in t.merges:
+        merges = _table_merges(t)                       # (the same merged cells as the Word report)
+        for r0, c0, r1, c1 in merges:
             for rr in range(r0, r1 + 1):
                 for cc in range(c0, c1 + 1):
                     if (rr, cc) != (r0, c0):
                         merged_hidden.add((rr, cc))
         for r, grid_row in enumerate(t.grid):
             for c in range(t.n_cols):
-                value = grid_row[c] if c < len(grid_row) else ""
+                value = _cell_text(t, r, c, merges)
                 cell = _put(ts, top + r, c + 1, None if (r, c) in merged_hidden else (value or None))
                 cell.border = _BORDER
-                if r < t.header_rows:
+                if r < shown_header_rows(t):                # only a row PRINTED as a heading row is shown as one
                     cell.font, cell.fill = _HEADER_FONT, _HEADER_FILL
                 elif _cell_attention(t, r, c, ctx, settings):
                     cell.fill = _LOWCONF_FILL
                 widths[c] = max(widths[c], min(60, max((len(x) for x in str(value).split("\n")), default=0) + 2))
-        for r0, c0, r1, c1 in t.merges:
-            if r1 < t.n_rows and c1 < t.n_cols and (r1 > r0 or c1 > c0):
-                ts.merge_cells(start_row=top + r0, start_column=c0 + 1, end_row=top + r1, end_column=c1 + 1)
+        for r0, c0, r1, c1 in merges:
+            ts.merge_cells(start_row=top + r0, start_column=c0 + 1, end_row=top + r1, end_column=c1 + 1)
         for c, wdt in enumerate(widths, 1):
             ts.column_dimensions[get_column_letter(c)].width = wdt
-        if any(_cell_attention(t, r, c, ctx, settings) for r in range(t.header_rows, t.n_rows) for c in range(t.n_cols)):
+        if any(_cell_attention(t, r, c, ctx, settings) for r in range(shown_header_rows(t), t.n_rows)
+               for c in range(t.n_cols)):
             _put(ts, top + t.n_rows + 1, 1, "Yellow cells: check against the scan (suspicious word or low-confidence number).", wrap=False)
 
     # ---- Full Text -----------------------------------------------------------------------
@@ -5819,6 +8175,12 @@ def write_workbook(path: Path, runs: list, settings: Settings, multi_doc: bool =
                 _put(pq, r, c, v, fill=_REVIEW_FILL if (c == 10 and grade in ("Poor", "No text", "FAILED")) else None)
             r += 1
 
+    # ---- Document Structure, Applicable Documents -----------------------------------------------
+    for doc, _items in runs:
+        document_outline(doc, settings)              # (worked out already when the tool runs; tests may not have)
+    _write_structure_sheet(wb, runs, multi_doc)
+    _write_documents_sheet(wb, runs, multi_doc)
+
     # ---- Run Info -------------------------------------------------------------------------
     ri = wb.create_sheet("Run Info")
     ri.column_dimensions["A"].width = 30
@@ -5846,12 +8208,176 @@ def write_workbook(path: Path, runs: list, settings: Settings, multi_doc: bool =
         ("HOW TO USE THIS WORKBOOK", "1) Filter 'Needs Review' = Yes on 'Extracted Items' and compare those rows with the scan "
                                      "(page numbers are given).\n2) Use the Word verification report to check whole pages quickly.\n"
                                      "3) 'Full Text' lists every text block the OCR found, in reading order, and which item it became.\n"
-                                     "4) 'Page Quality' shows pages with poor scan quality."),
+                                     "4) 'Page Quality' shows pages with poor scan quality.\n"
+                                     "5) 'Document Structure' is the document as an outline: each heading with its level and "
+                                     "paragraph number, and everything under it (also usable as a spreadsheet import into DOORS).\n"
+                                     "6) 'Applicable Documents' lists the standards and other documents named in section 2, and "
+                                     "which requirements cite them.\n"
+                                     "7) 'OCR Corrections' (Extracted Items) lists the misreads the tool corrected - marked in "
+                                     "green in the Word report."),
     ] + [(f"Column: {name}", desc) for name, _w, desc in MASTER_COLUMNS]
     for r, (k, v) in enumerate(info, 1):
         _put(ri, r, 1, k, bold=True)
         _put(ri, r, 2, v)
     return _save_workbook(wb, path)
+
+
+def shown_header_rows(t: TableData) -> int:
+    """How many rows of a table are SHOWN as its heading rows: those set apart in print (TableData.header_format),
+    or none - a first row that merely holds short words is content (see _header_rows)."""
+    return min(t.header_rows, t.n_rows) if t.header_format else 0
+
+
+def _table_merges(t: TableData) -> list:
+    """The merged cells of a table as the Excel sheet and the Word report draw them: (first row, first column, last
+    row, last column), cut to the table, two cells or more, and none overlapping one before it. A reading can give
+    ranges that overlap; merging those in Word grows the merged cell past what was read and wipes text already
+    written into it, so the Excel sheet and the Word report would no longer show the same table."""
+    taken, out = set(), []
+    for r0, c0, r1, c1 in t.merges or []:
+        r0, c0, r1, c1 = max(0, r0), max(0, c0), min(r1, t.n_rows - 1), min(c1, t.n_cols - 1)
+        if r1 < r0 or c1 < c0 or (r0, c0) == (r1, c1):
+            continue
+        cells = {(r, c) for r in range(r0, r1 + 1) for c in range(c0, c1 + 1)}
+        if cells & taken:
+            continue
+        taken |= cells
+        out.append((r0, c0, r1, c1))
+    return out
+
+
+def _cell_text(t: TableData, r: int, c: int, merges: list) -> str:
+    """The text a cell shows: its own, or - for the first cell of a merged range - the first text inside the range
+    (a reading normally repeats it in every cell of the range; this keeps it when only one of them holds it)."""
+    row = t.grid[r] if r < len(t.grid) else []
+    own = row[c] if c < len(row) else ""
+    for r0, c0, r1, c1 in merges:
+        if (r0, c0) == (r, c) and not own:
+            return next((t.grid[rr][cc] for rr in range(r0, min(r1 + 1, len(t.grid)))
+                         for cc in range(c0, min(c1 + 1, len(t.grid[rr]))) if t.grid[rr][cc]), "")
+    return own
+
+
+def _write_structure_sheet(wb, runs: list, multi_doc: bool) -> None:
+    """The "Document Structure" sheet: the document as an outline (build_outline) - every heading with its level
+    and paragraph number, and every paragraph, list item, table and figure under the heading it belongs to. One row
+    per object in reading order, with its parent: the shape of a spreadsheet import into DOORS, which (unlike a Word
+    import) can also carry the paragraph numbers and requirement IDs into attributes."""
+    ws = wb.create_sheet("Document Structure")
+    headers = [("ID", 9), ("Parent ID", 9), ("Level", 6), ("Is Heading", 8), ("Paragraph Number", 11), ("Kind", 12),
+               ("Heading / Text", 80), ("Section Type", 16), ("Requirement IDs", 16), ("Source File", 20),
+               ("Page(s)", 8), ("OCR Corrections", 24)]
+    for c, (h, wdt) in enumerate(headers, 1):
+        cell = _put(ws, 1, c, h)
+        cell.font, cell.fill = _HEADER_FONT, _HEADER_FILL
+        ws.column_dimensions[get_column_letter(c)].width = wdt
+    ws.freeze_panes = "A2"
+    r = 2
+    for d_index, (doc, items) in enumerate(runs, 1):
+        pre = f"D{d_index}-" if multi_doc else ""
+        by_block = defaultdict(list)
+        for it in items:
+            # a requirement made from a list item is filed on the item's own row (its blocks are the lead-in
+            # paragraph, then the item); every other item on the first block it was read from
+            own = it.block_uids[1:2] if it.found_in == "List item under stem" else []
+            for uid in own or it.block_uids[:1]:        # (an item on its lead-in's own line: that one block)
+                by_block[uid].append(it)
+        n = 0
+        for b in doc.blocks:
+            if b.kind in ("page_header", "page_footer"):
+                continue
+            parts = b.meta.get("outline") or [{"kind": "body", "level": 0, "number": "", "title": "", "start": 0,
+                                               "end": len(b.text or ""), "type": "", "parent": ""}]
+            body_parts = [p for p in parts if p["kind"] == "body"]
+            for p in parts:
+                n += 1
+                titled = p["kind"] in ("heading", "subheading")
+                heading = p["kind"] == "heading"           # (a sub-heading is shown as a title, but has no level)
+                if titled:
+                    text = (f"{p['number']} {p['title']}".strip() if p["kind"] == "heading" else p["title"])
+                    kind, ids = ("Heading" if p["kind"] == "heading" else "Subheading"), []
+                    row_id = pre + p.get("id", f"S-{n:04d}")
+                else:
+                    reqs = [it for it in by_block.get(b.uid, []) if it.item_type == "Requirement"]
+                    if len(body_parts) > 1:              # several numbered paragraphs in the block: by their number
+                        number = next((q["number"] for q in reversed(parts[:parts.index(p)]) if q["kind"] == "heading"),
+                                      "")
+                        reqs = [it for it in reqs if (it.doc_ref.split() or [""])[0] == number] or \
+                            (reqs if p is body_parts[0] else [])
+                    ids = [pre + it.item_id for it in reqs] + [pre + it.item_id for it in by_block.get(b.uid, [])
+                                                                if it.item_type != "Requirement" and p is body_parts[0]]
+                    if b.kind == "table":
+                        tables = [it for it in by_block.get(b.uid, []) if it.item_type == "Table"]
+                        text = ((b.meta.get("caption") or "Table") + (f" - see sheet {tables[0].table_sheet}"
+                                                                      if tables and tables[0].table_sheet else ""))
+                        kind = "Table"
+                    elif b.kind == "figure":
+                        text, kind = b.meta.get("caption") or "[figure]", "Figure"
+                    elif b.meta.get("document_entry"):
+                        e = b.meta["document_entry"]
+                        text = " - ".join(x for x in (e["id"], e["title"]) if x) + (f" ({e['paragraphs']})"
+                                                                                    if e["paragraphs"] else "")
+                        kind = "Document"
+                    else:
+                        text = (b.text or "")[p["start"]:p["end"]].strip()
+                        kind = ("Caption" if b.kind == "caption" else "Requirement" if reqs
+                                else "List Item" if b.kind == "list_item" else "Text")
+                    row_id = f"{pre}O-{n:04d}"
+                level = p["level"] if titled else p["level"] + 1
+                parent = p.get("parent", "")
+                values = [row_id, (pre + parent) if parent else None, level, "Yes" if heading else "No",
+                          p.get("number") or None, kind, text, p.get("type") or None, ", ".join(ids) or None,
+                          Path(doc.source).name, b.page_label(),
+                          "; ".join(b.meta.get("corrections") or [])
+                          if titled and b.kind == "heading" and not p.get("missing") else None]
+                for c, v in enumerate(values, 1):
+                    cell = _put(ws, r, c, v)
+                    if titled and c == 7:
+                        cell.font = Font(bold=True)
+                r += 1
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(r - 1, 1)}"
+
+
+def _document_key(doc_id: str) -> str:
+    """A document number in the form two citations of it share: 'RTCA DO-160G' and 'DO-160', 'SAE AS50881' and
+    'AS50881', 'IEEE Std 1394' and 'IEEE 1394', 'ISO 9001:2015' and 'ISO 9001' (see _document_base)."""
+    key = _document_base(" ".join(doc_id.split()))
+    key = re.sub(r"^(?:RTCA|SAE|ANSI)[ /]+(?=\S)", "", key)
+    key = re.sub(r"\bStd\.?\s+", "", key)
+    key = re.sub(r":\d{4}$", "", key)
+    return re.sub(r"(?<=\d)[A-Z]{1,2}$", "", key).upper()
+
+
+def _write_documents_sheet(wb, runs: list, multi_doc: bool = False) -> None:
+    """The "Applicable Documents" sheet: every document listed in section 2 (read_document_lists), with the
+    paragraphs the list says call it up, and the requirements whose text cites it."""
+    ws = wb.create_sheet("Applicable Documents")
+    headers = [("Group", 22), ("Sub-group", 14), ("Document", 20), ("Title", 60), ("Referenced In (paragraphs)", 18),
+               ("Cited By (requirements)", 22), ("Source File", 20), ("Page(s)", 8)]
+    for c, (h, wdt) in enumerate(headers, 1):
+        cell = _put(ws, 1, c, h)
+        cell.font, cell.fill = _HEADER_FONT, _HEADER_FILL
+        ws.column_dimensions[get_column_letter(c)].width = wdt
+    ws.freeze_panes = "A2"
+    r = 2
+    for d_index, (doc, items) in enumerate(runs, 1):
+        pre = f"D{d_index}-" if multi_doc else ""
+        cited = defaultdict(list)
+        for it in items:
+            if it.item_type == "Requirement":
+                for m in RE_DOC_ID.finditer(it.text or ""):
+                    cited[_document_key(m.group(0))].append(pre + it.item_id)
+        for e in getattr(doc, "_documents", None) or []:
+            values = [e["group"] or None, e["subgroup"] or None, e["id"], e["title"] or None, e["paragraphs"] or None,
+                      ", ".join(dict.fromkeys(cited.get(_document_key(e["id"]), []))) or None,
+                      Path(doc.source).name, e["page"]]
+            for c, v in enumerate(values, 1):
+                _put(ws, r, c, v)
+            r += 1
+    if r == 2:
+        _put(ws, 2, 1, "No list of documents was found (it is read in a section titled like 'APPLICABLE DOCUMENTS').",
+             wrap=False)
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(r - 1, 1)}"
 
 
 def _look_summary(settings: Settings) -> str:
@@ -5863,15 +8389,31 @@ def _look_summary(settings: Settings) -> str:
         return "the style file or template cannot be used: " + str(exc).splitlines()[0]
 
 
-def _save_workbook(wb, path: Path) -> Path:
+@contextlib.contextmanager
+def _temporary_files_in(folder: Path):
+    """While a file is written, keep Python's temporary files in a folder of their own inside `folder` (the output
+    folder), and delete it afterwards. openpyxl writes every worksheet - the requirement text - to a temporary file
+    before it zips the workbook; by default that is the system's temp folder, outside the folder the user chose for
+    the document's data, where a crash would leave it behind."""
+    private = Path(tempfile.mkdtemp(prefix="_saving_", dir=folder))
+    before, tempfile.tempdir = tempfile.tempdir, str(private)
     try:
-        wb.save(path)
-        return path
-    except PermissionError:
-        alt = path.with_name(f"{path.stem}_{_dt.datetime.now():%H%M%S}{path.suffix}")
-        LOG.warning("%s is open in another program - saved as %s instead", path.name, alt.name)
-        wb.save(alt)
-        return alt
+        yield
+    finally:
+        tempfile.tempdir = before
+        shutil.rmtree(private, ignore_errors=True)
+
+
+def _save_workbook(wb, path: Path) -> Path:
+    with _temporary_files_in(path.parent):
+        try:
+            wb.save(path)
+            return path
+        except PermissionError:
+            alt = path.with_name(f"{path.stem}_{_dt.datetime.now():%H%M%S}{path.suffix}")
+            LOG.warning("%s is open in another program - saved as %s instead", path.name, alt.name)
+            wb.save(alt)
+            return alt
 
 
 # =============================================================================
@@ -5919,16 +8461,31 @@ class ReportPart:
 
 REPORT_PARTS = (
     ReportPart("title", "paragraph", "Title", "", (), "the report title at the top of the first page"),
-    ReportPart("heading 1", "paragraph", "Heading 1", "", (), "\"Page 12\" at the start of each scanned page"),
-    ReportPart("heading 2", "paragraph", "Heading 2", "", (),
-               "\"Page 12 - text read by the tool\", and the scanned document's main headings"),
-    ReportPart("heading 3", "paragraph", "Heading 3", "", (), "the scanned document's second-level headings"),
-    ReportPart("heading 4", "paragraph", "Heading 4", "", (), "third-level headings and below"),
+    ReportPart("heading 1", "paragraph", "Heading 1", "", (),
+               "the scanned document's top-level sections (\"3. REQUIREMENTS\")"),
+    ReportPart("heading 2", "paragraph", "Heading 2", "", (), "its second-level sections (\"3.1 General\")"),
+    ReportPart("heading 3", "paragraph", "Heading 3", "", (), "third-level sections (\"3.1.1 Power input\")"),
+    ReportPart("heading 4", "paragraph", "Heading 4", "", (), "fourth-level sections (\"3.1.1.1\")"),
+    ReportPart("heading 5", "paragraph", "Heading 5", "", (), "fifth-level sections (\"3.1.1.1.1\")"),
+    ReportPart("heading 6", "paragraph", "Heading 6", "", (), "sixth-level sections"),
+    ReportPart("heading 7", "paragraph", "Heading 7", "", (), "seventh-level sections"),
+    ReportPart("heading 8", "paragraph", "Heading 8", "", (), "eighth-level sections"),
+    ReportPart("heading 9", "paragraph", "Heading 9", "", (), "ninth-level sections and deeper"),
+    ReportPart("subheadings", "paragraph", "Subheading", "body",
+               (("bold", True), ("space_before", 6.0), ("space_after", 3.0)),
+               "titles without a paragraph number inside a numbered section (\"SPECIFICATIONS\" above a list of "
+               "documents), and \"How to read this report\""),
+    ReportPart("subheadings 2", "paragraph", "Subheading 2", "subheadings", (("italic", True), ("indent_left", 274320)),
+               "a title under such a title (\"Military\" under \"SPECIFICATIONS\")"),
     ReportPart("body", "paragraph", "Normal", "", (("font", "Calibri"), ("size", 10.0)),
                "ordinary paragraphs read from the scan"),
     ReportPart("list items", "paragraph", "List Paragraph", "",
                (("indent_left", 320040), ("first_line_indent", 0), ("contextual_spacing", False)),   # 0.35 in
                "list entries read from the scan"),
+    ReportPart("document list", "paragraph", "Document List", "body",
+               (("indent_left", 1737360), ("first_line_indent", -1737360), ("space_after", 2.0)),   # 1.9 in
+               "the documents listed in section 2: number, title on a tab stop, and the paragraphs that call them "
+               "up at the right margin"),
     ReportPart("requirements", "paragraph", "Requirement Text", "body", (),
                "paragraphs that became a requirement row in the Excel file", ("tag_position", "mark_keywords")),
     ReportPart("requirement tag", "character", "Requirement Tag", "",
@@ -5950,6 +8507,9 @@ REPORT_PARTS = (
     ReportPart("scanned header footer", "paragraph", "Scanned Header Footer", "",
                (("size", 8.0), ("italic", True), ("color", "808080")),
                "running headers and footers printed on the scanned pages"),
+    ReportPart("page label", "paragraph", "Page Label", "",
+               (("size", 8.0), ("color", "595959"), ("alignment", "right"), ("space_before", 0.0), ("space_after", 0.0)),
+               "the label in the page header of each scanned page (\"Page 12 - text read by the tool\")"),
     ReportPart("notes", "paragraph", "Report Note", "", (("size", 8.5), ("italic", True)),
                "the tool's own remarks: page notes, \"[figure]\""),
 )
@@ -5958,7 +8518,9 @@ PART = {p.section: p for p in REPORT_PARTS}
 OTHER_SECTIONS = {
     "document": ("template", "font"),
     "page": ("paper", "orientation", "margin_top", "margin_bottom", "margin_left", "margin_right"),
-    "review marks": ("check_highlight", "likely_wrong_highlight", "likely_wrong_color", "cell_fill"),
+    "review marks": ("check_highlight", "likely_wrong_highlight", "likely_wrong_color", "cell_fill",
+                     "corrected_highlight"),
+    "doors": ("make_doors_document", "heading_numbers"),
 }
 # the tool's own page (used when there is no template)
 BUILT_IN_PAGE = {"paper": "letter", "orientation": "portrait", "margin_top": 548640, "margin_bottom": 548640,
@@ -5967,7 +8529,9 @@ BUILT_IN_PAGE = {"paper": "letter", "orientation": "portrait", "margin_top": 548
 BUILT_IN_SWITCHES = {("requirements", "tag_position"): "end", ("requirements", "mark_keywords"): False,
                      ("table header row", "repeat_on_each_page"): True,
                      ("review marks", "check_highlight"): "yellow", ("review marks", "likely_wrong_highlight"): "yellow",
-                     ("review marks", "likely_wrong_color"): "C00000", ("review marks", "cell_fill"): "FFF2CC"}
+                     ("review marks", "likely_wrong_color"): "C00000", ("review marks", "cell_fill"): "FFF2CC",
+                     ("review marks", "corrected_highlight"): "bright green",
+                     ("doors", "make_doors_document"): True, ("doors", "heading_numbers"): "keep"}
 BUILT_IN_HEADER_FILL = "D9E2F3"     # without a template; with one, the template's table style decides
 
 PAPER_SIZES = {"letter": (7772400, 10058400, 1), "legal": (7772400, 12801600, 5), "tabloid": (10058400, 15544800, 3),
@@ -6025,7 +8589,7 @@ def _style_value(section: str, key: str, raw: str):
         if not 0 <= n <= 200:
             return None, f"'{raw}' is outside the spacings this tool accepts: 0 to 200 points"
         return n, ""
-    if key in ("bold", "italic", "mark_keywords", "repeat_on_each_page"):
+    if key in ("bold", "italic", "mark_keywords", "repeat_on_each_page", "make_doors_document"):
         if v in _YES or v in _NO:
             return v in _YES, ""
         return None, f"'{raw}' should be yes or no, for example:  {key} = yes"
@@ -6048,7 +8612,11 @@ def _style_value(section: str, key: str, raw: str):
         what = ("a 6-character colour code such as D9E2F3, or none" if key == "fill"
                 else "a 6-character colour code such as FFF2CC (this mark cannot be switched off)")
         return None, f"'{raw}' is not a cell shading. Write {what}"
-    if key in ("check_highlight", "likely_wrong_highlight"):
+    if key == "heading_numbers":
+        if v in ("keep", "remove"):
+            return v, ""
+        return None, f"'{raw}' should be keep or remove, for example:  heading_numbers = keep"
+    if key in ("check_highlight", "likely_wrong_highlight", "corrected_highlight"):
         v2 = " ".join(v.replace("grey", "gray").replace("-", " ").replace("%", " ").split())
         if v2 in HIGHLIGHT_NAMES:
             return v2, ""
@@ -7295,6 +9863,7 @@ def _install_template(d, t: WordTemplate) -> None:
             sect.remove(child)
         for child in list(new):
             sect.append(child)
+    d._template_pictures, d._drawing_ids = pictures, [drawing_ids]   # (shared with the page headers, _page_header)
     for kind, hf_type, xml, story_pictures in t.stories:
         hf = {("header", "default"): section.header, ("header", "first"): section.first_page_header,
               ("header", "even"): section.even_page_header, ("footer", "default"): section.footer,
@@ -7303,12 +9872,7 @@ def _install_template(d, t: WordTemplate) -> None:
         if hf is None:
             continue
         hf.is_linked_to_previous = False
-        part = hf.part
-        story = _safe_xml(_attach_pictures(part, xml, story_pictures, pictures), "a header of the template")
-        for drawing in story.iter("{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}docPr"):
-            drawing_ids += 1                         # (picture ids must not repeat those of the report's own
-            drawing.set("id", str(drawing_ids))      # pictures, which python-docx numbers from 1)
-        part._element = parse_xml(_xml_bytes(story))
+        _fill_story(d, hf.part, xml, story_pictures)
 
 
 def _setup_page(d, look: ReportLook) -> None:
@@ -7391,6 +9955,12 @@ def _report_document(look: ReportLook) -> tuple:
         if part.kind == "paragraph":
             _without_numbering(styles[part.section], d.styles.element)
     _setup_page(d, look)
+    # a document list: the title on the hanging indent (Word's first tab stop), the paragraphs that call the document
+    # up on a right-aligned tab stop at the right margin
+    from docx.enum.text import WD_TAB_ALIGNMENT
+    stops = styles["document list"].paragraph_format.tab_stops
+    if not any(stop.alignment == WD_TAB_ALIGNMENT.RIGHT for stop in stops):
+        stops.add_tab_stop(Emu(int(_usable_page(d)[0] * 914400)), WD_TAB_ALIGNMENT.RIGHT)
     zoom = d.settings.element.find(_q(_W, "zoom"))
     if zoom is not None and zoom.get(_q(_W, "percent")) is None:    # (python-docx's own settings leave out this
         zoom.set(_q(_W, "percent"), "100")                          # required value)
@@ -7532,16 +10102,24 @@ def _add_confidence_runs(paragraph, tokens: list, settings: Settings, look: Repo
                          keyword_re=None, keyword_style=None):
     """Write words, highlighting the ones the OCR was not sure about (and, if asked, the requirement keywords)."""
     keywords = _keyword_tokens(tokens, keyword_re)
-    group, group_key = [], None
+    group, group_key, done = [], None, [0]
 
     def emit():
         if group:
-            text = _docx_text(" ".join(group)) + " "
+            done[0] += len(group)
+            text = _docx_text(" ".join(group)) + (" " if done[0] < len(tokens) else "")
             run = _styled_run(paragraph, text, keyword_style) if group_key[1] else paragraph.add_run(text)
+            if group_key[3]:
+                run.underline = True                    # (underlined in the scan)
+            if group_key[2] and not group_key[0]:       # a word the tool corrected
+                run.font.highlight_color = _highlight(look.get("review marks", "corrected_highlight"))
             _mark_review(run, group_key[0], look)
 
     for i, token in enumerate(tokens):
-        key = (token_attention(token, settings), i in keywords)
+        attention = token_attention(token, settings)
+        if attention == "check" and token_original(token):
+            attention = ""          # a corrected word shows the correction mark; its Excel row says what to check
+        key = (attention, i in keywords, bool(token_original(token)), bool(len(token) > 5 and token[5]))
         if key != group_key:
             emit()
             group, group_key = [], key
@@ -7610,91 +10188,534 @@ def _on(el) -> bool:
     return el is not None and (el.get(_q(_W, "val")) or "true").lower() in ("1", "true", "on")
 
 
-def _usable_page(d) -> tuple:
+def _usable_page(d, section=None, sections=None) -> tuple:
     """Width and height (inches) of the text area on a page of the report: the page less its margins and gutter,
-    and less any part of a header or footer that reaches into the text area (a tall logo pushes the text down)."""
-    section = d.sections[0]
+    and less any part of a header or footer that reaches into the text area (a tall logo pushes the text down).
+    `section`: the Word section to measure (default: the first). `sections`: the sections up to and including it, to
+    look back through for a header or footer it shows from a section before it (default: all the document's - a
+    caller that measures every page passes the few that matter, which is faster on a long report)."""
+    section = section if section is not None else d.sections[0]
     settings = d.settings.element
     gutter_at_top = _on(settings.find(_q(_W, "gutterAtTop")))
     gutter = section.gutter or 0
     width = section.page_width - section.left_margin - section.right_margin - (0 if gutter_at_top else gutter)
     height = section.page_height - abs(section.top_margin) - abs(section.bottom_margin) - (gutter if gutter_at_top else 0)
     even = _on(settings.find(_q(_W, "evenAndOddHeaders")))
-    for stories, distance, margin in (((section.header, section.even_page_header), section.header_distance,
-                                       section.top_margin),
-                                      ((section.footer, section.even_page_footer), section.footer_distance,
-                                       section.bottom_margin)):
+    sections = list(sections if sections is not None else d.sections)
+    index = next((k for k, sec in enumerate(sections) if sec._sectPr is section._sectPr), len(sections) - 1)
+
+    def shown(get):
+        """The header or footer the section shows: its own, or - when it is linked to the one before - the one of
+        the nearest section before it that has its own (the report's page sections keep the template's footer)."""
+        for sec in reversed(sections[:index + 1]):
+            hf = get(sec)
+            if not hf.is_linked_to_previous:
+                return hf
+        return None
+
+    for stories, distance, margin in (((lambda sec: sec.header, lambda sec: sec.even_page_header),
+                                       section.header_distance, section.top_margin),
+                                      ((lambda sec: sec.footer, lambda sec: sec.even_page_footer),
+                                       section.footer_distance, section.bottom_margin)):
         reach = 0
-        for k, hf in enumerate(stories):
-            if (k == 1 and not even) or hf.is_linked_to_previous:
-                continue
-            reach = max(reach, (distance or 0) + _story_height(hf._element) - abs(margin or 0))
+        for k, get in enumerate(stories):
+            hf = shown(get) if k == 0 or even else None
+            if hf is not None:
+                reach = max(reach, (distance or 0) + _story_height(hf._element) - abs(margin or 0))
         height -= max(0, reach)
     return width / 914400, height / 914400
 
 
-def write_word_report(path: Path, doc: DocResult, items: list, settings: Settings) -> Path:
-    look = report_look(settings)
-    d, styles = _report_document(look)
-    usable_w, usable_h = _usable_page(d)
-    table_alignment = look.values.get(("tables", "alignment"))     # (else the table style decides)
-    tag_start = look.get("requirements", "tag_position") == "start"
-    keyword_re = None
-    if look.get("requirements", "mark_keywords"):
-        words = sorted(settings.keywords, key=len, reverse=True)
-        keyword_re = re.compile(r"(?<![A-Za-z])(?:" + "|".join(r"\s+".join(map(re.escape, w.split())) for w in words)
-                                + r")(?![A-Za-z])", re.I)
-    header_fill = look.values.get(("table header row", "fill")) or (BUILT_IN_HEADER_FILL if look.template is None
-                                                                     else "none")
-    style_ids = {section: style.style_id for section, style in styles.items()}
+def _end_section(d) -> None:
+    """End the report's current Word section at its last paragraph and start a new one on a new page, with the same
+    page settings and - until it is given its own (_page_header) - the same headers and footers. (python-docx's
+    add_section puts the break in an extra, empty paragraph; a break belongs on the last paragraph itself.)"""
+    body = d.element.body
+    sentinel = body.get_or_add_sectPr()
+    last = sentinel.getprevious()
+    if last is None or last.tag != _q(_W, "p"):
+        last = d.add_paragraph()._p                     # (after a table: a section break must sit in a paragraph)
+        last.get_or_add_pPr().get_or_add_spacing().set(_q(_W, "after"), "0")
+    last.set_sectPr(copy.deepcopy(sentinel))
+    for ref in sentinel.xpath("w:headerReference|w:footerReference"):
+        sentinel.remove(ref)                            # the new section follows the one before ...
+    for numbering in sentinel.xpath("w:pgNumType"):
+        numbering.attrib.pop(_q(_W, "start"), None)     # ... and goes on counting its pages (a template's 'Start at 1'
+                                                        # stays on the first section only)
+    d.sections[-1].start_type = WD_SECTION.NEW_PAGE     # ... from a new page
 
-    tags = defaultdict(list)
-    requirement_blocks = set()
-    for it in items:
-        for uid in it.block_uids:
-            tags[uid].append(it.item_id)
-            if it.item_type == "Requirement":
-                requirement_blocks.add(uid)
-    vocab = document_text_context(doc, settings)
 
-    def paragraph(section: str, text: str = "", page_break: bool = False):
-        p = d.add_paragraph()
-        p._p.style = style_ids[section]                     # (faster than by style object, for long reports)
+def _fill_story(d, part, xml: bytes, pictures: list) -> None:
+    """Put a checked header or footer of the template (see _clean_story) into a part of the report, with its
+    pictures. The pictures are shared by every part that shows them, and drawing ids never repeat."""
+    from docx.oxml import parse_xml
+    store = getattr(d, "_template_pictures", None)
+    if store is None:
+        store = d._template_pictures = {}
+    counter = getattr(d, "_drawing_ids", None)
+    if counter is None:
+        counter = d._drawing_ids = [100000]          # (python-docx numbers the report's own pictures from 1)
+    story = _safe_xml(_attach_pictures(part, xml, pictures, store), "a header of the template")
+    for drawing in story.iter(f"{{{_WP}}}docPr"):
+        counter[0] += 1
+        drawing.set("id", str(counter[0]))
+    part._element = parse_xml(_xml_bytes(story))
+
+
+def _page_header(d, look: ReportLook, styles: dict, labels: list) -> None:
+    """Give the report's last section a page header of its own: the template's header (logo, marking), if any,
+    with the tool's label for the scanned page under it ("Page 12 - text read by the tool"). The tool's words about a
+    page go here, so the body of the page holds only what was read from it (and, for DOORS, nothing but that)."""
+    section = d.sections[-1]
+    section.different_first_page_header_footer = False     # (a template's first-page header is for the cover only)
+    even = _on(d.settings.element.find(_q(_W, "evenAndOddHeaders")))
+    stories = {hf_type: (xml, pictures) for kind, hf_type, xml, pictures in
+               (look.template.stories if look.template is not None else []) if kind == "header"}
+    for hf_type, header in (("default", section.header), ("even", section.even_page_header)):
+        if hf_type == "even" and not even:
+            continue
+        header.is_linked_to_previous = False
+        story = stories.get(hf_type) or stories.get("default")
+        if story is not None:
+            _fill_story(d, header.part, *story)
+        else:
+            for p in list(header._element):
+                if _local(p) == "p" and not "".join(p.itertext()).strip():
+                    header._element.remove(p)            # (python-docx's own empty header paragraph)
+        for k, text in enumerate(labels):
+            p = header.add_paragraph()
+            p._p.style = styles["page label"].style_id
+            run = p.add_run(_docx_text(text))
+            if k == 0:
+                run.bold = True
+
+
+def _cell_borders(cell) -> None:
+    """Plain single borders on every side of a cell, written on the cell itself: DOORS Next does not use table
+    styles, and DOORS draws a cell with any border with all four."""
+    from docx.oxml import OxmlElement
+    tc_pr = cell._tc.get_or_add_tcPr()
+    for old in tc_pr.findall(_q(_W, "tcBorders")):
+        tc_pr.remove(old)
+    borders = OxmlElement("w:tcBorders")
+    for side in ("top", "left", "bottom", "right"):
+        el = OxmlElement(f"w:{side}")
+        for attr, value in (("val", "single"), ("sz", "4"), ("space", "0"), ("color", "000000")):
+            el.set(_q(_W, attr), value)
+        borders.append(el)
+    width = tc_pr.find(_q(_W, "tcW"))
+    if width is not None:
+        width.addnext(borders)
+    else:
+        tc_pr.insert(0, borders)
+
+
+def _style_colour(style) -> Optional[str]:
+    """The text colour a paragraph style gives (its own, or the style it is based on), as RRGGBB; None for automatic
+    or a theme colour."""
+    while style is not None:
+        colour = style.font.color
+        if colour is not None and colour.type is not None and colour.rgb is not None:
+            return str(colour.rgb)
+        style = style.base_style
+    return None
+
+
+def _table_style_heading_look(table_style) -> tuple:
+    """(text colour as RRGGBB or None, fill as RRGGBB or "") that a Word table style gives a table's heading row: its
+    "header row" (firstRow) formatting, else the shading of the whole table. Followed through the styles it is
+    based on, as Word does."""
+    colour, fill, whole, chain = None, "", "", []
+    while table_style is not None:
+        chain.insert(0, table_style)
+        table_style = table_style.base_style
+    for style in chain:
+        shd = style.element.find(_q(_W, "tcPr") + "/" + _q(_W, "shd"))
+        if shd is not None and (shd.get(_q(_W, "fill")) or "auto").lower() != "auto":
+            whole = shd.get(_q(_W, "fill")).upper()
+        for part in style.element.findall(_q(_W, "tblStylePr")):
+            if part.get(_q(_W, "type")) != "firstRow":
+                continue
+            c = part.find(_q(_W, "rPr") + "/" + _q(_W, "color"))
+            if c is not None and c.get(_q(_W, "val")):
+                colour = None if c.get(_q(_W, "val")).lower() == "auto" else c.get(_q(_W, "val")).upper()
+            shd = part.find(_q(_W, "tcPr") + "/" + _q(_W, "shd"))
+            if shd is not None and (shd.get(_q(_W, "fill")) or "auto").lower() != "auto":
+                fill = shd.get(_q(_W, "fill")).upper()
+    return colour, fill or whole
+
+
+def _automatic_colour(run) -> None:
+    """Word's automatic text colour on a run: black on a light background, white on a dark one."""
+    run._r.get_or_add_rPr().get_or_add_color().set(_q(_W, "val"), "auto")
+
+
+_HEADING_COLOUR_TOLD = []          # (the notice below is given once per run, not for every document)
+
+
+class _ReportWriter:
+    """Writes the text of a scanned document into a Word document, in one of two forms:
+      verification  the report for checking the tool's work (write_word_report): words to check marked, the [R-0001]
+                    tags of the Excel rows, scanned running headers and footers, the tool's notes
+      doors         only the document's own content, in the form DOORS imports cleanly (write_doors_document):
+                    Heading 1-9 from the outline, one paragraph per paragraph of the document, plain tables with
+                    their own borders and no merged cells, pictures inline, nothing the tool added
+    Headings come from the outline (build_outline): a numbered paragraph is a heading at the level its number says,
+    and a run-in title is split off its text ("3.2.1 Power input" / "The equipment shall ...")."""
+
+    def __init__(self, d, styles: dict, look: ReportLook, doc: DocResult, items: list, settings: Settings, mode: str):
+        self.d, self.styles, self.look, self.doc, self.settings, self.mode = d, styles, look, doc, settings, mode
+        self.verify = mode == "verification"
+        self.style_ids = {section: style.style_id for section, style in styles.items()}
+        self.ctx = document_text_context(doc, settings)
+        document_outline(doc, settings)
+        self.tag_start = look.get("requirements", "tag_position") == "start"
+        self.keyword_re = None
+        if self.verify and look.get("requirements", "mark_keywords"):
+            words = sorted(settings.keywords, key=len, reverse=True)
+            self.keyword_re = re.compile(r"(?<![A-Za-z])(?:" + "|".join(r"\s+".join(map(re.escape, w.split()))
+                                                                          for w in words) + r")(?![A-Za-z])", re.I)
+        self.numbers_kept = not (mode == "doors" and look.get("doors", "heading_numbers") == "remove")
+        self.items_of = defaultdict(list)
+        for it in items:
+            for uid in it.block_uids:
+                self.items_of[uid].append(it)
+        self.table_alignment = look.values.get(("tables", "alignment"))
+        self.header_fill = look.values.get(("table header row", "fill")) or (
+            BUILT_IN_HEADER_FILL if look.template is None else "none")
+        # The heading rows must be readable whatever the template does. Their text colour comes from the Table
+        # Heading style or the table style's heading-row formatting, their shading from the style file or the table
+        # style - which shades only the FIRST row, so a second heading row is shaded here like the first. Light text
+        # (a template's Table Heading meant for a dark table style) on a light or no shading would be invisible -
+        # "the first row or two are blank" - so such text gets Word's automatic colour (black on light, white on
+        # dark) instead. Rows: [0] the first heading row, [1] the ones under it.
+        style_colour, style_fill = _table_style_heading_look(styles["tables"])
+        colour = _style_colour(styles["table header row"]) or style_colour
+        self.later_header_fill = self.header_fill if self.header_fill != "none" else (style_fill or "none")
+        first_fill = self.header_fill if self.header_fill != "none" else style_fill
+
+        def unreadable(fill: str) -> bool:
+            return bool(colour) and _contrast(colour, fill if fill not in ("", "none") else "FFFFFF") < 3.0
+        self.header_auto_colour = (unreadable(first_fill), unreadable(self.later_header_fill))
+        if any(self.header_auto_colour) and not _HEADING_COLOUR_TOLD:
+            _HEADING_COLOUR_TOLD.append(True)
+            LOG.info("The table heading text would be the colour of its shading (the template's Table Heading style "
+                     "or table style, or [table header row] in the style file): it is written in Word's automatic "
+                     "colour instead, so it can be read.")
+        self.width = _usable_page(d)[0]
+        self.level = 0                                   # the level of the last heading written (DOORS: no gaps)
+        self.written_numbers = set()
+
+    # ---- small pieces --------------------------------------------------------------------------------------------
+    def paragraph(self, section: str, text: str = "", page_break: bool = False):
+        p = self.d.add_paragraph()
+        p._p.style = self.style_ids[section]            # (faster than by style object, for long reports)
         if text:
             p.add_run(_docx_text(text))
         if page_break:
-            p.paragraph_format.page_break_before = True     # (never an extra empty paragraph: no blank pages)
+            p.paragraph_format.page_break_before = True
         return p
 
-    def tag(p, ids: list, where: str, alone: bool = False):
-        if ids and (where == "start") == tag_start:
+    def tag(self, p, ids: list, where: str, alone: bool = False):
+        if self.verify and ids and (where == "start") == self.tag_start:
             text = "[" + ", ".join(ids) + "]"
-            if not alone:                                   # (a tag on a line of its own has no spaces around it)
-                text = text + "  " if tag_start else "  " + text
-            _styled_run(p, text, styles["requirement tag"])
+            if not alone:
+                text = text + "  " if self.tag_start else "  " + text
+            _styled_run(p, text, self.styles["requirement tag"])
 
-    def picture(image: Path, width: float):
-        p = d.add_paragraph()                               # a picture: centred, no indent, single spacing (a
-        pf = p.paragraph_format                             # template's fixed line height would cut it off)
+    def picture(self, image: Path, width: float):
+        p = self.d.add_paragraph()                      # a picture: centred, no indent, single spacing (a
+        pf = p.paragraph_format                         # template's fixed line height would cut it off)
         pf.alignment = WD_ALIGN_PARAGRAPH.CENTER
         pf.left_indent = pf.right_indent = pf.first_line_indent = Emu(0)
         pf.line_spacing = 1.0
         p.add_run().add_picture(str(image), width=Inches(width))
 
+    def runs(self, p, tokens: list, keyword_re=None):
+        """The words of a paragraph: in the verification report with the review marks and the corrected words
+        marked; in the DOORS document as plain text (marks would become part of the requirement text in DOORS)."""
+        if not tokens:
+            return
+        if self.verify:
+            _add_confidence_runs(p, tokens, self.settings, self.look, keyword_re, self.styles["requirement keywords"])
+            return
+        groups, current, under = [], [], None
+        for t in tokens:                                # (the document's own underlining is kept)
+            u = bool(len(t) > 5 and t[5])
+            if u != under and current:
+                groups.append((current, under))
+                current = []
+            under = u
+            current.append(t[0])
+        groups.append((current, under))
+        for k, (words, u) in enumerate(groups):
+            run = p.add_run(_docx_text(" ".join(words)) + (" " if k + 1 < len(groups) else ""))
+            if u:
+                run.underline = True
+
+    # ---- headings ------------------------------------------------------------------------------------------------
+    def lost_heading(self, level: int, number: str):
+        """DOORS document: a parent heading the scan did not show, as a heading of its own that says so
+        ("3.2 [heading not found in the scan]"). The outline adds these (build_outline, parts with "missing")."""
+        level = max(1, min(9, level))
+        self.paragraph(f"heading {level}", (number + " " if number and self.numbers_kept else "")
+                       + "[heading not found in the scan]")
+        if number:
+            self.written_numbers.add(number)
+        self.level = level
+
+    def heading(self, level: int, number: str, tokens: list):
+        """A heading paragraph. In the DOORS document a heading never skips a level - DOORS cannot place 3.2.1.1
+        straight under 3.2. A parent the scan did not show comes from the outline (lost_heading, written before
+        this one); a level that is still skipped gets a heading of its own here, saying so."""
+        level = max(1, min(9, level))
+        if not self.verify:
+            parts = _outline_number(number).split(".") if number else []
+            for k in range(self.level + 1, level):
+                self.lost_heading(k, ".".join(parts[:k]) if len(parts) > k else "")
+        if number:
+            self.written_numbers.add(_outline_number(number))
+        else:
+            appendix = _APPENDIX_TITLE.search(" ".join(t[0] for t in tokens))
+            if appendix:
+                self.written_numbers.add(appendix.group(1))        # ("APPENDIX A" is the parent of A.1)
+        self.level = level
+        if tokens and tokens[-1][0].endswith(".") and len(tokens[-1][0]) > 1 and not RE_PARA_NUM.match(tokens[-1][0]):
+            tokens = tokens[:-1] + [tokens[-1]._replace(text=tokens[-1][0][:-1]) if isinstance(tokens[-1], Token)
+                                    else (tokens[-1][0][:-1],) + tuple(tokens[-1][1:])]   # "Power input." -> "Power input"
+        if (number and not self.numbers_kept and len(tokens) > 1
+                and clean_para_number(tokens[0][0].rstrip(".")) == clean_para_number(number)):
+            tokens = tokens[1:]           # heading_numbers = remove: DOORS numbers the headings itself. (A heading that
+            # is only a number - "3.2.1.1" above its requirement - keeps it: an empty heading would be dropped, and its
+            # text would land under the heading before it.)
+        p = self.paragraph(f"heading {level}")
+        self.runs(p, tokens)
+        return p
+
+    # ---- blocks --------------------------------------------------------------------------------------------------
+    def block(self, b: Block, page_dpi: float):
+        ids = [it.item_id for it in self.items_of.get(b.uid, [])]
+        if b.kind in ("page_header", "page_footer"):
+            if self.verify:
+                para = self.paragraph("scanned header footer")
+                self.tag(para, ids, "start")
+                para.add_run(("[header] " if b.kind == "page_header" else "[footer] ") + _docx_text(b.text))
+                self.tag(para, ids, "end")
+            return
+        if b.kind == "table" and b.table is not None:
+            self.table(b, ids)
+            return
+        if b.kind == "figure":
+            self.figure(b, page_dpi)
+            return
+        if b.kind == "caption":
+            if b.meta.get("duplicate_of_table"):
+                return                                   # a "(continued)" title of a table already written whole
+            p = self.paragraph("captions")
+            self.tag(p, ids, "start")
+            self.runs(p, block_tokens(b, self.ctx) if b.lines or b.meta.get("from_table") else [Token(w, 1.0) for w in b.text.split()])
+            self.tag(p, ids, "end")
+            return
+        tokens = block_tokens(b, self.ctx) if b.lines or b.meta.get("from_table") else [Token(w, 1.0) for w in (b.text or "").split()]
+        text, spans = tokens_text(tokens)
+        parts = b.meta.get("outline") or [{"kind": "body", "level": 0, "number": "", "title": "", "start": 0,
+                                           "end": len(text)}]
+        reqs = [it for it in self.items_of.get(b.uid, []) if it.item_type == "Requirement"]
+        body_parts = [pt for pt in parts if pt["kind"] == "body"]
+        placed = set()
+        for k, part in enumerate(parts):
+            if part.get("missing"):
+                if not self.verify:
+                    self.lost_heading(part["level"], part.get("number", ""))     # (DOORS only: see build_outline)
+                continue
+            toks = _part_tokens(tokens, spans, part["start"], part["end"])
+            if part["kind"] == "heading":
+                if (not self.verify and not part.get("number") and not part.get("implied") and not self.written_numbers
+                        and part.get("type") != "appendix"):
+                    # (DOORS: a heading before section 1 - a document number, "FOREWORD" - would take heading number
+                    # 1 and put every DOORS number after it out by one; it is written as text instead)
+                    self.runs(self.paragraph("body"), toks)
+                    continue
+                if part.get("implied"):
+                    self.written_numbers.add(part["implied"])     # ("REQUIREMENTS", its "3." lost: section 3)
+                self.heading(part["level"], part.get("number", ""), toks)
+                continue
+            if part["kind"] == "subheading":
+                sub = "subheadings 2" if b.meta.get("document_group") == "subgroup" else "subheadings"
+                self.runs(self.paragraph(sub), toks)
+                continue
+            # the requirement rows of this part of the block: those numbered as its section (several numbered
+            # paragraphs may share a block), the rest with the block's last part
+            number = next((q.get("number", "") for q in reversed(parts[:k]) if q["kind"] == "heading"), "")
+            mine = [it for it in reqs if it.item_id not in placed and (len(body_parts) == 1 or part is body_parts[-1]
+                                                                      or (it.doc_ref.split() or [""])[0] == number)]
+            placed.update(it.item_id for it in mine)
+            part_ids = [it.item_id for it in mine]
+            if part is body_parts[-1]:
+                part_ids += [i for i in ids if i not in placed and not i.startswith("R-")]
+            self.body(b, toks, part_ids, bool(mine))
+
+    def body(self, b: Block, tokens: list, ids: list, requirement: bool):
+        entry = b.meta.get("document_entry")
+        if entry:
+            p = self.paragraph("document list")
+            self.tag(p, ids, "start")
+            gap = "\t" if self.verify else " "            # (DOORS: no tab characters in the text)
+            p.add_run(_docx_text(entry["id"]))
+            if entry["title"]:
+                p.add_run(gap + _docx_text(entry["title"]))
+            if entry["paragraphs"]:
+                p.add_run(gap + _docx_text(entry["paragraphs"]))
+            self.tag(p, ids, "end")
+            return
+        section = ("list items" if b.kind == "list_item" else "requirements" if requirement else "body")   # (a list
+        # entry keeps the list look, also when it is a requirement)
+        p = self.paragraph(section)
+        self.tag(p, ids, "start")
+        cells = b.meta.get("cells")
+        if cells and b.meta.get("from_table"):
+            # a table without a heading row or a title, shown as a list: its columns on tab stops (DOORS: one space)
+            stops = [x for x in (b.meta.get("cell_x") or []) if x] if self.verify else []
+            for x in stops:
+                if 0.2 < x < self.width - 0.2:
+                    p.paragraph_format.tab_stops.add_tab_stop(Inches(x))
+            words = b.meta.get("cell_words") or []
+            first = True
+            for c, cell in enumerate(cells):
+                if not (cell or "").strip():
+                    continue
+                if not first:
+                    p.add_run("\t" if self.verify else " ")
+                first = False
+                cell_tokens = (word_tokens((Word(w, cf, (0, 0, 0, 0)) for w, cf in words[c]), self.ctx)
+                               if c < len(words) and words[c] else [Token(w, 1.0) for w in cell.split()])
+                self.runs(p, cell_tokens)
+        else:
+            self.runs(p, tokens, self.keyword_re if requirement else None)
+        if self.verify and b.meta.get("continued_across_pages"):
+            label = p.add_run(" [continues across pages]")
+            label.italic = True
+            label.font.size = self.styles["notes"].font.size or Pt(8)
+        self.tag(p, ids, "end")
+
+    def figure(self, b: Block, page_dpi: float):
+        cache_dir = Path(self.doc.cache_dir) if self.doc.cache_dir else None
+        img_file = b.meta.get("image_file")
+        if img_file and cache_dir and (cache_dir / img_file).exists():
+            fw = max(1, b.box[2] - b.box[0]) / max(page_dpi, 1)
+            self.picture(cache_dir / img_file, max(0.5, min(self.width, max(1.5, fw))))
+        elif self.verify:
+            self.paragraph("notes", "[figure]")
+        if self.verify and b.lines:
+            fp = self.paragraph("table text")
+            fp.add_run("Text inside figure: ").italic = True
+            _add_confidence_runs(fp, word_tokens((w for ln in b.lines for w in ln.words), self.ctx), self.settings,
+                                 self.look)
+
+    def table(self, b: Block, ids: list):
+        t = b.table
+        if b.meta.get("caption") and not any(x.kind == "caption" and x.meta.get("caption_of") == b.uid
+                                             for x in self.doc.blocks):
+            self.paragraph("captions", b.meta["caption"])
+        if ids and self.tag_start:
+            self.tag(self.paragraph("body"), ids, "start", alone=True)
+        d = self.d
+        tbl = d._body.add_table(t.n_rows, t.n_cols, Emu(int(self.width * 914400)))     # (the text width, less any gutter)
+        tbl.style = self.styles["tables"]
+        if self.table_alignment:
+            tbl.alignment = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
+                             "right": WD_TABLE_ALIGNMENT.RIGHT}[self.table_alignment]
+        shown = shown_header_rows(t)
+        table_look = tbl._tbl.tblPr.find(_q(_W, "tblLook"))
+        if table_look is not None:                       # a heading row (if shown); no first-column or banded look
+            table_look.attrib.pop(_q(_W, "val"), None)   # from a template's table style
+            for attr, value in (("firstRow", "1" if shown else "0"), ("lastRow", "0"), ("firstColumn", "0"),
+                                ("lastColumn", "0"), ("noHBand", "1"), ("noVBand", "1")):
+                table_look.set(_q(_W, attr), value)
+        table_rows = list(tbl.rows)       # (Table.cell() re-reads the whole table on every call: slow)
+        covered = set()                   # grid positions inside a merged cell, other than its top-left one
+        merges = _table_merges(t)                        # (the same merged cells as the Excel sheet)
+        for r0, c0, r1, c1 in merges:
+            if self.verify:
+                saved = copy.deepcopy(tbl._tbl)
+                try:
+                    table_rows[r0].cells[c0].merge(table_rows[r1].cells[c1])
+                except Exception:         # never keep a merge python-docx left half made: the table as it was
+                    tbl._tbl.getparent().replace(tbl._tbl, saved)
+                    tbl._tbl = tbl._element = saved
+                    table_rows = list(tbl.rows)
+                    continue
+            covered |= {(rr, cc) for rr in range(r0, r1 + 1) for cc in range(c0, c1 + 1)} - {(r0, c0)}
+            # (DOORS: no merged cells - the text once, in the top-left cell)
+        if shown and self.look.get("table header row", "repeat_on_each_page"):
+            from docx.oxml import OxmlElement
+            for r_i in range(shown):      # Word's "Repeat as header row"
+                tr_pr = table_rows[r_i]._tr.get_or_add_trPr()
+                if tr_pr.find(_q(_W, "tblHeader")) is None:
+                    tr_pr.append(OxmlElement("w:tblHeader"))
+        fixes = b.meta.get("cell_corrections", {})
+        grid_cells = tbl._cells           # one cell object per grid position, read once
+        written = set()
+        for r_i, row in enumerate(t.grid):
+            heading_row = r_i < shown
+            for c_i in range(t.n_cols):
+                cell = grid_cells[r_i * t.n_cols + c_i]
+                if not self.verify:
+                    _cell_borders(cell)
+                # Each Word cell is written ONCE: after merging, several grid positions are the same cell, and
+                # writing it again from another position would wipe the text already in it.
+                if id(cell._tc) in written or (r_i, c_i) in covered:
+                    continue
+                written.add(id(cell._tc))
+                cell.text = ""
+                cell_p = cell.paragraphs[0]
+                cell_p._p.style = self.style_ids["table header row" if heading_row else "table text"]
+                text = _cell_text(t, r_i, c_i, merges)
+                corrected = {fix[1] for fix in fixes.get(f"{r_i},{c_i}", [])}
+                for k, word in enumerate((text or "").split(" ")):
+                    run = cell_p.add_run(_docx_text(word) + (" " if k < len(text.split(" ")) - 1 else ""))
+                    if self.verify and word in corrected:
+                        run.font.highlight_color = _highlight(self.look.get("review marks", "corrected_highlight"))
+                    if heading_row and self.header_auto_colour[r_i > 0]:
+                        _automatic_colour(run)    # (light text on a light shading: see __init__)
+                    if heading_row and not self.verify:
+                        run.bold = True           # (DOORS may drop the heading-row setting: bold still shows it)
+                fill = self.header_fill if r_i == 0 else self.later_header_fill
+                if heading_row and fill != "none":
+                    _shade_cell(cell, fill)
+                elif not heading_row and self.verify and _cell_attention(t, r_i, c_i, self.ctx, self.settings):
+                    _shade_cell(cell, self.look.get("review marks", "cell_fill"))
+        if ids and not self.tag_start:
+            self.tag(self.paragraph("body"), ids, "end", alone=True)
+
+
+def write_word_report(path: Path, doc: DocResult, items: list, settings: Settings) -> Path:
+    """The verification report: a cover page with a summary and how to read the report, then, for every scanned
+    page, the page image and the text the tool read from it - each on pages of their own, labelled in the page
+    header ("Page 12 - scanned page" / "Page 12 - text read by the tool"), so the pages themselves hold only the
+    scan and what was read from it, with the document's own headings at their levels (Heading 1-9)."""
+    look = report_look(settings)
+    d, styles = _report_document(look)
+    w = _ReportWriter(d, styles, look, doc, items, settings, "verification")
+    paragraph = w.paragraph
+
     paragraph("title", "Extraction Verification Report")
     p = paragraph("body")
     p.add_run("Source: ").bold = True
     p.add_run(_docx_text(Path(doc.source).name))
-    p.add_run(f"\nPages: {len(doc.pages)}    Engine: {doc.engine}    Created: {_dt.datetime.now():%Y-%m-%d %H:%M}")
+    read = (f"{len(doc.pages)} of the file's {doc.page_count} (chosen with --pages)" if doc.page_count > len(doc.pages)
+            else str(len(doc.pages)))                   # (a page that could not be read is still in doc.pages)
+    p.add_run(f"\nPages: {read}    Engine: {doc.engine}    Created: {_dt.datetime.now():%Y-%m-%d %H:%M}")
     _software, differences = configuration_status(docling_used=doc.engine == "docling")
     p.add_run(f"\nTool: spec_extractor.py {__version__} (build {build_id()})    Tested configuration: "
               + ("yes" if not differences else "NO - see 'Run Info' in the Excel file or spec_extractor_log.txt"))
     n_req = sum(1 for it in items if it.item_type == "Requirement")
     p.add_run(f"\nRequirements: {n_req}    Tables: {sum(1 for it in items if it.item_type == 'Table')}    "
               f"Captions: {sum(1 for it in items if 'Caption' in it.item_type)}    "
-              f"Items needing review: {sum(1 for it in items if it.needs_review)}")
+              f"Items needing review: {sum(1 for it in items if it.needs_review)}    "
+              f"Words corrected by the tool: {sum(len(it.corrections) for it in items)}")
     p.add_run(f"\nReport look: {_docx_text(look.summary)}")
-    paragraph("heading 2", "How to read this report")
+    paragraph("subheadings", "How to read this report")
     legend = paragraph("body")
     _mark_review(legend.add_run("words marked like this"), "check", look)
     legend.add_run(" = check against the scan: the word failed a check (not in the dictionary, accent marks, "
@@ -7702,14 +10723,27 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
                    f"{settings.review_confidence:.2f};  ")
     _mark_review(legend.add_run("words marked like this"), "likely_wrong", look)
     legend.add_run(" = very low OCR confidence (likely misread);  ")
+    corrected = legend.add_run("words marked like this")
+    corrected.font.highlight_color = _highlight(look.get("review marks", "corrected_highlight"))
+    legend.add_run(" = corrected by the tool (a look-alike letter or digit the scan misread, or one letter that "
+                   "differs from a word this document writes elsewhere; the Excel column 'OCR Corrections' lists "
+                   "what was read, and a corrected number, requirement keyword or one-letter guess is also "
+                   "marked Needs Review there);  ")
     _styled_run(legend, "[R-0001]", styles["requirement tag"])
     legend.add_run(" = the row ID in the Excel workbook that this text became;  ")
-    if keyword_re is not None:
+    if w.keyword_re is not None:
         _styled_run(legend, "shall", styles["requirement keywords"])
         legend.add_run(" = a requirement keyword;  ")
     legend.add_run("[header] / [footer] = page header/footer text read from the scan.")
-    paragraph("body", "Suggested check: compare each page image with the text below it. Every sentence with a "
-                      "requirement keyword should carry an [R-...] tag; tables should match cell by cell.")
+    paragraph("body", "Each scanned page has a page of its own for the scan and one for the text read from it - the "
+                      "page header says which. Headings are at the level their paragraph number gives them (3, 3.1, "
+                      "3.1.1 ...), as in Word's Navigation Pane. Suggested check: compare each page image with the "
+                      "text after it. Every sentence with a requirement keyword should carry an [R-...] tag; tables "
+                      "should match cell by cell.")
+    if look.get("doors", "make_doors_document") and settings.make_doors_document:
+        paragraph("body", f"To import the document into DOORS, use {Path(path).stem.removesuffix('_verification')}"
+                          "_for_doors.docx: it holds only the document's own text and structure (README: "
+                          "\"Importing into DOORS\").")
 
     blocks_by_page = defaultdict(list)
     for b in doc.blocks:
@@ -7718,104 +10752,92 @@ def write_word_report(path: Path, doc: DocResult, items: list, settings: Setting
     for page_blocks in blocks_by_page.values():
         page_blocks.sort(key=lambda blk: furniture_rank.get(blk.kind, 1))     # (stable: reading order is kept)
     cache_dir = Path(doc.cache_dir) if doc.cache_dir else None
-
+    page_count = max([doc.page_count] + [p.number for p in doc.pages])   # (the file's pages, not just those read)
+    cover = None                                 # the first section (taken after the first break: see _end_section)
     for page in doc.pages:
-        paragraph("heading 1", f"Page {page.number}", page_break=True)
-        if page.notes:
-            paragraph("notes", "Notes: " + "; ".join(page.notes))
-        if page.notes and any(n.startswith("FAILED") for n in page.notes):
-            paragraph("notes").add_run("This page could not be read - check the scan manually.").bold = True
-        if settings.word_page_images and page.image_file and cache_dir and (cache_dir / page.image_file).exists():
+        failed = any(n.startswith("FAILED") for n in page.notes)
+        notes = ("Notes: " + "; ".join(page.notes)) if page.notes else ""
+        of = f"Page {page.number} of {page_count}"
+        image = (cache_dir / page.image_file) if settings.word_page_images and page.image_file and cache_dir else None
+        if image is not None and image.exists():
+            _end_section(d)
+            if cover is None:
+                cover = d.sections[0]
+            header = [f"{of}  -  scanned page"] + ([notes] if notes else [])
+            _page_header(d, look, styles, header)
+            # The room left for the scan, measured on each page: notes in the page header take some of it, and a
+            # long note wraps onto more lines than the one line per paragraph _usable_page counts.
+            section = d.sections[-1]
+            width, height = _usable_page(d, section, [cover, section])     # (its footer is the cover's: linked)
+            per_line = max(20, int(width * 12))              # characters on a line of the page header, roughly
+            height -= 0.2 * sum(max(0, math.ceil(len(t) / per_line) - 1) for t in header)
             aspect = page.height / max(page.width, 1)
-            # (room is kept for the "Page N" heading and a line of notes above the picture)
-            picture(cache_dir / page.image_file, max(1.0, min(usable_w, (usable_h - 1.2) / aspect)))
-            paragraph("heading 2", f"Page {page.number} - text read by the tool", page_break=True)
-        for b in blocks_by_page.get(page.number, []):
-            ids = tags.get(b.uid, [])
-            if b.kind == "heading":
-                level = min(4, 1 + int(b.meta.get("level", 1)))
-                paragraph(f"heading {level}", b.text)
-            elif b.kind in ("page_header", "page_footer"):
-                para = paragraph("scanned header footer")
-                tag(para, ids, "start")
-                para.add_run(("[header] " if b.kind == "page_header" else "[footer] ") + _docx_text(b.text))
-                tag(para, ids, "end")                       # (a repeated notice that was reported as a requirement)
-            elif b.kind == "table" and b.table is not None:
-                t = b.table
-                if b.meta.get("caption") and not any(x.kind == "caption" and x.meta.get("caption_of") == b.uid
-                                                     for x in blocks_by_page[page.number]):
-                    paragraph("captions", b.meta["caption"])
-                if ids and tag_start:
-                    tag(paragraph("body"), ids, "start", alone=True)
-                tbl = d._body.add_table(t.n_rows, t.n_cols, Emu(int(usable_w * 914400)))   # (the text width,
-                tbl.style = styles["tables"]                                                # less any gutter)
-                if table_alignment:
-                    tbl.alignment = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
-                                     "right": WD_TABLE_ALIGNMENT.RIGHT}[table_alignment]
-                table_look = tbl._tbl.tblPr.find(_q(_W, "tblLook"))
-                if table_look is not None:                  # a heading row; no first-column or banded-row look
-                    table_look.attrib.pop(_q(_W, "val"), None)   # from a template's table style
-                    for attr, value in (("firstRow", "1"), ("lastRow", "0"), ("firstColumn", "0"),
-                                        ("lastColumn", "0"), ("noHBand", "1"), ("noVBand", "1")):
-                        table_look.set(_q(_W, attr), value)
-                hidden = set()
-                table_rows = list(tbl.rows)       # (Table.cell() re-reads the whole table on every call: slow)
-                for r0, c0, r1, c1 in t.merges:
-                    if r1 < t.n_rows and c1 < t.n_cols and (r1 > r0 or c1 > c0):
-                        try:
-                            table_rows[r0].cells[c0].merge(table_rows[r1].cells[c1])
-                        except Exception:
-                            continue
-                        hidden |= {(rr, cc) for rr in range(r0, r1 + 1) for cc in range(c0, c1 + 1)} - {(r0, c0)}
-                if look.get("table header row", "repeat_on_each_page"):
-                    from docx.oxml import OxmlElement
-                    for r_i in range(min(t.header_rows, t.n_rows)):     # Word's "Repeat as header row"
-                        tr_pr = table_rows[r_i]._tr.get_or_add_trPr()
-                        if tr_pr.find(_q(_W, "tblHeader")) is None:
-                            tr_pr.append(OxmlElement("w:tblHeader"))
-                grid_cells = tbl._cells           # one cell object per grid position, read once
-                for r_i, row in enumerate(t.grid):
-                    heading_row = r_i < t.header_rows
-                    for c_i in range(t.n_cols):
-                        if (r_i, c_i) in hidden:
-                            continue
-                        cell = grid_cells[r_i * t.n_cols + c_i]
-                        cell.text = ""
-                        cell_p = cell.paragraphs[0]
-                        cell_p._p.style = style_ids["table header row" if heading_row else "table text"]
-                        cell_p.add_run(_docx_text(row[c_i] if c_i < len(row) else ""))
-                        if heading_row:
-                            if header_fill != "none":
-                                _shade_cell(cell, header_fill)
-                        elif _cell_attention(t, r_i, c_i, vocab, settings):
-                            _shade_cell(cell, look.get("review marks", "cell_fill"))
-                if ids and not tag_start:
-                    tag(paragraph("body"), ids, "end", alone=True)
-            elif b.kind == "figure":
-                img_file = b.meta.get("image_file")
-                if img_file and cache_dir and (cache_dir / img_file).exists():
-                    fw = max(1, b.box[2] - b.box[0]) / max(page.dpi, 1)
-                    picture(cache_dir / img_file, max(0.5, min(usable_w, max(1.5, fw))))
-                else:
-                    paragraph("notes", "[figure]")
-                if b.lines:
-                    fp = paragraph("table text")
-                    fp.add_run("Text inside figure: ").italic = True
-                    _add_confidence_runs(fp, word_tokens((w for ln in b.lines for w in ln.words), vocab), settings, look)
-            else:
-                requirement = b.uid in requirement_blocks
-                section = ("list items" if b.kind == "list_item" else "captions" if b.kind == "caption"
-                           else "requirements" if requirement else "body")
-                para = paragraph(section)
-                tag(para, ids, "start")
-                tokens = block_tokens(b, vocab) if b.lines else [(w, 1.0, "") for w in b.text.split()]
-                _add_confidence_runs(para, tokens, settings, look, keyword_re if requirement else None,
-                                     styles["requirement keywords"])
-                if b.meta.get("continued_across_pages"):
-                    label = para.add_run(" [continues across pages]")
-                    label.italic = True
-                    label.font.size = styles["notes"].font.size or Pt(8)
-                tag(para, ids, "end")
+            w.picture(image, max(1.0, min(width, (height - 0.15) / aspect)))
+            notes = ""
+        _end_section(d)
+        label = (f"{of}  -  could not be read: check the scan by hand" if failed else f"{of}  -  text read by the tool")
+        _page_header(d, look, styles, [label] + ([notes] if notes else []))
+        page_blocks = blocks_by_page.get(page.number, [])
+        for b in page_blocks:
+            w.block(b, page.dpi)
+        if not page_blocks:
+            paragraph("notes", "(no text was read on this page)")
+    return _save_word_file(d, path)
+
+
+def _doors_ready(d, styles: dict) -> None:
+    """The last touches DOORS needs (README: "Importing into DOORS"): no empty paragraphs (each would become an empty
+    object), and no outline level on any style but Heading 1-9 - DOORS makes every paragraph with an outline level a
+    heading, and a template's style may carry one, or inherit one from a heading it is based on."""
+    from docx.oxml import OxmlElement
+    headings = {styles[f"heading {k}"].style_id for k in range(1, 10)}
+    for style in {id(s): s for s in styles.values()}.values():
+        if style.type != WD_STYLE_TYPE.PARAGRAPH or style.style_id in headings:
+            continue
+        level, chain = None, style
+        while chain is not None and level is None:
+            ppr = chain.element.find(_q(_W, "pPr"))
+            lvl = ppr.find(_q(_W, "outlineLvl")) if ppr is not None else None
+            level = int(lvl.get(_q(_W, "val"), "9")) if lvl is not None else None
+            chain = chain.base_style
+        if level is not None and level < 9:
+            ppr = style.element.get_or_add_pPr()
+            for old in ppr.findall(_q(_W, "outlineLvl")):
+                ppr.remove(old)
+            el = OxmlElement("w:outlineLvl")
+            el.set(_q(_W, "val"), "9")                     # 9 = body text
+            ppr.append(el)
+    body = d.element.body
+    # no tab characters or line breaks in the text: DOORS Next turns a tab into spaces, and DOORS Classic keeps both
+    # inside the object text (a line break would also keep two paragraphs of the scan in one object)
+    for el in body.xpath(".//w:r/w:tab | .//w:r/w:br[not(@w:type) or @w:type='textWrapping']"):
+        space = OxmlElement("w:t")
+        space.text = " "
+        space.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        el.getparent().replace(el, space)
+    for p in list(body.iterchildren(_q(_W, "p"))):
+        if (not "".join(p.itertext()).strip() and not p.xpath(".//w:drawing|.//w:pict") and p.getnext() is not None
+                and p.getnext().tag != _q(_W, "sectPr")):
+            body.remove(p)
+
+
+def write_doors_document(path: Path, doc: DocResult, items: list, settings: Settings) -> Path:
+    """The document's text for a DOORS import: what was read from the scan, in reading order, with nothing the tool
+    added - no page labels, notes, tags or marks - and in the form DOORS turns into a clean module (see
+    _ReportWriter and README "Importing into DOORS"). Headings 1-9 by paragraph number, so the DOORS hierarchy is
+    the document's; one paragraph per paragraph (and per requirement); tables with their own borders and no merged
+    cells; pictures inline in paragraphs of their own; captions as plain text. Running headers and footers read from
+    the scan are left out; the template's page header and footer (classification marking) are kept."""
+    look = report_look(settings)
+    d, styles = _report_document(look)
+    d.core_properties.title = f"{Path(doc.source).name} - text for DOORS import"
+    w = _ReportWriter(d, styles, look, doc, items, settings, "doors")
+    dpi_of = {p.number: p.dpi for p in doc.pages}
+    for b in doc.blocks:
+        w.block(b, dpi_of.get(b.page, 200.0))
+    if len(d.element.body) <= 1:
+        w.paragraph("body", "(no text was read from this document)")
+    _doors_ready(d, styles)
     return _save_word_file(d, path)
 
 
@@ -7887,10 +10909,27 @@ def write_starter_template(target: Path, look: ReportLook) -> Path:
     by_section = {p.section: p for p in REPORT_PARTS}
     label(by_section["title"])
     paragraph("title", "Extraction Verification Report")
-    for section, text in (("heading 1", "Page 12"), ("heading 2", "Page 12 - text read by the tool"),
-                          ("heading 3", "3.2 Electrical requirements"), ("heading 4", "3.2.1 Power input")):
+    label(by_section["page label"])
+    paragraph("page label", "Page 12 of 40  -  text read by the tool")
+    paragraph("notes", "(In a report this label is in the page header of each scanned page, under the template's own "
+                       "header. Do not put it in this file's header: the header of the template is copied into every "
+                       "page of the reports.)")
+    for section, text in (("heading 1", "3. REQUIREMENTS"), ("heading 2", "3.2 Electrical requirements"),
+                          ("heading 3", "3.2.1 Power input"), ("heading 4", "3.2.1.1 Input voltage"),
+                          ("heading 5", "3.2.1.1.1 Steady state"), ("heading 6", "3.2.1.1.1.1"),
+                          ("heading 7", "3.2.1.1.1.1.1"), ("heading 8", "3.2.1.1.1.1.1.1"),
+                          ("heading 9", "3.2.1.1.1.1.1.1.1")):
         label(by_section[section])
         paragraph(section, text)
+    label(by_section["subheadings"])
+    paragraph("subheadings", "SPECIFICATIONS")
+    label(by_section["subheadings 2"])
+    paragraph("subheadings 2", "Military")
+    label(by_section["document list"])
+    for number, title, paras in (("MIL-STD-461G", "Requirements for the Control of Electromagnetic Interference "
+                                                  "Characteristics of Subsystems and Equipment", "3.2.5, 4.3.2"),
+                                 ("MIL-STD-810H", "Environmental Engineering Considerations and Laboratory Tests", "3.2.6")):
+        paragraph("document list", f"{number}\t{title}\t{paras}")
     label(by_section["body"])
     paragraph("body", "This is ordinary text read from the scan. It shows how a paragraph of the scanned document "
                       "looks in the report, with the spacing between paragraphs.")
@@ -7950,7 +10989,10 @@ def write_starter_template(target: Path, look: ReportLook) -> Path:
     _mark_review(p.add_run("marked like this"), "check", look)
     p.add_run(", and words that were very likely misread ")
     _mark_review(p.add_run("like this"), "likely_wrong", look)
-    p.add_run(". Table cells holding a word to check are shaded as in the table above.")
+    p.add_run(". Table cells holding a word to check are shaded as in the table above. A word the tool corrected is ")
+    corrected = p.add_run("marked like this")
+    corrected.font.highlight_color = _highlight(look.get("review marks", "corrected_highlight"))
+    p.add_run(".")
     d.core_properties.title = "Word template for the verification report"
     return _save_word_file(d, path)
 
@@ -8044,12 +11086,18 @@ class SpecExtractor:
                 except OSError as exc:
                     LOG.warning("  could not save the OCR cache (%s) - the results are still written", exc)
         finalize_document(doc, s)
-        items = RequirementExtractor(s).extract(doc)
+        extractor = RequirementExtractor(s)
+        items = extractor.extract(doc)
+        build_outline(doc, extractor)                  # sections and their levels (9b)
+        read_document_lists(doc)                       # the lists of standards in section 2 (9c)
+        note_section_types(doc, items)
         outputs = {}
         if s.make_excel:
             outputs["excel"] = write_workbook(out_dir / f"{output_stem}_extracted.xlsx", [(doc, items)], s)
         if s.make_word_report:
             outputs["word"] = write_word_report(out_dir / f"{output_stem}_verification.docx", doc, items, s)
+            if s.make_doors_document and report_look(s).get("doors", "make_doors_document"):
+                outputs["doors"] = write_doors_document(out_dir / f"{output_stem}_for_doors.docx", doc, items, s)
         failed_pages = [p.number for p in doc.pages if any(str(n).startswith("FAILED") for n in p.notes)]
         LOG.info("  done in %.0f s: %d requirements, %d tables, %d captions, %d items flagged for review%s",
                  time.time() - start, sum(1 for i in items if i.item_type == "Requirement"),
@@ -8061,12 +11109,12 @@ class SpecExtractor:
 
     def _read_document(self, path: Path, cache_dir: Path) -> DocResult:
         s = self.settings
-        doc = DocResult(source=str(path), engine=s.engine, cache_dir=str(cache_dir))
+        doc = DocResult(source=str(path), engine=s.engine, cache_dir=str(cache_dir), page_count=count_pages(path))
         t0 = time.time()
-        total = len(parse_page_selection(s.page_selection, count_pages(path)))
+        total = len(parse_page_selection(s.page_selection, doc.page_count))
         if total == 0:
             doc.warnings.append(f"{path.name}: no pages selected")
-            LOG.warning("  no pages selected (--pages %s, the file has %d page(s))", s.page_selection, count_pages(path))
+            LOG.warning("  no pages selected (--pages %s, the file has %d page(s))", s.page_selection, doc.page_count)
             return doc
         docling_pages = []     # (page number, dpi, height, width, cleaned image file) - images stay on disk
         for n, raw in enumerate(iter_raw_pages(path, s), 1):
@@ -8245,10 +11293,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                "  python spec_extractor.py spec.pdf --engine docling --docling-models D:\\docling_models\n")
     p.add_argument("inputs", nargs="*", help="PDF/TIFF/PNG/JPG files and/or folders (omit to open a file picker)")
     g = p.add_argument_group("input / output")
-    g.add_argument("-o", "--output", help="output folder (default: 'extraction_output' next to the input)")
+    g.add_argument("-o", "--output", help=f"output folder (default: '{OUTPUT_FOLDER}' next to the input)")
     g.add_argument("-r", "--recursive", action="store_true", help="also process files in sub-folders")
     g.add_argument("--pages", default="", help="pages to process, e.g. 1-5,9 (default: all)")
-    g.add_argument("--no-word", action="store_true", help="do not write the Word verification report")
+    g.add_argument("--no-word", action="store_true", help="do not write the Word documents")
+    g.add_argument("--no-doors", action="store_true", help="do not write <name>_for_doors.docx (the text for DOORS)")
+    g.add_argument("--no-autocorrect", action="store_true",
+                   help="leave every word as it was read (no corrected look-alike letters or digits)")
     g.add_argument("--no-page-images", action="store_true", help="leave page images out of the Word report (smaller file)")
     g.add_argument("--word-style", metavar="FILE",
                    help="style file for the Word report's look and template (default: word_style/report_style.ini)")
@@ -8303,6 +11354,8 @@ def settings_from_args(args) -> Settings:
     s.recursive = args.recursive
     s.page_selection = args.pages or ""
     s.make_word_report = not args.no_word
+    s.make_doors_document = not args.no_doors
+    s.autocorrect = not args.no_autocorrect
     s.word_page_images = not args.no_page_images
     if args.word_style:
         s.word_style_file = Path(args.word_style).expanduser()
@@ -8447,7 +11500,7 @@ def main(argv: Optional[list] = None) -> int:
         LOG.error("No PDF/TIFF/image files found in: %s", ", ".join(map(str, inputs)))
         return _pause_if_dialog(used_dialog, 1)
     first = Path(inputs[0]).expanduser()
-    out_dir = settings.output_dir or ((first if first.is_dir() else first.parent) / "extraction_output")
+    out_dir = settings.output_dir or ((first if first.is_dir() else first.parent) / OUTPUT_FOLDER)
     out_dir.mkdir(parents=True, exist_ok=True)
     _setup_logging(out_dir, args.verbose)
     LOG.info("%s - %d file(s) - engine: %s - output: %s", version_line(), len(files), settings.engine, out_dir)

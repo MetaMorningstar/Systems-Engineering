@@ -57,6 +57,9 @@ _AFTER = "3.2.5 Weight. The equipment shall not exceed 45 kilograms."
 _AFTER_ROW = para("3.2.5 | The equipment shall not exceed 45 kilograms.")
 _CHAR_ROWS = [("Voltage:", "28 VDC nominal", "Test"), ("Current:", "5 A maximum", "Test"),
               ("Impedance:", "50 ohm", "Analysis"), ("Isolation:", "100 Mohm at 500 VDC", "Test")]
+_PROPERTIES = "The interface shall have the following properties:"
+# 1.5.0: columns with no heading row and no title are a list - each row an item of the lead-in, its cells in order
+_CHAR_LIST_ROWS = items(_PROPERTIES, *(f"3.2.1 | {a} {b} {c}" for a, b, c in _CHAR_ROWS)) + _AFTER_ROW
 
 
 def _grid(lead: list, rows: list, cols: tuple, header: tuple = None, caption: str = "", below: str = "",
@@ -168,10 +171,10 @@ CASES = [
          + _AFTER_ROW),
     Case("TBL-07", "A three-column table without a header under a lead-in",
          "TBL-06 without its header row.",
-         "A Table item, not four list rows (no Requirement column, so no requirement rows from it).",
-         "Review round 2 (tab-list attack on tables); real OCR page tbl_colon_nohdr.",
-         text=_grid(_LEAD, _CHAR_ROWS, (3, 24, 55)), tables=1, table_has=("Impedance:", "Analysis"),
-         expect=_LEAD_ROW + _AFTER_ROW),
+         "A list, not a table (1.5.0: no heading row and no title): four rows, each the lead-in and one row of the "
+         "columns ('... properties: Voltage: 28 VDC nominal Test'). Until 1.4.0 this was a Table item.",
+         "Review round 2 (tab-list attack on tables); real OCR page tbl_colon_nohdr. User request (1.5.0).",
+         text=_grid(_LEAD, _CHAR_ROWS, (3, 24, 55)), tables=0, expect=_CHAR_LIST_ROWS),
     Case("TBL-08", "A three-column table with a header, labels without colons",
          "TBL-06 with the labels' colons left out.",
          "As TBL-06.",
@@ -184,16 +187,22 @@ CASES = [
     Case("TBL-09", "A three-column table without a header, labels without colons",
          "TBL-07 with the labels' colons left out.",
          "As TBL-07.",
-         "Review round 2 (tab-list attack on tables); real OCR page tbl_plain_nohdr.",
-         text=_grid(_LEAD, [(a.rstrip(":"), b, c) for a, b, c in _CHAR_ROWS], (3, 24, 55)),
-         tables=1, table_has=("Impedance", "Analysis"), expect=_LEAD_ROW + _AFTER_ROW),
+         "Review round 2 (tab-list attack on tables); real OCR page tbl_plain_nohdr. User request (1.5.0).",
+         text=_grid(_LEAD, [(a.rstrip(":"), b, c) for a, b, c in _CHAR_ROWS], (3, 24, 55)), tables=0,
+         expect=items(_PROPERTIES, *(f"3.2.1 | {a.rstrip(':')} {b} {c}" for a, b, c in _CHAR_ROWS)) + _AFTER_ROW),
     Case("TBL-10", "A table of documents under a lead-in",
          "'2.1 Documents. The following documents form a part of this specification:' then document numbers and "
          "titles in two columns (one title over two lines), then 2.2.",
-         "One Table item; the documents are not list items; 2.2 keeps its number.",
-         "Review round 2 (tab-list attack on tables); real OCR page tbl_docs.",
-         text=_grid(_DOCS_LEAD, _DOCS, (3, 22), after=_PRECEDENCE), tables=1, table_has=("MIL-STD-810H",),
-         expect=_PRECEDENCE_ROW),
+         "A list of documents, not a table (1.5.0: no heading row and no title): the five documents in the "
+         "Applicable Documents sheet, the wrapped title in one piece (the lead-in 'The following documents form a "
+         "part of' says a list of documents follows); 2.2 keeps its number. Until 1.4.0 this was a Table item.",
+         "Review round 2 (tab-list attack on tables); real OCR page tbl_docs. User request (1.5.0).",
+         text=_grid(_DOCS_LEAD, _DOCS, (3, 22), after=_PRECEDENCE), tables=0, expect=_PRECEDENCE_ROW,
+         documents=("MIL-STD-461G | Requirements for the Control of Electromagnetic Interference Characteristics | ",
+                    "MIL-STD-704F | Aircraft Electric Power Characteristics | ",
+                    "MIL-STD-810H | Environmental Engineering Considerations | ",
+                    "MIL-STD-1275E | Characteristics of 28 Volt DC Input Power | ",
+                    "MIL-STD-1553B | Digital Time Division Command/Response Bus | ")),
     Case("TBL-11", "A table of documents with a header row",
          "TBL-10 with the header row 'Document / Title'.",
          "As TBL-10.",
@@ -218,13 +227,16 @@ CASES = [
     Case("TBL-13", "A table whose first column holds long labels",
          "'3.2.1 ... the following properties:' then 'Maximum steady state input current:  5 A  Test' and "
          "three more rows with labels of five to six words.",
-         "A Table item, not a list.",
-         "Review round 2 (tab-list attack on tables); real OCR page tbl_longlabel.",
+         "A list, not a table (1.5.0: no heading row and no title), as TBL-07. Until 1.4.0 a Table item.",
+         "Review round 2 (tab-list attack on tables); real OCR page tbl_longlabel. User request (1.5.0).",
          text=_grid(_LEAD, [("Maximum steady state input current:", "5 A", "Test"),
                             ("Minimum insulation resistance at 500 VDC:", "100 Mohm", "Test"),
                             ("Maximum inrush current at turn on:", "20 A", "Test"),
-                            ("Maximum ripple voltage on the bus:", "1 V", "Analysis")], (3, 48, 60)),
-         tables=1, table_has=("Maximum inrush current",), expect=_LEAD_ROW + _AFTER_ROW),
+                            ("Maximum ripple voltage on the bus:", "1 V", "Analysis")], (3, 48, 60)), tables=0,
+         expect=items(_PROPERTIES, "3.2.1 | Maximum steady state input current: 5 A Test",
+                      "3.2.1 | Minimum insulation resistance at 500 VDC: 100 Mohm Test",
+                      "3.2.1 | Maximum inrush current at turn on: 20 A Test",
+                      "3.2.1 | Maximum ripple voltage on the bus: 1 V Analysis") + _AFTER_ROW),
     Case("TBL-14", "A table under a lead-in with its caption BELOW it",
          "TBL-07's table with the caption 'TABLE I. Interface characteristics.' under it, then 3.2.5.",
          "A Table item linked to its caption; not a list.",
@@ -234,31 +246,30 @@ CASES = [
     Case("TBL-15", "A table whose labels are abbreviations with full stops ('Min.', 'Nom.', 'Max.')",
          "'3.2.3 ... within the following limits:' then 'Min.  22.0 VDC  Test', 'Nom.  28.0 VDC  Test', 'Max.  29.0 "
          "VDC  Test'.",
-         "A Table item, not a list.",
-         "Review round 2 (tab-list attack on tables); real OCR page tbl_minmax; known limitation.",
+         "A list, not a table (1.5.0: no heading row and no title): three rows, each the lead-in and one row "
+         "('... following limits: Min. 22.0 VDC Test'). Until 1.4.0 a Table item was expected (and not found).",
+         "Review round 2 (tab-list attack on tables); real OCR page tbl_minmax. User request (1.5.0).",
          text=_grid(["3.2.3 Input voltage. The input voltage shall be within the", "following limits:"],
                     [("Min.", "22.0 VDC", "Test"), ("Nom.", "28.0 VDC", "Test"), ("Max.", "29.0 VDC", "Test")],
-                    (3, 24, 55)),
-         tables=1, table_has=("29.0 VDC",),
-         expect=para(f"3.2.3 | The input voltage shall be within the following limits: [note: {_NO_LIST}]")
-         + _AFTER_ROW,
-         known="The rows are taken as the lead-in's list, with the labels and the rest of each row apart: six rows "
-               "('... following limits: Min.', 'Nom.', 'Max.', then '22.0 VDC Test' ...), and no Table item."),
+                    (3, 24, 55)), tables=0,
+         expect=items("The input voltage shall be within the following limits:", "3.2.3 | Min. 22.0 VDC Test",
+                      "3.2.3 | Nom. 28.0 VDC Test", "3.2.3 | Max. 29.0 VDC Test") + _AFTER_ROW),
     Case("TBL-16", "A table whose labels are abbreviations ('Temp.', 'Alt.', 'Vib.', 'Hum.')",
          "'3.2.1 ... the following properties:' then 'Temp.  -40 C to +71 C  Test' and three more such rows.",
-         "A Table item, not a list.",
-         "Review round 2 (tab-list attack on tables); real OCR page tbl_abbrev; known limitation.",
+         "A list, not a table (1.5.0: no heading row and no title), as TBL-15. Until 1.4.0 a Table item was "
+         "expected (and not found).",
+         "Review round 2 (tab-list attack on tables); real OCR page tbl_abbrev. User request (1.5.0).",
          text=_grid(_LEAD, [("Temp.", "-40 C to +71 C", "Test"), ("Alt.", "15,000 m", "Test"),
-                            ("Vib.", "7.7 g rms", "Test"), ("Hum.", "95 percent", "Analysis")], (3, 24, 55)),
-         tables=1, table_has=("15,000 m",), expect=_LEAD_ROW + _AFTER_ROW,
-         known="The rows are taken as the lead-in's list: four rows such as '... properties: Temp. -40 C to "
-               "+71 C Test', and no Table item."),
+                            ("Vib.", "7.7 g rms", "Test"), ("Hum.", "95 percent", "Analysis")], (3, 24, 55)), tables=0,
+         expect=items(_PROPERTIES, "3.2.1 | Temp. -40 C to +71 C Test", "3.2.1 | Alt. 15,000 m Test",
+                      "3.2.1 | Vib. 7.7 g rms Test", "3.2.1 | Hum. 95 percent Analysis") + _AFTER_ROW),
     Case("TBL-17", "Requirement IDs with a colon on a tab stop ('SRS-101:')",
          "'3.2 Performance. The radar shall meet the following requirements:' then 'SRS-101:' at the margin and "
          "its requirement on a tab stop (two lines), 'SRS-102:' and 'SRS-103:' likewise; then 3.3.",
          "Each requirement is a row whose Doc Ref is its own ID (SRS-101, SRS-102, SRS-103) - the ID is not a list "
          "label (round 3: 'SRS-101:' was accepted as a label and the table was lost).",
-         "Review round 3 (idcolon); real OCR page idcolon_mono.",
+         "Review round 3 (idcolon); real OCR page idcolon_mono. A known limitation until 1.5.0 (the IDs were read as "
+         "a table column, and the rows had no Doc Ref).",
          text="""
 3.2 Performance. The radar shall meet the following requirements:
 @gap 0.5
@@ -271,13 +282,11 @@ SRS-103:      The radar shall operate from 115 VAC.
 
 3.3 Cooling. The radar shall be cooled by forced air.
 """,
-         tables=1, table_has=("SRS-102",),
+         tables=0,
          expect=para(f"3.2 | The radar shall meet the following requirements: [note: {_NO_LIST}]",
                      "SRS-101 | The radar shall detect a 1 square meter target at a range of not less than 150 km.",
                      "SRS-102 | The radar shall track 200 targets.", "SRS-103 | The radar shall operate from 115 VAC.",
-                     "3.3 | The radar shall be cooled by forced air."),
-         known="The IDs are read as the first column of a table, and the requirement rows taken from it have an "
-               "empty Doc Ref instead of SRS-101, SRS-102 and SRS-103."),
+                     "3.3 | The radar shall be cooled by forced air.")),
     Case("TBL-18", "A list of labels, then the next table's caption and a ruled table",
          "'3.2.6 ... shall meet the following:' with five labels on tab stops (no markers), one blank line, the "
          "caption 'TABLE II. Connector J1 pin assignments.' and a ruled table Pin / Signal.",

@@ -89,11 +89,7 @@ b. MIL-STD-704F
 """,
          expect=items(_DOCS_STEM, "2.1 a | a. MIL-STD-461G", "2.1 b | b. MIL-STD-704F")
          + para("3.1 | The unit shall operate from 28 VDC aircraft power. [section: 3 Requirements]",
-                "3.2 | The unit shall weigh less than 5 kg. [section: 3 Requirements]"),
-         known="Almost every line of this page is followed by a blank line, so a blank line is taken as the "
-               "page's normal line spacing; item b has no full stop, and the heading one blank line below it is "
-               "read as its next line: the row is 'b. MIL-STD-704F 3. Requirements.' and 3.1 and 3.2 keep the "
-               "section '2 APPLICABLE DOCUMENTS'."),
+                "3.2 | The unit shall weigh less than 5 kg. [section: 3 Requirements]")),
     Case("NUM-04", "Empty sections in a row ('5. Packaging.', '6. Notes.')",
          "4.3, then the headings '5. Packaging.' and '6. Notes.' each followed only by a blank line, then 6.1.",
          "Both are headings (no rows of their own) and 6.1 is in section '6 Notes' (round 3: a run of empty "
@@ -268,8 +264,11 @@ installation in the aircraft nose bay.
     Case("NUM-12", "A table of contents with dot leaders",
          "'TABLE OF CONTENTS', then numbers, titles with dot leaders and page numbers ('3.2.1  Performance "
          "..........  4').",
-         "No requirement rows and no sections come from the contents list; it is given as one Table item.",
-         "Review round 1 (layout, table of contents); real OCR page toc_mono.",
+         "No requirement rows and no sections come from the contents list: its entries are text under the heading "
+         "TABLE OF CONTENTS, not headings of their own (which would put a second copy of every section into the "
+         "outline and the DOORS file). Since 1.5.0 the entries are a list, not a Table item: the grid has no title "
+         "('TABLE OF CONTENTS' is not a table caption) and no heading row printed as one.",
+         "Review round 1 (layout, table of contents); real OCR page toc_mono. Re-written for 1.5.0.",
          text="""
                          TABLE OF CONTENTS
 
@@ -299,7 +298,7 @@ Paragraph                                                        Page
 ~
 4.1     Responsibility for inspection ................            9
 """,
-         expect=[], tables=1, table_has=("QUALITY ASSURANCE PROVISIONS",)),
+         expect=[], tables=0, outline=("1 | TABLE OF CONTENTS",)),
     Case("NUM-13", "A paragraph number run into its title ('4.2Extended verification.')",
          "'4.2Extended verification. The contractor shall ...' - the scan lost the space after the number.",
          "The number is still split off: Doc Ref '4.2'.",

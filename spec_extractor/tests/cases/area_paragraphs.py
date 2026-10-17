@@ -169,7 +169,8 @@ include the mounting tray and all cables supplied with the unit.
          "3.2.1 to 3.2.3; then the heading '3.3 Interfaces' and two ordinary paragraphs.",
          "Each numbered paragraph is one row with its number as the Doc Ref and its title split off ('The unit "
          "shall operate from ...'); no table; the two paragraphs are in section '3.3 Interfaces'.",
-         "Review round 1 (layout); real OCR page hanging_numbers.",
+         "Review round 1 (layout); real OCR page hanging_numbers. A known limitation until 1.5.0 (an extra Table "
+         "item, titles left in the text).",
          text="""
 3.2.1     Power. The unit shall operate from the 28 VDC
           aircraft bus and shall draw no more than 150 W.
@@ -191,9 +192,7 @@ mission computer as defined in the ICD.
                      "3.2.3 | The unit shall weigh less than 5 kg.",
                      " | The unit shall provide an RS-422 interface to the mission computer as defined in the ICD. "
                      "[section: 3.3 Interfaces]",
-                     " | The unit shall provide a MIL-STD-1553B remote terminal. [section: 3.3 Interfaces]"),
-         known="The numbers and their text are also read as a two-column table (an extra Table item), and each "
-               "title stays at the start of the text ('Power. The unit shall operate ...')."),
+                     " | The unit shall provide a MIL-STD-1553B remote terminal. [section: 3.3 Interfaces]")),
     Case("PARA-09", "Lettered paragraphs 'A. General:' under a heading",
          "The heading '3.1 Installation.', then 'A. General: The contractor shall provide all labor, materials' "
          "with its next line back at the margin, and 'B. Cabling: ...' the same way; then 3.2.",
