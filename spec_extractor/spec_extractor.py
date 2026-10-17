@@ -3668,6 +3668,13 @@ def _all_underlined(lines: list) -> bool:
     return bool(words) and all(w.underline for w in words)
 
 
+# a line that names an issuer of documents: a word such an organisation is named with, or its acronym in brackets
+# ("SOCIETY OF AUTOMOTIVE ENGINEERS (SAE)", "NATO STANDARDIZATION AGREEMENTS")
+_ISSUER_NAME = re.compile(r"\((?:[A-Z][A-Z0-9&/.-]{1,9})\)\s*$|\b(?:SOCIETY|COMMISSION|INSTITUTE|ASSOCIATION|ALLIANCE|"
+                          r"LABORATORIES|AGREEMENTS|ORGANI[SZ]ATION|COUNCIL|AGENCY|BUREAU|FEDERATION|CONSORTIUM|"
+                          r"COMMITTEE|ADMINISTRATION|CORPORATION|INC)\b\.?")
+
+
 def _title_x_after_dash(row: list) -> Optional[float]:
     """Where the title starts on the first line of an entry in the dash layout ('MIL-STD-461G - Requirements ...'):
     the left edge of the word after the dash, which is where a title with a hanging indent wraps to. None when the
@@ -4366,7 +4373,7 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             # (a number of several levels only after a word that takes one, "..., Paragraph" / "5.4.1 Control
             # Movement", as a short title with no sentence after it, and only where the paragraph number above is
             # known and this is not the paragraph that comes after it ("2.2 Non-Government publications" after 2.1);
-            # never the next top-level section: "..., AN Type" / "3 REQUIREMENTS", "30 REQUIREMENTS" after 20.1)
+            # never the next top-level section: "..., AN Type" / "3 REQUIREMENTS", or any "30 ..." after 20.1)
             row_number = clean_para_number(row_num.group("num")) if row_num else ""
             part_number = (doc_led and bool(row_num) and not row_num.group("dot")
                            and ((bool(_ENDS_IN_PART_NAME.search(prev_text)) and "." not in row_number)
@@ -4377,8 +4384,9 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                                     and not re.search(r"[.:]\s+\S", row_num.group("rest"))
                                     and (row_number == number_above       # (its own number: "Clause" / "4.2" in 4.2)
                                          or not plausible_next_number(number_above, row_number, max_skip=1))))
-                           and not (section_type(row_num.group("rest")) in TOP_LEVEL_TYPES and "." not in row_number
-                                    and (plausible_next_number(number_above, row_number)
+                           and not ("." not in row_number
+                                    and ((section_type(row_num.group("rest")) in TOP_LEVEL_TYPES
+                                          and plausible_next_number(number_above, row_number))
                                          or (row_number.isdigit() and _next_tens(number_above, int(row_number))))))
             document_entry = document_entry or (bool(RE_DOC_ID_START.match(first_text)) and bool(RE_PARA_NUM.match(row_text))
                                                 and (_is_heading_text(row_text) or _is_titled_number(row_text))
@@ -4396,10 +4404,11 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                                                 r"|\S+(?:\s+\S+)?\s+[-–—]\s+\S", row_text)))
                 # (in a list typed in capitals, a line that starts where the title starts on the entry's first line -
                 # or where a wrapped line of this entry or of an entry above starts - after a line that ran to the
-                # margin, may be the title wrapping with a hanging indent near the middle of the page: "MIL-STD-461G -
-                # REQUIREMENTS FOR THE CONTROL OF ELECTROMAGNETIC INTERFERENCE" / "CHARACTERISTICS OF SUBSYSTEMS AND
-                # EQUIPMENT". There only a line centred on the page within half a line height is a group title. And no
-                # group title comes after a title left unfinished: "..., SECTION 300B," / "ELECTRIC POWER, ...")
+                # margin, is the title wrapping with a hanging indent, although it may be near the middle of the page:
+                # "MIL-STD-461G - REQUIREMENTS FOR THE CONTROL OF ELECTROMAGNETIC INTERFERENCE" / "CHARACTERISTICS OF
+                # SUBSYSTEMS AND EQUIPMENT" - unless it names an issuer, "SOCIETY OF AUTOMOTIVE ENGINEERS (SAE)", or is
+                # centred within half a line height. And no group title comes after a title left unfinished: "...,
+                # SECTION 300B," / "ELECTRIC POWER, ...")
                 hanging_x = [x for x in [_title_x_after_dash(current[0])] if x is not None] + [
                     min(ln.box[0] for ln in r) for r in current[1:]]
                 for blk in out[-8:]:
@@ -4411,7 +4420,9 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                 off_centre = abs((row_box[0] + row_box[2]) / 2 - (text_x0 + text_w / 2))
                 centred_title = (row_text.isupper() and _is_heading_text(row_text)
                                  and row_text.count("(") == row_text.count(")")
-                                 and off_centre < (0.5 if at_hanging_indent else 1.5) * stats.line_h
+                                 and off_centre < 1.5 * stats.line_h
+                                 and (not at_hanging_indent or bool(_ISSUER_NAME.search(row_text))
+                                      or off_centre < 0.5 * stats.line_h)
                                  and not _leaves_phrase_open(prev_text, in_entry=True)
                                  and row_box[2] - row_box[0] < 0.6 * text_w
                                  and row_box[0] > first_box[0] + 4 * stats.line_h)         # ("STANDARDS", centred)
