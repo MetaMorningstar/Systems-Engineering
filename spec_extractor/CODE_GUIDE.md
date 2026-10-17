@@ -205,4 +205,5 @@ What happens when you run `python spec_extractor.py spec.pdf` (section numbers i
   Nothing with the document's text may be written outside the output folder: the Excel file is saved with its
   temporary files in a folder of their own there (`_temporary_files_in()` [10]). Test scans of your own go in
   `tests/cases/my_cases/`, which git ignores; `tests/cases/run_cases.py` keeps everything it writes for them in
-  `my_cases/_results`.
+  `my_cases/_results`, and gives each run of the tool a temp folder there as well, so an older copy of the tool
+  under test cannot leave their text in the system's temp folder.

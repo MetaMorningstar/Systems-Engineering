@@ -103,6 +103,11 @@ def tail_after_stem(actual: str, expected: str, stem_len: int) -> str:
 
 
 def run_tool(spec: Path, documents: list, outdir: Path, jobs: int) -> None:
+    """Run the tool on the documents, as `jobs` processes, each into a folder runN of its own under outdir.
+    Each process is also given a temp folder inside its runN folder (TMPDIR, TEMP and TMP), deleted when it
+    ends: a copy of the tool under test may write temporary files that hold the documents' text (an older
+    version saves its workbooks through the system's temp folder), and none of them may land outside outdir -
+    for your own scans, outside my_cases."""
     py = os.environ.get("SPEC_PYTHON") or (VENV_PY if os.path.exists(VENV_PY) else sys.executable)
     jobs = max(1, min(jobs, len(documents)))
     groups = [documents[k::jobs] for k in range(jobs)]
@@ -110,12 +115,16 @@ def run_tool(spec: Path, documents: list, outdir: Path, jobs: int) -> None:
     for k, group in enumerate(groups):
         target = outdir / f"run{k + 1}"
         target.mkdir(parents=True, exist_ok=True)
+        temp = target / "_temp"
+        temp.mkdir(exist_ok=True)
+        env = dict(os.environ, TMPDIR=str(temp), TEMP=str(temp), TMP=str(temp))
         cmd = [py, str(spec), *map(str, group), "-o", str(target), "--no-combined", "--no-cache", "--no-word"]
         log = open(target / "tool_output.txt", "w", encoding="utf-8")
-        procs.append((subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT), log, target))
-    for p, log, target in procs:
+        procs.append((subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env), log, target, temp))
+    for p, log, target, temp in procs:
         rc = p.wait()
         log.close()
+        shutil.rmtree(temp, ignore_errors=True)
         if rc != 0:
             print(f"WARNING: spec_extractor exited with status {rc} (see {target / 'tool_output.txt'})", file=sys.stderr)
 

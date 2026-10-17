@@ -208,7 +208,8 @@ Remember that these files hold your document's text. Everything the runs write f
 `tests/cases/my_cases/`: the tool's workbooks, the page images and text it keeps in `_cache`, and the case reports
 (which quote the requirement text) go to `tests/cases/my_cases/_results/`, never to `tests/cases/_results/`, and
 `--record` refuses a scan that is not in `my_cases` (and deletes the tool's output once the `.expected.txt` is
-written). Keep the folder where such data may be kept, and when a scan is no longer needed delete it, its
+written). The tool's own temporary files go there too, not to the system's temp folder - also when you test
+another copy of the tool, such as an older version. Keep the folder where such data may be kept, and when a scan is no longer needed delete it, its
 `.expected.txt` and the `_results` folder.
 
 ---
