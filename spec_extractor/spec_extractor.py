@@ -4457,15 +4457,15 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                         and row_num.group("rest")[:1].isupper() and word_count(row_num.group("rest")) <= 10
                         and re.match(re.escape(clean_para_number(row_num.group("num"))) + r"\.1\b", next_row_text))
                 # (an undotted number and a title, "6 Production and acceptance", with no full stop after it - up to
-                # 50, or the next tens in MIL-STD-490 numbering, its title in capitals or of a known kind: "60 TEST
-                # EQUIPMENT" after 50.2, not "60 Minutes" in a table)
+                # 50, or the next tens in MIL-STD-490 numbering on a line of its own or in capitals: "60 TEST
+                # EQUIPMENT" or "60 Test equipment" after 50.2, not "60 Minutes" in the first column of a table)
                 or bool(row_num and "." not in row_num.group("num") + row_num.group("dot")
                         and row_num.group("rest")[:1].isupper() and word_count(row_num.group("rest")) <= 10
                         and not row_text.rstrip().endswith(".") and not _starts_with_unit(row_num.group("rest"))
                         and clean_para_number(row_num.group("num")).isdigit()
                         and (int(clean_para_number(row_num.group("num"))) <= 50
                              or (_next_tens(number_above, int(clean_para_number(row_num.group("num"))))
-                                 and (row_num.group("rest").isupper()
+                                 and (row_num.group("rest").isupper() or len(row) == 1
                                       or section_type(row_num.group("rest")) in TOP_LEVEL_TYPES))))
                 or (not row_num and bool(_SECTION_LABEL.fullmatch(row_text.strip())) and not row_text.endswith("."))
                 or (not row_num and row_text.isupper() and bool(re.search(r"[a-z]", block_so_far)))

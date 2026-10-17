@@ -5569,13 +5569,14 @@ def test_review3_a_title_wrapped_with_a_hanging_indent_near_the_middle_and_numbe
         sections.append((None, [f"{n}. {name}", f"{n}.1 General. The test set shall meet the requirements of "
                                 f"{name.lower()}.", f"{n}.2 Items. The {name.lower()} shall include:",
                                 (40, "- item one"), (40, "- item two")]))
-    first = [row for _label, part in sections for row in part]
-    first = first[:-1] + [first[-1], "60 TEST EQUIPMENT"]
-    doc, _items = _pages(first, ["60.1 General. The test set shall meet the requirements of test equipment.",
-                                 "60.2 Items. The test equipment shall include:", (40, "- item one"),
-                                 (40, "- item two"), "70. CALIBRATION", "70.1 General. The test set shall be "
-                                 "calibrated yearly."])
-    assert [h["title"] for h in doc._outline if h["level"] == 1][-2:] == ["TEST EQUIPMENT", "CALIBRATION"], doc._outline
+    rows = [row for _label, part in sections for row in part]
+    for lost in ("60 TEST EQUIPMENT", "60 Test equipment"):
+        doc, _items = _pages(rows + [lost], ["60.1 General. The test set shall meet the requirements of test equipment.",
+                                             "60.2 Items. The test equipment shall include:", (40, "- item one"),
+                                             (40, "- item two"), "70. CALIBRATION", "70.1 General. The test set shall "
+                                             "be calibrated yearly."])
+        assert [h["title"] for h in doc._outline if h["level"] == 1][-2:] == [lost[3:], "CALIBRATION"], \
+            (lost, doc._outline)
 
 
 def test_review3_paragraphs_that_start_with_a_document_number_stay_whole_and_items_stay_apart_across_a_page():
@@ -5645,17 +5646,18 @@ def test_review3_real_headings_after_titles_that_end_in_edition_notice_section_o
     item with ';' ('..., Paragraph' / '5.4.1 Control Movement;') is part of the item."""
     body = ["1. SCOPE", "1.1 Scope. This specification covers the radar set.", "2. APPLICABLE DOCUMENTS",
             "2.1 General. See appendix I.", "3. REQUIREMENTS", "3.1 Weight. The radar set shall weigh not more than 40 kg."]
-    for last in ("DI-CMAN-80643, Specification Change Notice", "UL 1950, Safety of Information Technology Equipment, "
-                 "Third Edition"):
+    for last, heading in (("DI-CMAN-80643, Specification Change Notice", "30 REQUIREMENTS"),
+                          ("UL 1950, Safety of Information Technology Equipment, Third Edition", "30 REQUIREMENTS"),
+                          ("MIL-C-5015, Connectors, Electrical, Circular Threaded, AN Type", "30 PERFORMANCE")):
         doc, _items = _two_pages_outline(body, [
             "APPENDIX I", None, "10. SCOPE", "10.1 Scope. This appendix covers the radar test set.",
             "20. APPLICABLE DOCUMENTS", "20.1 Government documents. The following documents form a part of this "
             "appendix to the extent", "specified herein.", None,
             "MIL-STD-461G, Requirements for the Control of Electromagnetic Interference",
-            "MIL-STD-810H, Environmental Engineering Considerations and Laboratory Tests", last, "30 REQUIREMENTS", None,
+            "MIL-STD-810H, Environmental Engineering Considerations and Laboratory Tests", last, heading, None,
             "30.1 Weight. The unit shall weigh not more than 20 kg.", None, "30.2 Power. The unit shall operate from 115 "
             "V ac power."])
-        assert "REQUIREMENTS" in [h["title"] for h in doc._outline if h["number"] == "30"], (last, doc._outline)
+        assert heading[3:] in [h["title"] for h in doc._outline if h["number"] == "30"], (last, doc._outline)
     doc, _items, _s = _outline_doc(["1 Scope", "This Standard specifies the requirements for the radar set.", None,
                                     "2 Normative references", "The following documents contain provisions which, "
                                     "through reference in this text, constitute", "provisions of this Standard.", None,
@@ -5778,9 +5780,9 @@ def _dash_list_page(width: int, groups: list, caps: bool = True) -> list:
 
 def test_review3_centred_group_titles_that_start_near_where_a_title_wraps():
     """Review 1.5.0 (round 3): a centred group title right under an entry that ran to the margin is a group title also
-    when its left edge happens to be where the entry's title wraps with a hanging indent - in a list typed in
-    capitals ('RADIO TECHNICAL COMMISSION FOR AERONAUTICS') and under an entry in small letters ('SOCIETY OF AUTOMOTIVE
-    ENGINEERS' after '..., General Specification for')."""
+    when its left edge happens to be near or at where the entry's title wraps with a hanging indent - in a list typed
+    in capitals ('RADIO TECHNICAL COMMISSION FOR AERONAUTICS', 'SOCIETY OF AUTOMOTIVE ENGINEERS (SAE)') and
+    under an entry in small letters ('SOCIETY OF AUTOMOTIVE ENGINEERS' after '..., General Specification for')."""
     for width, caps, groups in [
             (76, True, [("DEPARTMENT OF DEFENSE STANDARDS",
                          [("MIL-STD-704F", "Aircraft Electric Power Characteristics"),
@@ -5797,7 +5799,14 @@ def test_review3_centred_group_titles_that_start_near_where_a_title_wraps():
                          ("SOCIETY OF AUTOMOTIVE ENGINEERS",
                           [("SAE AS5553", "Counterfeit Electrical, Electronic, and Electromechanical (EEE) Parts; "
                                           "Avoidance, Detection, Mitigation, and Disposition"),
-                           ("SAE ARP4754A", "Guidelines for Development of Civil Aircraft and Systems")])])]:
+                           ("SAE ARP4754A", "Guidelines for Development of Civil Aircraft and Systems")])]),
+            # (the group title starts exactly where the title of MIL-STD-1686C wraps: it names an issuer)
+            (69, True, [("DEPARTMENT OF DEFENSE STANDARDS",
+                         [("MIL-STD-1686C", "Electrostatic Discharge Control Program for Protection of Electrical and "
+                                            "Electronic Parts, Assemblies and Equipment")]),
+                        ("SOCIETY OF AUTOMOTIVE ENGINEERS (SAE)",
+                         [("SAE AS5553", "Counterfeit Electrical, Electronic, and Electromechanical (EEE) Parts"),
+                          ("SAE ARP4754A", "Guidelines for Development of Civil Aircraft and Systems")])])]:
         got = _documents(_dash_list_page(width, groups, caps))
         assert [(g, n) for g, _s, n, _t, _p in got] == [(g, n) for g, entries in groups for n, _t in entries], got
 
