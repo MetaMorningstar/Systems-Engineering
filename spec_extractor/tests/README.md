@@ -25,7 +25,7 @@ Nothing here uses the network: the test documents are drawn on this computer, an
 ## 1. Rule tests (`tests/test_rules.py`)
 
 ```bat
-python tests/test_rules.py                      all of them (about 300), in a minute or two
+python tests/test_rules.py                      all of them (about 350), in a minute or two
 python tests/test_rules.py underline            only the tests with "underline" in their name
 python tests/test_rules.py underline doors      ... with "underline" or "doors" in their name
 python tests/test_rules.py --list               the name and first line of every test
