@@ -7,7 +7,7 @@ There are four ways to test the tool. Every command below is typed in a terminal
 
 | Test | What it checks | How long | Command |
 |---|---|---|---|
-| **Rule tests** | the layout, table, list, heading and export rules, on made-up page geometry (no OCR) | seconds | `python tests/test_rules.py` |
+| **Rule tests** | the layout, table, list, heading and export rules, on made-up page geometry (no OCR) | a minute or two | `python tests/test_rules.py` |
 | **Regression** | the whole tool, with the real OCR, on 12 scanned files (42 pages) of 7 synthetic specifications with exact answers | 4-6 minutes | `python tests/run_regression.py` |
 | **Case library** | the whole tool on 162 small scanned pages, each one situation (a list on tab stops, a table without a heading row ...) | 15-20 minutes | `python tests/cases/run_cases.py` |
 | **Your own scans** | the whole tool on pages of your own documents, checked against what you wrote down | a minute a page | `python tests/cases/run_cases.py --only MY` |

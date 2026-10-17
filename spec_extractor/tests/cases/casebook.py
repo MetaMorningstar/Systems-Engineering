@@ -309,7 +309,7 @@ def _appendices(width: float) -> list:
                            ("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5)]))
     docs = regression_documents()
     return [PageBreak(), _p("Appendix A - the fast rule tests", _H1),
-            _p(f"<font face='Courier'>python tests/test_rules.py</font> runs these {len(tests)} checks in seconds, "
+            _p(f"<font face='Courier'>python tests/test_rules.py</font> runs these {len(tests)} checks in a minute or two, "
                "without the OCR: each builds OCR lines with realistic page geometry and runs them through the same "
                "steps as a scanned page. They test one rule at a time; the cases in this catalog test the whole tool "
                "on real scans of whole pages.", _BODY), Spacer(1, 4), t,

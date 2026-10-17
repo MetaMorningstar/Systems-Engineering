@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_rules.py - fast checks of the layout and requirement rules (no OCR, runs in seconds).
+test_rules.py - fast checks of the layout and requirement rules (no OCR, runs in a minute or two).
 
     python tests/test_rules.py                    all of them
     python tests/test_rules.py underline table    only the tests with "underline" or "table" in their name
