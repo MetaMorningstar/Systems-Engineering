@@ -3793,6 +3793,12 @@ _TITLE_ENDS_IN_FOR = re.compile(r"\b[A-Z][a-z][\w/-]*\s+(?:for|of|For|Of)$|\b(?:
                                 r"REQUIREMENTS|METHODS|PROCEDURES|PRACTICES?|GUIDELINES|CRITERIA)\s+(?:FOR|OF)$")
 
 
+# "Class A", "Level A", "Appendix A", "DAL A" at the end of a line: a designator, not the article "a" (in small letters an
+# article at the end of a line is "a")
+_ENDS_IN_DESIGNATOR = re.compile(r"\b(?:[A-Z][a-z]+|CLASS|LEVEL|TYPE|CATEGORY|OPTION|APPENDIX|ANNEX|GRADE|GROUP|DAL|PART"
+                                 r"|SECTION|TABLE|FIGURE|ZONE|MODE|METHOD|PROCEDURE|PHASE|TIER|CONDITION|CURVE)\s+A$")
+
+
 def _ends_list_item(text: str, starts_with_document: bool = False) -> bool:
     """Does a line that leaves a phrase open still end an item of a list: '...; and', '...; or' - or, in an item that
     starts with a document number, '...,' and '... and' ('MIL-STD-461G, RE102 ... in each of their modes, and' /
@@ -3808,7 +3814,7 @@ def _leaves_phrase_open(text: str, in_entry: bool = False) -> bool:
     of a document's entry, where a title in capitals may end so too ('CAPACITORS, SELECTION AND USE OF')."""
     t = (text or "").rstrip()
     return (bool(_ENDS_MID_PHRASE.search(t) or re.search(r"(?:,|\bsee)$", t, re.I))
-            and not _TITLE_ENDS_IN_FOR.search(t)
+            and not _TITLE_ENDS_IN_FOR.search(t) and not _ENDS_IN_DESIGNATOR.search(t)
             and not (in_entry and re.search(r"(?:\b[A-Z][A-Z/-]+\s+(?:FOR|OF)|^(?:for|of|FOR|OF))$", t)))
 
 
@@ -4524,7 +4530,10 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             weak_split = ""
             if listed_split and not new_block:
                 requirement_open = _says_requirement(block_so_far) and not _ends_sentence(prev_text)
-                if listed_lead or (requirement_open and item_x is None and not doc_led):
+                # ("lead" too under a line of a paragraph that did not start with a document: "... shall be marked IAW
+                # MIL-STD-130N, ...;" / "MIL-STD-129R, ..." is running text)
+                if (listed_lead or (requirement_open and item_x is None and not doc_led)
+                        or (item_x is None and not _starts_listed_document(first_text) and not doc_led)):
                     weak_split = "lead"
                 elif item_x is None and ((phrase_open and item_end) or (doc_led and requirement_open)):
                     weak_split = "item"
@@ -5382,10 +5391,11 @@ def _rejoin_running_text(doc: DocResult) -> None:
             continue
         joined = False
         # (an item that starts with a document number under a lead-in - also one that the first item ran on into:
-        # "... the following limits: MIL-STD-461G, CE102 ..." - or under the item before it)
+        # "... the following limits: MIL-STD-461G, CE102 ..." - under the item before it, or under any paragraph that
+        # ends as an item does: "...;", "...; and")
         lead_text = (body_above.text or "") if body_above is not None else ""
         above_is_item = bool(RE_DOC_ID_START.match(text)) and (
-            above_is_item or _introduces_list(lead_text)
+            above_is_item or _introduces_list(lead_text) or bool(re.search(r";\s*(?:and|or)?$", lead_text.rstrip()))
             or any(RE_DOC_ID_START.match(lead_text[m.end():]) for m in re.finditer(r":\s+", lead_text)))
         body_above = b
         kept.append(b)
