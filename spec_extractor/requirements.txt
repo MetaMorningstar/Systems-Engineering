@@ -4,7 +4,7 @@
 #     python -m pip install -r requirements.txt -c constraints.txt
 # On Windows, setup_windows.bat does exactly this.
 #
-# Python: 64-bit 3.10, 3.11, 3.12, 3.13 or 3.14, standard build. All five passed both test levels (2026-09-17).
+# Python: 64-bit 3.10, 3.11, 3.12, 3.13 or 3.14, standard build. All five passed both test levels (2026-10-16).
 #   * 3.11 or 3.12 recommended: the page-orientation classifier (last line) only installs on Python 3.12 and
 #     older. 3.13 and 3.14 use the slower, equally accurate OCR-based orientation check instead.
 #   * 3.10 gets older numpy and ONNX Runtime releases (pinned in constraints.txt); it reaches end of life in

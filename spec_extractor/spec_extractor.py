@@ -3472,8 +3472,7 @@ def _modal_re():
         garbled = "|".join(f"(?:{pattern.pattern})" for _, pattern in OCR_KEYWORD_REPAIRS)
         _MODAL_RE = re.compile(r"(?<![A-Za-z])(?:" + words + r")(?![A-Za-z])|" + garbled, re.I)
     return _MODAL_RE
-_ENDS_MID_PHRASE = re.compile(r"\b(?:of|in|the|and|or|to|for|with|a|an|by|on|at|from|as|that|which|section|per|than|"
-                              r"IAW)\s*$", re.I)                 # ("IAW": in accordance with)
+_ENDS_MID_PHRASE = re.compile(r"\b(?:of|in|the|and|or|to|for|with|a|an|by|on|at|from|as|that|which|section|per|than)\s*$", re.I)
 
 
 def _ends_sentence(text: str) -> bool:
@@ -3606,9 +3605,12 @@ def _next_tens(number_above: str, number: int) -> bool:
 # the words a document's title may wrap after, before the number of its part: "... Electronic Systems, Part" / "3
 # Software Requirements"
 _ENDS_IN_PART_NAME = re.compile(r"\b(?:Part|Volume|Vol|No|Number|Section|Chapter|Book|Table|Figure|Category|Class|Type|"
-                                r"Method|Procedure|Note|Sheet|Paragraph|Para|Clause|Subclause|Appendix|Annex|Level|Grade|"
-                                r"Notice|Change|Amendment|Supplement|Revision|Issue|Edition|Curve|Mode|Step)\.?\s*$",
-                                re.I)
+                                r"Method|Procedure|Note|Sheet|Paragraph|Para|Clause|Subclause|Appendix|Annex|Level|"
+                                r"Grade)\.?\s*$", re.I)
+# ... and words that also end titles on their own ("Seventh Edition", "Specification Change Notice", "Adaptation to
+# climate change"): only with a comma straight after the number ("..., Notice" / "2, Parts Count Method")
+_ENDS_IN_REVISION_NAME = re.compile(r"\b(?:Notice|Change|Amendment|Supplement|Revision|Issue|Edition|Curve|Mode|"
+                                    r"Step)\.?\s*$", re.I)
 # ... and those of them whose number may have several levels: "..., Paragraph" / "5.4.1 Control Movement"
 _ENDS_IN_DOTTED_PART_NAME = re.compile(r"\b(?:Paragraph|Para|Section|Clause|Subclause|Chapter|Appendix|Annex|Table|"
                                        r"Figure)\.?\s*$", re.I)
@@ -3814,6 +3816,13 @@ def _leaves_phrase_open(text: str, in_entry: bool = False) -> bool:
 # lead-in to a list of documents, not a requirement
 _DOCUMENTS_APPLY = re.compile(r"\b(?:documents|specifications|standards|handbooks|publications|drawings)\b[^.:;]{0,150}?"
                               r"\b(?:shall|will)\s+form\s+(?:a\s+)?part\b", re.I)
+
+
+# what a MIL-STD-490 / 961C lead-in says about its documents with "shall", naming no tests: "... the contents of this
+# specification shall be considered a superseding requirement", "the issues of these documents shall be those listed in
+# the DoDISS", "this specification shall govern"
+_LEAD_IN_BOILERPLATE = re.compile(r"superseding requirement|issues? of (?:these|the) documents shall be"
+                                  r"|shall (?:govern|take precedence)|in the event of (?:a )?conflict", re.I)
 
 
 def _says_requirement(text: str, capitals: bool = True) -> bool:
@@ -4321,21 +4330,24 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             # block it starts is marked ("listed_split"), and finalize_document joins it back to the text above it
             # outside a list of documents (_rejoin_running_text).
             block_so_far = " ".join(" ".join(ln.text for ln in r) for r in current)
-            # (a line that ends "; and" ends an item of a list, and so does one that ends "," or "and" in an item that
-            # starts with a document number: "MIL-STD-461G, RE102 ... in each of their modes; and" / "MIL-STD-461G,
-            # RS103 ..." is two items - _ends_list_item)
+            # (a line that ends "; and" may end an item of a list, and so may one that ends "," or "and" in a block
+            # that starts with a document number and says "shall": "MIL-STD-461G, RE102 ... shall be met in each of
+            # their modes, and" / "MIL-STD-461G, RS103 ..." is two items under a lead-in - _ends_list_item. Such a cut
+            # is marked "item": see below. In a list of documents, "RTCA DO-178C AND" / "EUROCAE ED-12C, ..." is one
+            # entry.)
             doc_led = bool(RE_DOC_ID_START.match(first_text))
-            listed_row = _starts_listed_document(row_text) and (
-                _ends_list_item(prev_text, doc_led)
-                or not _leaves_phrase_open(prev_text, in_entry=_starts_listed_document(first_text)))
+            phrase_open = _leaves_phrase_open(prev_text, in_entry=_starts_listed_document(first_text))
+            item_end = _ends_list_item(prev_text, doc_led and _says_requirement(block_so_far))
+            listed_row = _starts_listed_document(row_text) and (item_end or not phrase_open)
             listed_next = listed_row and (_starts_listed_document(first_text) or _starts_listed_document(prev_text))
             listed_lead = listed_row and not listed_next and (
                 _introduces_list(prev_text) or bool(_DOCUMENTS_FOLLOW.search(block_so_far))
                 or (len(current) == 1 and 0 < word_count(prev_text) <= 8 and not _ends_sentence(prev_text)
                     and not RE_PARA_NUM.match(prev_text)))
             listed_split = listed_next or listed_lead
-            # (the paragraph number of this block, or else of the last numbered block on the page)
-            number_above = clean_para_number(first_num.group("num")) if first_num else next(
+            # (the paragraph number of this block, or else of the last numbered block on the page - not the number a
+            # document's own number starts with: "48 CFR 252, ...")
+            number_above = clean_para_number(first_num.group("num")) if first_num and not doc_led else next(
                 (clean_para_number(m.group("num")) for blk in reversed(out) for m in [RE_PARA_NUM.match(blk.text or "")]
                  if m and ("." in m.group("num") or m.group("dot"))), "")
             # an entry in the dash layout wraps to the margin, but only with more of its title: a group title after it
@@ -4346,19 +4358,22 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
             # The ..."), also when the list is single-spaced and the last title has no full stop - but a title may
             # wrap before the number of its part ("... Electronic Systems, Part" / "3 Software Requirements")
             # (a number of several levels only after a word that takes one, "..., Paragraph" / "5.4.1 Control
-            # Movement", as a short title with no sentence, and not the paragraph that comes next ("2.2 Non-Government
-            # publications" after 2.1); never the next top-level section: "..., AN Type" / "3 REQUIREMENTS" is a heading)
+            # Movement", as a short title with no sentence after it, and only where the paragraph number above is
+            # known and this is not the paragraph that comes after it ("2.2 Non-Government publications" after 2.1);
+            # never the next top-level section: "..., AN Type" / "3 REQUIREMENTS", "30 REQUIREMENTS" after 20.1)
+            row_number = clean_para_number(row_num.group("num")) if row_num else ""
             part_number = (doc_led and bool(row_num) and not row_num.group("dot")
-                           and (bool(_ENDS_IN_PART_NAME.search(prev_text)) and "." not in row_num.group("num")
-                                or (bool(_ENDS_IN_DOTTED_PART_NAME.search(prev_text)) and "." in row_num.group("num")
-                                    and word_count(row_num.group("rest")) <= 8 and not RE_TERMINAL.search(row_text)
-                                    and not (number_above and clean_para_number(row_num.group("num")) != number_above
-                                             and plausible_next_number(number_above,
-                                                                       clean_para_number(row_num.group("num")),
-                                                                       max_skip=1))))
-                           and not (section_type(row_num.group("rest")) in TOP_LEVEL_TYPES
-                                    and "." not in row_num.group("num")
-                                    and plausible_next_number(number_above, clean_para_number(row_num.group("num")))))
+                           and ((bool(_ENDS_IN_PART_NAME.search(prev_text)) and "." not in row_number)
+                                or (bool(_ENDS_IN_REVISION_NAME.search(prev_text)) and "." not in row_number
+                                    and bool(re.match(r"\d{1,3},", row_text)))
+                                or (bool(_ENDS_IN_DOTTED_PART_NAME.search(prev_text)) and "." in row_number
+                                    and bool(number_above) and word_count(row_num.group("rest")) <= 8
+                                    and not re.search(r"[.:]\s+\S", row_num.group("rest"))
+                                    and (row_number == number_above       # (its own number: "Clause" / "4.2" in 4.2)
+                                         or not plausible_next_number(number_above, row_number, max_skip=1))))
+                           and not (section_type(row_num.group("rest")) in TOP_LEVEL_TYPES and "." not in row_number
+                                    and (plausible_next_number(number_above, row_number)
+                                         or (row_number.isdigit() and _next_tens(number_above, int(row_number))))))
             document_entry = document_entry or (bool(RE_DOC_ID_START.match(first_text)) and bool(RE_PARA_NUM.match(row_text))
                                                 and (_is_heading_text(row_text) or _is_titled_number(row_text))
                                                 and not part_number)
@@ -4373,19 +4388,27 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                 cited_list = (prev_text.rstrip().endswith(":") and row_box[0] > first_box[0] + 0.6 * stats.line_h
                               and bool(re.match(r"(?:Method|Procedure|Test|Part|Section|Table|Volume)\s+\d"
                                                 r"|\S+(?:\s+\S+)?\s+[-–—]\s+\S", row_text)))
-                # (a line that starts where the title starts on the entry's first line - or where an earlier line
-                # of the entry starts - after a line that ran to the margin, is the title wrapping with a hanging
-                # indent, although it may be near the middle of the page: "MIL-STD-461G - REQUIREMENTS FOR THE
-                # CONTROL OF ELECTROMAGNETIC INTERFERENCE" / "CHARACTERISTICS OF SUBSYSTEMS AND EQUIPMENT")
+                # (in a list typed in capitals, a line that starts where the title starts on the entry's first line -
+                # or where a wrapped line of this entry or of an entry above starts - after a line that ran to the
+                # margin, may be the title wrapping with a hanging indent near the middle of the page: "MIL-STD-461G -
+                # REQUIREMENTS FOR THE CONTROL OF ELECTROMAGNETIC INTERFERENCE" / "CHARACTERISTICS OF SUBSYSTEMS AND
+                # EQUIPMENT". There only a line centred on the page within half a line height is a group title. And no
+                # group title comes after a title left unfinished: "..., SECTION 300B," / "ELECTRIC POWER, ...")
                 hanging_x = [x for x in [_title_x_after_dash(current[0])] if x is not None] + [
                     min(ln.box[0] for ln in r) for r in current[1:]]
-                at_hanging_indent = ran_on and any(abs(row_box[0] - x) <= stats.line_h for x in hanging_x)
+                for blk in out[-8:]:
+                    if blk.lines and RE_DOC_ID_START.match(blk.text or ""):
+                        top = min(ln.box[1] for ln in blk.lines)
+                        hanging_x += [ln.box[0] for ln in blk.lines if ln.box[1] > top + 0.5 * stats.line_h]
+                at_hanging_indent = (ran_on and not re.search(r"[a-z]", first_text)
+                                     and any(abs(row_box[0] - x) <= stats.line_h for x in hanging_x))
+                off_centre = abs((row_box[0] + row_box[2]) / 2 - (text_x0 + text_w / 2))
                 centred_title = (row_text.isupper() and _is_heading_text(row_text)
                                  and row_text.count("(") == row_text.count(")")
-                                 and abs((row_box[0] + row_box[2]) / 2 - (text_x0 + text_w / 2)) < 1.5 * stats.line_h
+                                 and off_centre < (0.5 if at_hanging_indent else 1.5) * stats.line_h
+                                 and not _leaves_phrase_open(prev_text, in_entry=True)
                                  and row_box[2] - row_box[0] < 0.6 * text_w
-                                 and row_box[0] > first_box[0] + 4 * stats.line_h          # ("STANDARDS", centred)
-                                 and not at_hanging_indent)
+                                 and row_box[0] > first_box[0] + 4 * stats.line_h)         # ("STANDARDS", centred)
                 document_entry = (ends or note_under_entry or bool(RE_LIST_MARKER.match(row_text)) or group_under_entry
                                   or cited_list or _says_requirement(row_text) or _starts_with_delimited_id(row_text)
                                   or centred_title)
@@ -4417,13 +4440,16 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                         and row_num.group("rest")[:1].isupper() and word_count(row_num.group("rest")) <= 10
                         and re.match(re.escape(clean_para_number(row_num.group("num"))) + r"\.1\b", next_row_text))
                 # (an undotted number and a title, "6 Production and acceptance", with no full stop after it - up to
-                # 50, or the next tens in MIL-STD-490 numbering: "60 TEST EQUIPMENT" after 50.2)
+                # 50, or the next tens in MIL-STD-490 numbering, its title in capitals or of a known kind: "60 TEST
+                # EQUIPMENT" after 50.2, not "60 Minutes" in a table)
                 or bool(row_num and "." not in row_num.group("num") + row_num.group("dot")
                         and row_num.group("rest")[:1].isupper() and word_count(row_num.group("rest")) <= 10
                         and not row_text.rstrip().endswith(".") and not _starts_with_unit(row_num.group("rest"))
                         and clean_para_number(row_num.group("num")).isdigit()
                         and (int(clean_para_number(row_num.group("num"))) <= 50
-                             or _next_tens(number_above, int(clean_para_number(row_num.group("num"))))))
+                             or (_next_tens(number_above, int(clean_para_number(row_num.group("num"))))
+                                 and (row_num.group("rest").isupper()
+                                      or section_type(row_num.group("rest")) in TOP_LEVEL_TYPES))))
                 or (not row_num and bool(_SECTION_LABEL.fullmatch(row_text.strip())) and not row_text.endswith("."))
                 or (not row_num and row_text.isupper() and bool(re.search(r"[a-z]", block_so_far)))
                 # (under text in capitals, only a top-level title of its own: "QUALITY ASSURANCE PROVISIONS", not
@@ -4489,14 +4515,21 @@ def analyze_page(page_no: int, prep: PreparedPage, lines: list, settings: Settin
                 or (in_list and wider_gap and not at_value
                     and ((sentence_ended and row_text[:1].isupper()) or new_requirement))
             )
-            # (a new block for that reason alone is marked: see listed_split)
-            # ("lead" also inside a block that states a requirement, under a line that leaves its sentence open: no
-            # list of documents says "shall" - but an item that itself starts with a document number, "MIL-STD-461G,
-            # CE102 ... shall be met on all power leads", is followed by the next such item, also with no full stop
-            # and after a page or column break)
-            weak_split = (("lead" if listed_lead or (_says_requirement(block_so_far) and item_x is None and not doc_led
-                                                     and not _ends_sentence(prev_text)) else "next")
-                          if listed_split and not new_block else "")
+            # (a new block for that reason alone is marked: see listed_split. "lead" also inside a block that states a
+            # requirement, under a line that leaves its sentence open: no list of documents says "shall". "item" where
+            # only an item of a list under a lead-in would be cut: after "; and", or in a block that starts with a
+            # document number and says "shall" - "MIL-STD-461G, CE102 ... shall be met on all power leads" /
+            # "MIL-STD-461G, RE102 ..." - when the lead-in is not on this page above it; finalize_document keeps the
+            # cut only when the block above is such an item, with its lead-in on the page or column before)
+            weak_split = ""
+            if listed_split and not new_block:
+                requirement_open = _says_requirement(block_so_far) and not _ends_sentence(prev_text)
+                if listed_lead or (requirement_open and item_x is None and not doc_led):
+                    weak_split = "lead"
+                elif item_x is None and ((phrase_open and item_end) or (doc_led and requirement_open)):
+                    weak_split = "item"
+                else:
+                    weak_split = "next"
             new_block = new_block or listed_split
             if new_block and hanging and max(prev_h, row_h) <= 1.45 * max(1, min(prev_h, row_h)):
                 new_block = False
@@ -5267,18 +5300,20 @@ def _rejoin_running_text(doc: DocResult) -> None:
     ("MIL-STD-461G, Requirements ...") and marks it (meta "listed_split"): on its own page it cannot tell a list of
     documents from running text that names documents ("3.4 EMI. Emission limits for the unit are" / "MIL-STD-461G
     RE102 and CE102 for Navy aircraft, ..."). Here, with the whole document in order, such a paragraph is joined back
-    to the one it was cut from unless it is in a list of documents: a section numbered 2 (an appendix's x.2), or one
-    titled as a list of documents ("1.2 Applicable documents", "20. APPLICABLE DOCUMENTS") or saying that one follows
-    ("The following documents form a part of ...") - the sections read_document_lists reads. A paragraph marked
-    "lead" (cut under a lead-in or a short line) is joined back; one marked "next" (cut under a line like it) only in
-    the same run as one joined back, or under a paragraph that starts a page and carries on a sentence from the page
-    before ("... as defined in" / "MIL-STD-704F ... and" / "MIL-STD-1275E ..."), so that lines of documents under a
-    heading stay as they are; and nothing is joined before the first heading, where the scan may start inside a
-    list. An unnumbered lead-in that says a list of documents follows ("The following documents form a part of this
-    appendix ...") opens a list of documents up to the next numbered paragraph."""
+    to the one it was cut from unless it is in a list of documents: a section numbered 2, or one titled as a list of
+    documents ("1.2 Applicable documents", "20. APPLICABLE DOCUMENTS", in an appendix's x.2 also "A.2 NORMATIVE
+    REFERENCES", or "A.2 STANDARDS" from its lead-in on) or saying that one follows ("The following documents form a
+    part of ...") - the sections read_document_lists reads. A paragraph marked "lead" (cut under a lead-in or a short
+    line) is joined back; one marked "next" (cut under a line like it) only in the same run as one joined back, so
+    that lines of documents under a heading stay as they are; one marked "item" unless it follows an item of a list
+    under a lead-in (on this page or the one before); and nothing is joined before the first heading, where the scan
+    may start inside a list."""
     in_list, list_parts = None, None  # None: not known yet (the scan may start inside a list)
     top_type, top_number = "", None   # the type and number of the top-level section now open ("", None: not known)
     joined = False                    # the block above was joined back to the text above it
+    above_is_item = False             # the paragraph above is an item of a list under a lead-in (see "item")
+    lead_in_opens = False             # under "A.2 STANDARDS": a lead-in "The following documents ..." opens its list
+    body_above = None                 # the last block kept that is not page furniture
     kept = []
     for b in doc.blocks:
         if b.kind in ("page_header", "page_footer"):
@@ -5307,38 +5342,38 @@ def _rejoin_running_text(doc: DocResult) -> None:
         if parts or b.kind == "heading":
             plain = " ".join(title.lower().split()).strip(" .:")
             # (section 2 of a MIL-STD-961 document; in an appendix, or where section 2 is something else, only a title
-            # that names a list of documents counts - in an appendix's x.2 also a plain one, "A.2 STANDARDS", as
-            # read_document_lists reads it)
+            # that names a list of documents counts. In a section of documents - an appendix's own x.2, a MIL-STD-490
+            # appendix's 20 - so does a compound title, "A.2 NORMATIVE REFERENCES", "20. APPLICABLE STANDARDS", and a
+            # plain one, "A.2 STANDARDS", from a lead-in under it on: "The following documents form a part of this
+            # appendix ...". Elsewhere such titles may hold requirements: "3.4 Applicable standards. The unit shall
+            # ...", "A.2.3 Drawings. Drawings shall be prepared ...")
             in_section_2 = bool(parts) and parts[0] == 2 and top_type in ("", "applicable documents")
-            appendix_2 = bool(parts) and parts[0] < 0 and len(parts) > 1 and parts[1] == 2
+            documents_section = in_section_2 or (bool(parts) and ((len(parts) == 2 and parts[0] < 0 and parts[1] == 2)
+                                                                  or tuple(parts) == (20,)))
             names_list = (section_type(title) == "applicable documents"
                           or (bool(_DOCUMENT_LIST_TITLES.fullmatch(plain))
-                              and (in_section_2 or appendix_2
-                                   or not _GENERIC_LIST_TITLES.fullmatch(plain)))   # ("3.4 Standards.")
+                              and (in_section_2 or not _GENERIC_LIST_TITLES.fullmatch(plain)))   # ("3.4 Standards.")
+                          or (bool(_COMPOUND_LIST_TITLES.fullmatch(plain)) and documents_section)
                           or (bool(_DOCUMENTS_FOLLOW.search(text)) and not _says_requirement(text)))
+            lead_in_opens = False
             if names_list or in_section_2:
                 in_list, list_parts = True, parts
             elif parts and list_parts and tuple(parts[:len(list_parts)]) == tuple(list_parts):
                 pass                                           # 1.2.1 inside "1.2 Applicable documents"
             elif parts or section_type(title) in TOP_LEVEL_TYPES or _APPENDIX_TITLE.match(title):
                 in_list, list_parts = False, None
-        elif (in_list is False and b.kind == "paragraph" and _DOCUMENTS_FOLLOW.search(text)
+                lead_in_opens = documents_section and bool(_GENERIC_LIST_TITLES.fullmatch(plain))
+        elif (lead_in_opens and in_list is False and b.kind == "paragraph" and _DOCUMENTS_FOLLOW.search(text)
               and not _says_requirement(text)):
-            # (an unnumbered lead-in under "20. STANDARDS": "The following documents form a part of this appendix
-            # ..." - up to the next numbered paragraph)
-            in_list = True
+            in_list = True             # (the lead-in under "A.2 STANDARDS": up to the next numbered paragraph)
         above = kept[-1] if kept else None
         mark = b.meta.get("listed_split")
-        # (the paragraph above starts a page and carries on a sentence from the page before, which stops on a word
-        # that needs more after it: "... as defined in" / next page "MIL-STD-704F Aircraft Electric Power
-        # Characteristics and" / "MIL-STD-1275E ..." is one sentence. A page that stops on "," or "and" may end an
-        # item of a list.)
-        before = next((k for k in reversed(kept[:-1]) if k.kind not in ("page_header", "page_footer")), None)
-        carried_over = (above is not None and before is not None and before.page < above.page
-                        and before.kind in ("paragraph", "list_item") and _leaves_phrase_open(before.text or "")
-                        and not _ends_list_item(before.text or "", starts_with_document=True))
-        if (mark and in_list is False and (mark == "lead" or joined or carried_over) and b.kind == "paragraph"
-                and above is not None
+        # (a paragraph marked "item" stays apart only under an item of a list under a lead-in - "The unit shall meet
+        # the following limits:" / "MIL-STD-461G, CE102 ..." - also when the lead-in is on the page or column before;
+        # under any other paragraph it is running text: "... as defined in" / next page "MIL-STD-704F Aircraft
+        # Electric Power Characteristics and" / "MIL-STD-1275E ...")
+        if (mark and in_list is False and (mark == "lead" or joined or (mark == "item" and not above_is_item))
+                and b.kind == "paragraph" and above is not None
                 and above.kind in ("paragraph", "list_item") and above.page == b.page and b.lines and above.lines):
             above.lines = above.lines + b.lines
             above.box = box_union([above.box, b.box])
@@ -5346,6 +5381,13 @@ def _rejoin_running_text(doc: DocResult) -> None:
             joined = True                  # (the next document line of the same run is joined too)
             continue
         joined = False
+        # (an item that starts with a document number under a lead-in - also one that the first item ran on into:
+        # "... the following limits: MIL-STD-461G, CE102 ..." - or under the item before it)
+        lead_text = (body_above.text or "") if body_above is not None else ""
+        above_is_item = bool(RE_DOC_ID_START.match(text)) and (
+            above_is_item or _introduces_list(lead_text)
+            or any(RE_DOC_ID_START.match(lead_text[m.end():]) for m in re.finditer(r":\s+", lead_text)))
+        body_above = b
         kept.append(b)
     doc.blocks = kept
 
@@ -7306,23 +7348,28 @@ SPEC_SECTION_TYPES = (
     ("packaging", r"packaging|preparation for delivery|packing|delivery|packaging requirements"),
     ("notes", r"notes|general notes|notes and definitions"),
     ("definitions", r"definitions|acronyms|abbreviations|glossary|terms and definitions|acronyms and abbreviations|"
-                    r"definitions and acronyms|abbreviations and acronyms|list of acronyms"),
+                    r"definitions and acronyms|abbreviations and acronyms|list of acronyms|"
+                    # (ISO and ECSS clause 3: "Terms, definitions and abbreviated terms")
+                    r"terms,? definitions,? and (?:abbreviated terms|abbreviations|acronyms)|definitions and abbreviations|"
+                    r"(?:terms, definitions, )?symbols,? and abbreviated terms|abbreviated terms"),
     ("appendix", r"appendix(?:\s+[A-Z0-9]{1,3})?\b.*|annex(?:\s+[A-Z0-9]{1,3})?\b.*"),
 )
 # sub-sections of section 2 whose title says that a list of documents follows
 _DOCUMENT_LIST_TITLES = re.compile(
     r"(?:applicable|referenced|reference|government|non-?government|other government)\s+(?:documents|publications)"
-    # ("APPLICABLE STANDARDS", "NORMATIVE REFERENCES", "APPLICABLE SPECIFICATIONS, STANDARDS AND DRAWINGS"; not
-    # "6.3 Related documents", which lists documents for information only)
-    r"|(?:applicable|referenced|normative|cited)\s+(?:documents|publications|standards|specifications|references"
-    r"|documentation|drawings)(?:(?:,\s*|\s+)(?:(?:and|or)\s+)?(?:documents|publications|standards|specifications"
-    r"|handbooks|drawings))*"
     r"|specifications,?\s+standards,?\s+and\s+handbooks|specifications\s+and\s+standards|standards\s+and\s+handbooks"
     r"|(?:other\s+)?(?:government\s+)?(?:documents,\s+)?drawings,?\s+and\s+publications|industry standards"
     r"|commercial (?:standards|documents|publications)|specifications|standards|handbooks|publications|drawings"
     r"|documents|documents and publications",
     re.I)
 # ... and the sentence such a section opens with: "The following documents form a part of this specification"
+# titles that name a list of documents only in a section of documents (section 2, an appendix's x.2 or 20): elsewhere
+# "3.4 Applicable standards." holds requirements ("APPLICABLE STANDARDS", "NORMATIVE REFERENCES", "APPLICABLE
+# SPECIFICATIONS, STANDARDS AND DRAWINGS"; not "6.3 Related documents", which lists documents for information only)
+_COMPOUND_LIST_TITLES = re.compile(
+    r"(?:applicable|referenced|normative|cited)\s+(?:documents|publications|standards|specifications|references"
+    r"|documentation|drawings)(?:(?:,\s*|\s+)(?:(?:and|or)\s+)?(?:documents|publications|standards|specifications"
+    r"|handbooks|drawings))*", re.I)
 # titles that name a list of documents only in section 2: elsewhere "3.4 Standards." holds requirements
 _GENERIC_LIST_TITLES = re.compile(r"specifications|standards|handbooks|publications|drawings|documents"
                                   r"|documents and publications", re.I)
@@ -7587,11 +7634,14 @@ def build_outline(doc: DocResult, extractor: "RequirementExtractor") -> list:
                 # whose number the scan lost ("REQUIREMENTS", then 3.1) stands for the number its sections have.
                 kind_of, implied = section_type(title), ""
                 label = _SECTION_LABEL_NUMBER.match(title)
-                if nxt and len(nxt) > 1 and nxt[0] > 0 and not _APPENDIX_TITLE.match(title):
+                if label:
+                    implied = str(int(label.group(1)))   # ("SECTION 2 - APPLICABLE DOCUMENTS" is section 2, also
+                                                         # when it holds no numbered paragraph of its own)
+                elif nxt and len(nxt) > 1 and nxt[0] > 0 and not _APPENDIX_TITLE.match(title):
                     # (the number its label or its MIL-STD-961 title names, or the next section's when it names a
                     # numbered section - "REQUIREMENTS" then 4.1 is section 4; not FOREWORD's or a title page's:
                     # section 1 comes after them)
-                    if (_SECTION_NUMBERS.get(kind_of) == nxt[0] or (label and int(label.group(1)) == nxt[0])
+                    if (_SECTION_NUMBERS.get(kind_of) == nxt[0]
                             or (kind_of in TOP_LEVEL_TYPES - {"front matter", "appendix"} and not numbered_seen
                                 and not (kind_of == "definitions" and nxt[0] == 1))   # (ACRONYMS before 1.1)
                             or (kind_of in TOP_LEVEL_TYPES - {"front matter", "appendix"} and numbered_seen
@@ -7799,7 +7849,7 @@ def read_document_lists(doc: DocResult) -> list:
     entries = []
     in_list, group, subgroup = False, "", ""
     entry_title_x = None              # where the title of the entry just read starts, when it is on a tab stop
-    after_requirement = False         # under a requirement that ends in ":" (the tests it names follow it)
+    after_requirement = False         # the block above in the list is a requirement (its tests follow it)
     for b in doc.blocks:
         if b.kind in ("page_header", "page_footer"):
             continue
@@ -7812,37 +7862,33 @@ def read_document_lists(doc: DocResult) -> list:
             # and handbooks"), or one that says a list of documents follows. A title of one plain word such as
             # "Standards" names a list only in section 2 (or an appendix's A.2): "3.4 Standards." holds requirements
             plain = " ".join(title.lower().split()).strip(" .:")
-            in_section_2 = bool(number) and (number[0] == 2 or (number[0] < 0 and len(number) > 1 and number[1] == 2))
+            # (section 2, an appendix's x.2, or a MIL-STD-490 appendix's 20: "20. STANDARDS", "20. APPLICABLE
+            # STANDARDS")
+            in_section_2 = bool(number) and (number[0] in (2, 20)
+                                             or (number[0] < 0 and len(number) > 1 and number[1] == 2))
             in_list = (heading.get("type") == "applicable documents"
                        or (bool(_DOCUMENT_LIST_TITLES.fullmatch(plain))
                            and (in_section_2 or not _GENERIC_LIST_TITLES.fullmatch(plain)))
+                       or (bool(_COMPOUND_LIST_TITLES.fullmatch(plain)) and in_section_2)
                        or bool(_DOCUMENTS_FOLLOW.search(b.text or "")))
             group = subgroup = ""
             entry_title_x, after_requirement = None, False
             if not any(p["kind"] == "body" for p in parts):
                 continue
-        text = (b.text or "").strip()
-        # an unnumbered lead-in under a title that does not name a list ("20. STANDARDS" in an appendix): "The
-        # following documents form a part of this appendix ..." - the list runs to the next heading
-        if (not in_list and heading is None and b.kind == "paragraph" and _DOCUMENTS_FOLLOW.search(text)
-                and not _says_requirement(text)):
-            in_list, group, subgroup = True, "", ""
-            entry_title_x, after_requirement = None, False
-            continue
         if not in_list or b.kind in ("table", "figure", "caption"):
             continue
+        text = (b.text or "").strip()
         if _says_requirement(text):
-            # (a lead-in that also says "shall" - "... the contents of this specification shall be considered a
-            # superseding requirement." - names no tests: only one that ends in ":" does)
-            entry_title_x, after_requirement = None, text.rstrip().endswith(":")
+            # (a lead-in that also says "shall" about the documents - "... the contents of this specification shall be
+            # considered a superseding requirement." - names no tests)
+            entry_title_x, after_requirement = None, not _LEAD_IN_BOILERPLATE.search(text)
             continue                                 # a requirement, not a document: no document's title says "shall"
         entry = parse_document_entry(text, _entry_columns(b) if RE_DOC_ID_START.match(text) else None)
-        if entry is not None and after_requirement:
-            if re.match(r"(?:Method|Procedure|Table|Figure|Paragraph|Condition)\.?\s+\d", entry["title"]):
-                entry_title_x = None
-                continue                             # "... The methods to be used are:" / "MIL-STD-810H, Method 514.8
+        if (entry is not None and after_requirement
+                and re.match(r"(?:Method|Procedure|Table|Figure|Paragraph|Condition)\.?\s+\d", entry["title"])):
+            entry_title_x = None
+            continue                                 # "... The methods to be used are:" / "MIL-STD-810H, Method 514.8
                                                      # Vibration, ...": a test that requirement names, not a document
-            after_requirement = False                # (a document: the tests named, if any, have ended)
         if entry is not None:
             lead = None if RE_DOC_ID_START.match(text) else RE_LIST_MARKER.match(text)
             entry.update({"group": group, "subgroup": subgroup, "page": b.page_label(), "uid": b.uid,
